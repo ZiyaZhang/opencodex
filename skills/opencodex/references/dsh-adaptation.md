@@ -137,3 +137,11 @@ Read `exec.agent` for the actual calling session and `exec.signal` for cancellat
 ## Minimum delivery record
 
 Record the generated package name/version/hash, exact DSH version, installed tarball path, isolated profile, build/typecheck result, real interaction result and unload restoration. Include the commands another user can run from a clean checkout. Separate source-grounded assumptions, synthetic tests and real UI evidence. Submit an actual compiled tarball through `opencodex_job` artifact registration; a plan, screenshot or README alone is not the requested usable plugin.
+
+## Independent delivery and automatic installation
+
+A reconstruction is a new DSH bundle, not a patch to OpenCodex or the DSH checkout. Every feature owns a package name, concrete version, compiled exports and shipped bundle patch. Declare actual runtime SDK dependencies and share React through the DSH client loader. No runtime dependency on `dsh-opencodex`, no `file:`/`workspace:` dependency into the research directory, no bundled local evidence or credentials. Keep REA/CUA/research skills in the research plugin unless the requested feature itself requires them.
+
+Test the packed tarball in an isolated DSH_HOME without OpenCodex. Use native package installation, then verify the feature's first use, disable/re-enable, restart and uninstall. Register the exact tarball and current behavior/visual/lifecycle evidence, including the two labeled screenshot sets. A compile pass or archive alone does not complete reconstruction.
+
+After independent acceptance, the Host installs and enables the current artifact automatically through public `pluginManager.installBundle(path, {enabled:true})`; the research agent stops at verifying and does not run a daily-profile installation command or request another install confirmation. The UI opens `pluginNavigation.openBundle(packageName)` for subsequent management. Native applied and restart-required results differ: never report a running feature from a restart-required receipt. On install errors, preserve the package and native diagnostic; do not try another installer or silently approve pending dependency build scripts.

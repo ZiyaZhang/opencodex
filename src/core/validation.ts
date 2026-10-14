@@ -91,7 +91,7 @@ export function validateState(value: unknown): asserts value is StoreState {
   check(s.schemaVersion === 1, 'Unsupported OpenCodex state version'); isoDate(s.createdAt, 'createdAt'); isoDate(s.updatedAt, 'updatedAt'); validateSettings(s.settings);
   if (s.capabilities !== null) validateCapabilities(s.capabilities);
   for (const raw of list(s.jobs, 'jobs')) {
-    const j = object(raw, 'job', ['id', 'title', 'description', 'source', 'mode', 'status', 'createdAt', 'updatedAt', 'budget', 'elapsedMs', 'activeSince', 'repairRounds', 'history', 'budgetHistory', 'sessionIds', 'sessionBindings'], ['candidateId', 'sessionId', 'workdir', 'foreground', 'artifactId', 'installedReceipt', 'coverage']);
+    const j = object(raw, 'job', ['id', 'title', 'description', 'source', 'mode', 'status', 'createdAt', 'updatedAt', 'budget', 'elapsedMs', 'activeSince', 'repairRounds', 'history', 'budgetHistory', 'sessionIds', 'sessionBindings'], ['candidateId', 'sessionId', 'workdir', 'foreground', 'artifactId', 'installedReceipt', 'installation', 'coverage']);
     idDates(j, true); textValue(j.title, 'title'); textValue(j.description, 'description', true); enumeration(j.source, ['user', 'discovery'], 'source'); enumeration(j.status, JOB_STATUSES, 'status'); budget(j.budget);
     enumeration(j.mode, ['reconstruct', 'investigate'], 'job mode');
     if (j.mode === 'investigate') check(!['building', 'verifying', 'ready', 'covered', 'installed'].includes(j.status as string), 'Investigation jobs cannot reconstruct or install plugins');
@@ -129,6 +129,22 @@ export function validateState(value: unknown): asserts value is StoreState {
     }
     if (j.coverage !== undefined) {
       const coverage = object(j.coverage, 'coverage', ['specId', 'confirmedAt', 'reason']); textValue(coverage.specId, 'specId'); isoDate(coverage.confirmedAt, 'confirmedAt'); textValue(coverage.reason, 'reason'); check(j.status === 'covered', 'Coverage receipt requires the covered state');
+    }
+    if (j.installation !== undefined) {
+      const install = object(j.installation, 'installation', ['requestId', 'artifactId', 'artifactSha256', 'status', 'startedAt'], ['completedAt', 'packageName', 'version', 'application', 'error', 'logPath', 'warnings']);
+      textValue(install.requestId, 'installation requestId'); textValue(install.artifactId, 'installation artifactId'); digest(install.artifactSha256);
+      enumeration(install.status, ['installing', 'installed', 'failed', 'interrupted'], 'installation status'); isoDate(install.startedAt, 'installation startedAt');
+      if (install.completedAt !== undefined) isoDate(install.completedAt, 'installation completedAt');
+      for (const key of ['packageName', 'version', 'error', 'logPath']) if (install[key] !== undefined) textValue(install[key], `installation ${key}`);
+      if (install.application !== undefined) enumeration(install.application, ['applied', 'restart-required', 'overridden', 'failed', 'cancelled'], 'installation application');
+      if (install.warnings !== undefined) strings(install.warnings, 'installation warnings');
+      check(install.artifactId === j.artifactId, 'Installation must reference the current artifact');
+      check(['ready', 'installed'].includes(j.status as string), 'Installation belongs to an accepted job');
+      check((install.status === 'installed') === (j.status === 'installed'), 'Installation and job completion disagree');
+      check((install.status === 'installing') === (install.completedAt === undefined), 'Installation completion time disagrees with status');
+      if (install.status === 'installed') {
+        check(install.packageName && install.version && ['applied', 'restart-required'].includes(install.application as string), 'Installed receipt requires a successful native result');
+      }
     }
   }
   for (const raw of list(s.candidates, 'candidates')) {
@@ -197,6 +213,7 @@ export function validateState(value: unknown): asserts value is StoreState {
   for (const j of state.jobs) {
     if (j.candidateId) check(state.candidates.some(c => c.id === j.candidateId), 'Unknown candidate');
     if (j.artifactId) check(artifacts.get(j.artifactId)?.jobId === j.id, 'Unknown job artifact');
+    if (j.installation) check(artifacts.get(j.installation.artifactId)?.sha256 === j.installation.artifactSha256, 'Installation artifact digest mismatch');
     if (j.status === 'ready' || j.status === 'installed') {
       check(state.specs.some(f => f.jobId === j.id), 'Ready job needs a feature spec');
       check(j.artifactId && artifacts.get(j.artifactId)?.kind === 'plugin', 'Ready job needs a plugin artifact');

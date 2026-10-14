@@ -19,6 +19,6 @@ The template demonstrates `conversation.composer.dock` with `PropsRuntime` and i
 
 If adding styles, ensure the emitted styles are loaded and disposed; an unreferenced CSS file will not apply itself. If adding runtime imports from DSH, keep shared packages external in the Client build and declare their loading requirements.
 
-Install the tarball in a separate DSH profile for real interaction, visual, refresh, and unload checks before requesting everyday installation. Compilation does not prove that an interaction or visual comparison passed. Replace this starter description with the actual feature, supported states, known gaps, validation evidence, and uninstall steps before delivery.
+Install the tarball in a separate DSH_HOME without OpenCodex for real interaction, visual, refresh, disable/re-enable and uninstall checks. After independent acceptance, the OpenCodex Host installs and enables the package automatically through native DSH plugin management. Compilation does not prove that an interaction or visual comparison passed. Replace this starter description with the actual feature, supported states, known gaps, validation evidence, and uninstall steps before delivery.
 
 Original starter code is available under the MIT license. Retain applicable notices when adding other code or assets.

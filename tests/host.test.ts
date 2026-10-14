@@ -12,6 +12,8 @@ import OpenCodex from '../src/host/index.js';
 import { OpenCodexStore } from '../src/core/index.js';
 import type { OpenCodexRequest } from '../src/host/remote.js';
 import { MAX_REFERENCE_IMAGE_BYTES } from '../src/host/reference-image.js';
+import { verifyingPlugin } from './helpers/plugin-fixture.js';
+import type { PluginInstaller } from '../src/host/plugin-install.js';
 
 const PNG_REFERENCE = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jQ8sAAAAASUVORK5CYII=';
 const WEBP_REFERENCE = 'UklGRhoAAABXRUJQVlA4TA0AAAAvAAAAEAcQERGIiP4HAA==';
@@ -51,6 +53,53 @@ async function fixture(sandbox = true, existingDirectory?: string) {
   const close = async () => { await ctx.fiber.dispose(); if (!existingDirectory) await rm(directory, { recursive: true, force: true }); };
   return { plugin, ctx, call, tools, descriptors, sessions, agents, prompts, counts: () => ({ createCount, cancels }), directory, close };
 }
+
+test('the last independent acceptance scope automatically installs through DSH without a separate install request', async () => {
+  const f = await fixture();
+  try {
+    let installs = 0;
+    f.ctx.provide('pluginManager', {
+      async listBundles() { return []; },
+      async installBundle() { installs++; return { changed: true, application: 'restart-required', stage: 'enable', target: 'dsh-install-fixture', bundle: 'dsh-install-fixture', version: '1.0.0', enabled: true }; },
+    } as never);
+    const internal = f.plugin as unknown as { store: Promise<OpenCodexStore>; installer: Promise<PluginInstaller> };
+    const store = await internal.store, data = await verifyingPlugin(store);
+    await f.call({ action: 'recordVerification', jobId: data.jobId, input: data.verification('behavior') });
+    await f.call({ action: 'recordVerification', jobId: data.jobId, input: data.verification('visual') });
+    assert.equal(installs, 0);
+    await f.call({ action: 'recordVerification', jobId: data.jobId, input: data.verification('lifecycle') });
+    await (await internal.installer).whenIdle();
+    assert.equal(installs, 1);
+    assert.equal(store.getJob(data.jobId).status, 'installed');
+    assert.equal(store.getJob(data.jobId).installation?.application, 'restart-required');
+    await f.call({ action: 'markReady', jobId: data.jobId });
+    await f.call({ action: 'installPlugin', jobId: data.jobId });
+    await (await internal.installer).whenIdle();
+    assert.equal(installs, 1, 'Duplicate user delivery must not reinstall an installed package');
+    assert.ok(!f.tools.has('opencodex_install'), 'Research agents cannot call the profile installer');
+  } finally { await f.close(); }
+});
+
+test('failed automatic installation stays failed across maintenance ticks without repeated package operations', async () => {
+  const f = await fixture();
+  try {
+    let installs = 0;
+    f.ctx.provide('pluginManager', {
+      async listBundles() { return []; },
+      async installBundle() { installs++; return { changed: false, application: 'failed', stage: 'install', target: 'fixture', enabled: true, error: { code: 'operation-error', diagnostic: 'Synthetic native installation error' } }; },
+    } as never);
+    const internal = f.plugin as unknown as { store: Promise<OpenCodexStore>; installer: Promise<PluginInstaller>; maintenance(): Promise<void> };
+    const store = await internal.store, data = await verifyingPlugin(store);
+    for (const scope of ['behavior', 'visual', 'lifecycle'] as const) await f.call({ action: 'recordVerification', jobId: data.jobId, input: data.verification(scope) });
+    await (await internal.installer).whenIdle();
+    for (let i = 0; i < 3; i++) await internal.maintenance();
+    assert.equal(installs, 1);
+    assert.equal(store.getJob(data.jobId).installation?.status, 'failed');
+    await f.call({ action: 'installPlugin', jobId: data.jobId });
+    await (await internal.installer).whenIdle();
+    assert.equal(installs, 2, 'An explicit retry may invoke native installation again');
+  } finally { await f.close(); }
+});
 
 test('manual research starts one ordinary DSH session in a confined workdir and resume retains it', async () => {
   const f = await fixture();

@@ -61,22 +61,28 @@ async function readPackage(root: string, jobId: string, path: string, signal: Ab
   } finally { await file.close(); }
 }
 
-export async function readPluginArtifact(store: OpenCodexStore, jobId: string, artifactId: string, offset: number | undefined, signal: AbortSignal): Promise<PluginArtifactChunk> {
+/** Return the exact registered buffer for either download or Host-controlled installation. */
+export async function readRegisteredPlugin(store: OpenCodexStore, jobId: string, artifactId: string, signal: AbortSignal) {
   signal.throwIfAborted();
   if (typeof jobId !== 'string' || !ID.test(jobId) || typeof artifactId !== 'string' || !ID.test(artifactId)) throw new Error('Invalid plugin job or artifact ID');
   store.getJob(jobId);
   const artifact = store.snapshot().artifacts.find(item => item.id === artifactId);
   if (!artifact || artifact.jobId !== jobId || artifact.kind !== 'plugin') throw new Error('Download requires a registered plugin artifact of this job');
-  const start = offset === undefined ? 0 : offset;
-  if (!Number.isSafeInteger(start) || start < 0 || start >= artifact.bytes) throw new Error('Plugin download offset must be an integer inside the registered file');
   if (!artifact.bytes || artifact.bytes > MAX_PLUGIN_DOWNLOAD_BYTES) throw new Error('Plugin must be nonempty and at most 16 MB');
   if (isAbsolute(artifact.path) || artifact.path.includes('\\') || artifact.path.split('/').some(part => !part || part === '.' || part === '..')) throw new Error('Invalid plugin artifact path');
   const filename = basename(artifact.path);
   if (!/\.(?:tgz|tar\.gz)$/.test(filename) || /[\x00-\x1f\x7f]/.test(filename)) throw new Error('Plugin download requires an npm tarball filename');
   const bytes = await readPackage(store.artifactRoot, jobId, resolve(store.artifactRoot, artifact.path), signal);
   if (bytes.length !== artifact.bytes || createHash('sha256').update(bytes).digest('hex') !== artifact.sha256) throw new Error('Plugin no longer matches its registered SHA-256');
-  inspectTarball(bytes); // Validate this exact bounded buffer without reopening the path or executing code.
+  const inspection = inspectTarball(bytes); // Inspect the exact buffer, never reopen the path or execute it.
   signal.throwIfAborted();
+  return { artifact, filename, bytes, inspection };
+}
+
+export async function readPluginArtifact(store: OpenCodexStore, jobId: string, artifactId: string, offset: number | undefined, signal: AbortSignal): Promise<PluginArtifactChunk> {
+  const { artifact, filename, bytes } = await readRegisteredPlugin(store, jobId, artifactId, signal);
+  const start = offset === undefined ? 0 : offset;
+  if (!Number.isSafeInteger(start) || start < 0 || start >= artifact.bytes) throw new Error('Plugin download offset must be an integer inside the registered file');
   const end = Math.min(start + PLUGIN_DOWNLOAD_CHUNK_BYTES, bytes.length);
   return { filename, sha256: artifact.sha256, totalBytes: bytes.length, offset: start, dataBase64: bytes.subarray(start, end).toString('base64'), ...(end < bytes.length ? { nextOffset: end } : {}) };
 }

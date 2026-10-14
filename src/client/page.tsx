@@ -7,11 +7,12 @@ import { Icon, type IconName } from './icons.js';
 import { fetchPluginArtifact } from './plugin-download.js';
 
 type Call = (request: OpenCodexRequest, signal?: AbortSignal) => Promise<OpenCodexResponse>;
+type OpenPlugin = (packageName: string) => void;
 type ReferenceImage = { mimeType: 'image/png' | 'image/jpeg' | 'image/webp'; dataBase64: string };
 type Tab = 'research' | 'discover' | 'library' | 'settings';
 const tabs: [Tab, string][] = [['research', '研究'], ['discover', '发现'], ['library', '资料'], ['settings', '设置']];
 const tabIcons: Record<Tab, IconName> = { research: 'search', discover: 'radar', library: 'books', settings: 'settings' };
-const labels: Record<JobStatus, string> = { detected: '发现候选', draft: '待开始', queued: '排队中', researching: '调查中', specifying: '编写规格', researched: '调查完成', building: '开发中', verifying: '待验收', ready: '可安装', covered: '已有能力可用', paused: '已暂停', blocked: '需要处理', failed: '失败', installed: '已安装', cancelled: '已取消' };
+const labels: Record<JobStatus, string> = { detected: '发现候选', draft: '待开始', queued: '排队中', researching: '调查中', specifying: '编写规格', researched: '调查完成', building: '开发中', verifying: '待验收', ready: '验收通过', covered: '已有能力可用', paused: '已暂停', blocked: '需要处理', failed: '失败', installed: '已安装', cancelled: '已取消' };
 const active = new Set<JobStatus>(['queued', 'researching', 'specifying', 'building', 'verifying']);
 const number = (value: number) => value.toLocaleString('zh-CN');
 const date = (value: string) => new Date(value).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
@@ -73,7 +74,7 @@ export function JobReferenceThumbnail({ jobId, artifacts, call }: { jobId: strin
   </span>;
 }
 
-export function OpenCodexPage({ call }: { call: Call }) {
+export function OpenCodexPage({ call, openPlugin }: { call: Call; openPlugin?: OpenPlugin }) {
   const [tab, setTab] = useState<Tab>('research');
   const [data, setData] = useState<OpenCodexResponse>();
   const [selected, setSelected] = useState<string>();
@@ -186,7 +187,7 @@ export function OpenCodexPage({ call }: { call: Call }) {
         {readingImage && <p role="status">正在读取截图…</p>}
         <div className="oc-two-columns"><label>本项 token 上限<input required type="number" min={1000} step={1000} value={tokens} onChange={event => setTokens(Number(event.target.value))} /></label><p className="oc-muted oc-align-bottom">包含全部阶段与重试。默认是短调查额度；可查看进展后续额。</p></div>
         <button className="oc-primary" disabled={busy || readingImage || !title.trim()}><Icon name="plus" />创建研究任务</button>
-      </form> : job ? <JobDetail key={job.id} job={job} data={data} busy={busy} run={run} call={call} back={() => setSelected(undefined)} /> : <>
+      </form> : job ? <JobDetail key={job.id} job={job} data={data} busy={busy} run={run} call={call} openPlugin={openPlugin} back={() => setSelected(undefined)} /> : <>
         <div className="oc-section-head"><h2>研究任务 <span className="oc-heading-count">{data.state.jobs.length}</span></h2></div>
         {data.state.jobs.length === 0 ? <div className="oc-empty"><div className="oc-empty-mark"><Icon name="search" /></div><h2>下一项功能，从这里开始</h2><p>描述你想复刻的交互，或从更新中选择候选。<br />研究证据、生成代码和验收结果都保存在本机。</p><button onClick={openNew}><Icon name="plus" />创建第一个任务</button></div> : <div className="oc-list">{[...data.state.jobs].reverse().map(item => <JobRow key={item.id} job={item} artifacts={data.state.artifacts.filter(artifact => artifact.jobId === item.id)} confirmed={data.budgets[item.id]?.job.confirmedTokens ?? 0} call={call} open={() => setSelected(item.id)} />)}</div>}
       </>)}
@@ -206,7 +207,7 @@ export function OpenCodexPage({ call }: { call: Call }) {
 }
 
 type Run = (request: OpenCodexRequest, success?: string) => Promise<OpenCodexResponse | undefined>;
-function JobDetail({ job, data, busy, run, call, back }: { job: Job; data: OpenCodexResponse; busy: boolean; run: Run; call: Call; back: () => void }) {
+function JobDetail({ job, data, busy, run, call, back, openPlugin }: { job: Job; data: OpenCodexResponse; busy: boolean; run: Run; call: Call; back: () => void; openPlugin?: OpenPlugin }) {
   const budget = data.budgets[job.id];
   const evidence = data.state.evidence.filter(item => item.jobId === job.id);
   const specs = data.state.specs.filter(item => item.jobId === job.id);
@@ -221,7 +222,7 @@ function JobDetail({ job, data, busy, run, call, back }: { job: Job; data: OpenC
     <div className="oc-section-head"><h2>{job.title}</h2><Status status={job.status} /></div>
     <p className="oc-description">{featureDescription(job.description)}</p>
     <ScreenshotGallery jobId={job.id} artifacts={artifacts} call={call} upload={<ScreenshotUpload job={job} busy={busy} run={run} />} />
-    <PluginResultSummary job={job} artifacts={artifacts} checks={checks} latestSpecId={specs.at(-1)?.id} call={call} />
+    <PluginResultSummary job={job} artifacts={artifacts} checks={checks} latestSpecId={specs.at(-1)?.id} call={call} openPlugin={openPlugin} />
     {['paused', 'blocked', 'failed'].includes(job.status) && job.history.at(-1)?.reason && <div className="oc-notice" role="status">暂停原因：{job.history.at(-1)!.reason}</div>}
     <div className="oc-budget"><div><span>已确认</span><strong>{number(budget?.job.confirmedTokens ?? 0)}</strong></div><div><span>待结算预留</span><strong>{number(budget?.job.reservedTokens ?? 0)}</strong></div><div><span>本项上限</span><strong>{number(job.budget.tokenLimit)}</strong></div><div><span>每日已用 / 上限</span><strong>{number(budget?.daily.confirmedTokens ?? 0)} <small>/ {number(data.state.settings.dailyTokenLimit)}</small></strong></div></div>
     <div className="oc-progress" role="meter" aria-label="任务预算使用" aria-valuemin={0} aria-valuemax={job.budget.tokenLimit} aria-valuenow={Math.min(job.budget.tokenLimit, (budget?.job.confirmedTokens ?? 0) + (budget?.job.reservedTokens ?? 0))}><span style={{ width: `${Math.min(100, 100 * ((budget?.job.confirmedTokens ?? 0) + (budget?.job.reservedTokens ?? 0)) / job.budget.tokenLimit)}%` }} /></div>
@@ -244,16 +245,16 @@ function JobDetail({ job, data, busy, run, call, back }: { job: Job; data: OpenC
   </section>;
 }
 
-export function PluginResultSummary({ job, artifacts, checks, latestSpecId, call }: { job: Job; artifacts: Artifact[]; checks: Verification[]; latestSpecId?: string; call: Call }) {
+export function PluginResultSummary({ job, artifacts, checks, latestSpecId, call, openPlugin }: { job: Job; artifacts: Artifact[]; checks: Verification[]; latestSpecId?: string; call: Call; openPlugin?: OpenPlugin }) {
   const plugins = artifacts.filter(item => item.jobId === job.id && item.kind === 'plugin');
   return <section className="oc-plugin-results" aria-label="插件产出">
     <h3><Icon name="package" />插件产出{plugins.length > 0 && <span>{plugins.length} 个包</span>}</h3>
     {plugins.length === 0 ? <p className="oc-muted">尚未产出插件包。已有研究进展保留在下方；完成构建并登记后，这里会出现可下载的安装包。</p>
-      : <>{[...plugins].reverse().map(artifact => <PluginDownload key={`${job.id}:${artifact.id}:${artifact.sha256}`} job={job} artifact={artifact} checks={checks} latestSpecId={latestSpecId} call={call} />)}<p className="oc-result-note">下载后可在隔离 DSH 的插件管理中选择本地安装包。下载不会自动安装到日常环境。</p></>}
+      : <>{[...plugins].reverse().map(artifact => <PluginDownload key={`${job.id}:${artifact.id}:${artifact.sha256}`} job={job} artifact={artifact} checks={checks} latestSpecId={latestSpecId} call={call} openPlugin={openPlugin} />)}<p className="oc-result-note">验收通过后自动安装到当前 DSH 并启用，之后可在插件管理中独立禁用或卸载。安装包也可下载保存。</p></>}
   </section>;
 }
 
-function PluginDownload({ job, artifact, checks, latestSpecId, call }: { job: Job; artifact: Artifact; checks: Verification[]; latestSpecId?: string; call: Call }) {
+function PluginDownload({ job, artifact, checks, latestSpecId, call, openPlugin }: { job: Job; artifact: Artifact; checks: Verification[]; latestSpecId?: string; call: Call; openPlugin?: OpenPlugin }) {
   const [downloading, setDownloading] = useState(false);
   const [percent, setPercent] = useState(0);
   const [error, setError] = useState('');
@@ -282,6 +283,7 @@ function PluginDownload({ job, artifact, checks, latestSpecId, call }: { job: Jo
     finally { request.current = undefined; if (!controller.signal.aborted) setDownloading(false); }
   };
   return <article className="oc-plugin-result">
+    {job.artifactId === artifact.id && <InstallationStatus job={job} call={call} openPlugin={openPlugin} />}
     <div className="oc-plugin-result-head"><div><strong>{filename}</strong><p>{artifact.label}</p><span className="oc-result-size">{artifact.bytes >= 1_000_000 ? `${(artifact.bytes / 1_000_000).toFixed(1)} MB` : `${Math.max(1, Math.round(artifact.bytes / 1000))} KB`} · {date(artifact.createdAt)}</span></div><button className="oc-primary" disabled={downloading} onClick={() => void download()}><Icon name="package" />{downloading ? `下载并校验 ${percent}%` : ready ? '下载插件包' : '下载实验包'}</button></div>
     {artifact.provenance?.kind === 'operator-assisted' && <p className="oc-result-provenance"><strong>人工协助产物</strong> · {artifact.provenance.details}</p>}
     <div className="oc-result-checks" aria-label="插件验收状态">{(['behavior', 'visual', 'lifecycle'] as const).map(scope => {
@@ -292,6 +294,34 @@ function PluginDownload({ job, artifact, checks, latestSpecId, call }: { job: Jo
     {error && <p className="oc-error" role="alert">{error}</p>}
     {saved && <p className="oc-result-note" role="status">SHA-256 校验通过，已发起文件保存。</p>}
   </article>;
+}
+
+export function InstallationStatus({ job, call, openPlugin }: { job: Job; call: Call; openPlugin?: OpenPlugin }) {
+  const receipt = job.installation;
+  const [busy, setBusy] = useState(false), [error, setError] = useState('');
+  if (!receipt && !['ready', 'installed'].includes(job.status)) return null;
+  const title = !receipt ? (job.status === 'ready' ? '验收通过，正在安排安装…' : '已有安装记录')
+    : receipt.status === 'installing' ? '正在安装到当前 DSH…'
+      : receipt.status === 'installed' ? (receipt.application === 'restart-required' ? '已安装并启用 · 重启 DSH 后生效' : '安装完成 · DSH 已应用')
+        : receipt.status === 'interrupted' ? '安装中断，结果待核对' : '安装未完成';
+  const retry = async () => {
+    setBusy(true); setError('');
+    try { await call({ action: 'installPlugin', jobId: job.id }); }
+    catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    finally { setBusy(false); }
+  };
+  return <div className="oc-installation" aria-label="DSH 安装结果">
+    <strong role="status"><Icon name={receipt?.status === 'installed' ? 'check' : receipt?.status === 'failed' || receipt?.status === 'interrupted' ? 'warning' : 'clock'} />{title}</strong>
+    {receipt?.packageName && <p>{receipt.packageName} <span className="oc-numeric">{receipt.version}</span></p>}
+    {receipt?.error && <p className="oc-error">{receipt.error}</p>}
+    {receipt?.warnings?.map((warning, i) => <p key={i}>{warning}</p>)}
+    {receipt?.logPath && <details><summary>安装日志</summary><code className="oc-path">{receipt.logPath}</code></details>}
+    <div className="oc-actions">
+      {receipt && ['failed', 'interrupted'].includes(receipt.status) && <button disabled={busy} onClick={() => void retry()}><Icon name="refresh" />{busy ? '提交重试…' : '重试安装'}</button>}
+      {receipt?.packageName && openPlugin && <button onClick={() => { try { openPlugin(receipt.packageName!); } catch (err) { setError(err instanceof Error ? err.message : String(err)); } }}><Icon name="package" />在插件管理中查看</button>}
+    </div>
+    {error && <p className="oc-error" role="alert">{error}</p>}
+  </div>;
 }
 
 export function ScreenshotGallery({ jobId, artifacts, call, upload }: { jobId: string; artifacts: Artifact[]; call: Call; upload?: ReactNode }) {
@@ -379,7 +409,7 @@ function AcceptanceForm({ job, data, busy, run }: { job: Job; data: OpenCodexRes
   const evidence = data.state.evidence.filter(item => item.jobId === job.id && item.kind === 'observed');
   const screenshots = data.state.artifacts.filter(item => item.jobId === job.id && item.kind === 'screenshot' && item.screenshot);
   const visualPair = ['codex', 'dsh'].every(subject => screenshots.some(item => screenshotIds.includes(item.id) && item.screenshot?.subject === subject));
-  return <details className="oc-section"><summary><Icon name="check" />记录隔离验收结果</summary><p className="oc-muted">检查隔离环境中的实际结果，选取相应证据。模型的自述不能替代验收。</p><form className="oc-form" onSubmit={event => { event.preventDefault(); void run({ action: 'recordVerification', jobId: job.id, input: { artifactId: job.artifactId!, scope, outcome, method: 'manual', environment: 'isolated', details, evidenceIds, ...(scope === 'visual' ? { screenshotIds } : {}) } }, '验收结果已记录'); }}><div className="oc-two-columns"><label>验收项目<select value={scope} onChange={event => setScope(event.target.value as VerificationScope)}><option value="behavior">行为</option><option value="visual">视觉</option><option value="lifecycle">生命周期</option></select></label><label>结果<select value={outcome} onChange={event => setOutcome(event.target.value as Verification['outcome'])}><option value="partial">部分完成</option><option value="failed">失败</option><option value="passed">通过</option></select></label></div><label>实际步骤与结果<textarea required minLength={10} rows={3} value={details} onChange={event => setDetails(event.target.value)} /></label><fieldset><legend>关联已观察证据</legend>{evidence.length === 0 && <p className="oc-muted">尚无已观察证据，无法确认验收通过。</p>}{evidence.map(item => <label className="oc-checkbox" key={item.id}><input type="checkbox" checked={evidenceIds.includes(item.id)} onChange={event => setEvidenceIds(event.target.checked ? [...evidenceIds, item.id] : evidenceIds.filter(id => id !== item.id))} />{item.claim}</label>)}</fieldset>{scope === 'visual' && <fieldset><legend>关联对照截图</legend><p className="oc-muted">视觉通过需要 Codex 参考图和 DSH 实现图，并确认两者是可比较的状态。缺图时请选择部分完成。</p>{screenshots.map(item => <label className="oc-checkbox" key={item.id}><input type="checkbox" checked={screenshotIds.includes(item.id)} onChange={event => setScreenshotIds(event.target.checked ? [...screenshotIds, item.id] : screenshotIds.filter(id => id !== item.id))} />{item.screenshot!.subject === 'codex' ? 'Codex' : item.screenshot!.subject === 'dsh' ? 'DSH' : '其他'} · {item.screenshot!.caption}</label>)}</fieldset>}<div className="oc-actions"><button disabled={busy || (outcome === 'passed' && (evidenceIds.length === 0 || (scope === 'visual' && !visualPair)))}><Icon name="check" />保存本项验收</button>{job.status === 'verifying' && <button type="button" disabled={busy} onClick={() => void run({ action: 'markReady', jobId: job.id }, '验收门槛已通过，可在 DSH 插件管理中选择安装该产物')}><Icon name="package" />检查是否可安装</button>}</div></form></details>;
+  return <details className="oc-section"><summary><Icon name="check" />记录隔离验收结果</summary><p className="oc-muted">检查隔离环境中的实际结果，选取相应证据。模型的自述不能替代验收。全部通过后会自动安装到当前 DSH 并启用。</p><form className="oc-form" onSubmit={event => { event.preventDefault(); void run({ action: 'recordVerification', jobId: job.id, input: { artifactId: job.artifactId!, scope, outcome, method: 'manual', environment: 'isolated', details, evidenceIds, ...(scope === 'visual' ? { screenshotIds } : {}) } }, '验收结果已记录'); }}><div className="oc-two-columns"><label>验收项目<select value={scope} onChange={event => setScope(event.target.value as VerificationScope)}><option value="behavior">行为</option><option value="visual">视觉</option><option value="lifecycle">生命周期</option></select></label><label>结果<select value={outcome} onChange={event => setOutcome(event.target.value as Verification['outcome'])}><option value="partial">部分完成</option><option value="failed">失败</option><option value="passed">通过</option></select></label></div><label>实际步骤与结果<textarea required minLength={10} rows={3} value={details} onChange={event => setDetails(event.target.value)} /></label><fieldset><legend>关联已观察证据</legend>{evidence.length === 0 && <p className="oc-muted">尚无已观察证据，无法确认验收通过。</p>}{evidence.map(item => <label className="oc-checkbox" key={item.id}><input type="checkbox" checked={evidenceIds.includes(item.id)} onChange={event => setEvidenceIds(event.target.checked ? [...evidenceIds, item.id] : evidenceIds.filter(id => id !== item.id))} />{item.claim}</label>)}</fieldset>{scope === 'visual' && <fieldset><legend>关联对照截图</legend><p className="oc-muted">视觉通过需要 Codex 参考图和 DSH 实现图，并确认两者是可比较的状态。缺图时请选择部分完成。</p>{screenshots.map(item => <label className="oc-checkbox" key={item.id}><input type="checkbox" checked={screenshotIds.includes(item.id)} onChange={event => setScreenshotIds(event.target.checked ? [...screenshotIds, item.id] : screenshotIds.filter(id => id !== item.id))} />{item.screenshot!.subject === 'codex' ? 'Codex' : item.screenshot!.subject === 'dsh' ? 'DSH' : '其他'} · {item.screenshot!.caption}</label>)}</fieldset>}<div className="oc-actions"><button disabled={busy || (outcome === 'passed' && (evidenceIds.length === 0 || (scope === 'visual' && !visualPair)))}><Icon name="check" />保存本项验收</button>{job.status === 'verifying' && <button type="button" disabled={busy} onClick={() => void run({ action: 'markReady', jobId: job.id }, '验收通过，已安排自动安装')}><Icon name="package" />检查验收并安装</button>}</div></form></details>;
 }
 
 function SettingsForm({ settings, busy, save, inspect }: { settings: Settings; busy: boolean; inspect: () => void; save: (patch: Partial<Settings>) => void }) {

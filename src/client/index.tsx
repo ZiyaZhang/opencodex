@@ -3,6 +3,7 @@ import type {} from '@deepseek-ai/dsh-api-remotes/client';
 import type { MainPanelId } from '@deepseek-ai/dsh-client-ui-layout/client';
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client';
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client';
+import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client';
 import { OPEN_CODEX_REMOTE } from '../host/remote.js';
 import { OpenCodexPage } from './page.js';
 import { Icon } from './icons.js';
@@ -23,7 +24,11 @@ export async function apply(ctx: Context): Promise<void> {
   ctx.inject(['remote.opencodex'], ctx => {
   ctx.slots.inject('main', () => ctx.slots.register({
     name: 'main', key: PANEL,
-    inject: () => ({ call: async (request: Parameters<typeof ctx.remote.opencodex.call>[0], signal?: AbortSignal) => {
+    inject: () => ({ openPlugin: (packageName: string) => {
+      const navigation = ctx.get('pluginNavigation');
+      if (!navigation) throw new Error('请先启用 DSH 插件管理页面');
+      navigation.openBundle(packageName);
+    }, call: async (request: Parameters<typeof ctx.remote.opencodex.call>[0], signal?: AbortSignal) => {
       const result = await ctx.remote.opencodex.call(request, signal);
       if (!result.ok) throw new Error(result.error.message);
       return result.value;

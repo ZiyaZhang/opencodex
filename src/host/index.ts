@@ -27,6 +27,7 @@ import { VersionMonitor } from './version-monitor.js';
 import { scaffoldPlugin } from './scaffold.js';
 import { addScreenshot, createJobWithReference, readReferenceImage, readScreenshot } from './reference-image.js';
 import { readPluginArtifact } from './plugin-download.js';
+import { PluginInstaller } from './plugin-install.js';
 
 export interface Config { dataDirectory?: string; maxOutputTokens?: number; monitorTickMs?: number; allowSubagents?: boolean; backgroundToolNames?: string[] }
 const ACTIVE = new Set<JobStatus>(['researching', 'specifying', 'building', 'verifying']);
@@ -49,6 +50,7 @@ export default class OpenCodex extends TypertRemoteService {
   readonly artifactRoot: string;
   private readonly resources = new ResourceReader(fileURLToPath(new URL('../../', import.meta.url)));
   private readonly store: Promise<OpenCodexStore>;
+  private readonly installer: Promise<PluginInstaller>;
   private readonly versionMonitor: VersionMonitor;
   private readonly lifetime = new AbortController();
   private readonly jobOperations = new Map<string, Promise<unknown>>();
@@ -74,6 +76,8 @@ export default class OpenCodex extends TypertRemoteService {
     const tick = config.monitorTickMs ?? 30_000;
     if (!Number.isSafeInteger(tick) || tick < 1000) throw new Error('monitorTickMs must be at least 1000');
     this.store = OpenCodexStore.open({ directory: this.directory, artifactRoot: this.artifactRoot });
+    this.installer = this.store.then(store => new PluginInstaller(store, this.directory, () => ctx.get('pluginManager'), this.lifetime.signal));
+    void this.installer.catch(() => undefined);
     // Retain the failure for RPC callers without an unhandled rejection before the first call.
     void this.store.catch(() => undefined);
     this.versionMonitor = new VersionMonitor(this.directory, this.store, id => this.localVersionCandidate(id));
@@ -92,6 +96,7 @@ export default class OpenCodex extends TypertRemoteService {
       try { store = await this.store; } catch { return; }
       for (const job of store.snapshot().jobs) if (ACTIVE.has(job.status)) await this.stop(job.id, 'paused', 'OpenCodex plugin unloaded');
       await Promise.allSettled([...this.jobOperations.values(), ...(this.scanOperation ? [this.scanOperation] : [])]);
+      await (await this.installer).whenIdle();
       const idle = store.snapshot().jobs.flatMap(job => job.sessionIds.map(id => this.ctx.agents.get(SessionId(id)))).filter(agent => agent !== undefined);
       for (const agent of idle) agent.cancel({ kind: 'user' });
       await Promise.allSettled(idle.map(agent => agent.whenIdle()));
@@ -128,8 +133,19 @@ export default class OpenCodex extends TypertRemoteService {
       case 'approveForeground':
         await this.serial(text(request.jobId, 'jobId'), async () => { await store.approveForeground(request.jobId, text(request.requestId, 'requestId')); await this.start(request.jobId); });
         break;
-      case 'recordVerification': await store.recordVerification(text(request.jobId, 'jobId'), request.input); break;
-      case 'markReady': if (!(await this.validateArtifact(text(request.jobId, 'jobId'))).passed) throw new Error('Package inspection did not pass'); await store.transitionJob(request.jobId, 'ready', { reason: 'User reviewed independent isolated acceptance' }); this.cancelSessions(store.getJob(request.jobId)); break;
+      case 'recordVerification':
+        await this.serial(text(request.jobId, 'jobId'), async () => {
+          await store.recordVerification(request.jobId, request.input);
+          const state = store.snapshot(), job = store.getJob(request.jobId), specId = state.specs.filter(s => s.jobId === job.id).at(-1)?.id;
+          if (['behavior', 'visual', 'lifecycle'].every(scope => state.verifications.filter(v => v.jobId === job.id && v.artifactId === job.artifactId && v.specId === specId && v.scope === scope).at(-1)?.outcome === 'passed')) await this.completeAcceptance(job.id);
+        });
+        break;
+      case 'markReady': await this.serial(text(request.jobId, 'jobId'), () => this.completeAcceptance(request.jobId)); break;
+      case 'installPlugin': {
+        const job = store.getJob(text(request.jobId, 'jobId'));
+        if (!['ready', 'installed'].includes(job.status)) throw new Error('Only accepted plugins can be installed');
+        this.queueInstallation(job.id); break;
+      }
       case 'markCovered': await store.markCovered(text(request.jobId, 'jobId'), { userConfirmed: true, specId: text(request.specId, 'specId'), reason: text(request.reason, 'reason') }); this.cancelSessions(store.getJob(request.jobId)); break;
       case 'validateArtifact': extra = { validation: await this.validateArtifact(text(request.jobId, 'jobId')) }; break;
       case 'scanLocalVersion': extra = { scan: await this.versionMonitor.check(signal) }; await this.capabilities(); break;
@@ -158,6 +174,7 @@ export default class OpenCodex extends TypertRemoteService {
     const checks = [
       { id: 'local-version', available: localVersion.selected && !localVersion.error, detail: localVersion.error ?? (localVersion.selected ? `Local version ${localVersion.version ?? 'baseline pending'}${localVersion.build ? ` (${localVersion.build})` : ''}; ${localVersion.watching ? 'watcher active' : 'periodic fallback'}` : 'Select a local version metadata file to enable immediate version checks') },
       { id: 'dsh-sessions', available: true, detail: 'Uses DSH sessionController and the configured main Agent' },
+      { id: 'plugin-manager', available: Boolean(this.ctx.get('pluginManager')), detail: 'Accepted generated bundles install and enable automatically through the current DSH profile plugin manager' },
       { id: 'workspace-sandbox', available: Boolean(this.ctx.get('sandbox') && this.ctx.get('sandboxPolicy')), detail: 'Research requires workspace-write confinement; no escalation is allowed' },
       { id: 'cua', available: names.some(name => /cua|computer/i.test(name)), detail: names.filter(name => /cua|computer/i.test(name)).join(', ') || 'Install and configure a DSH CUA provider' },
       { id: 'browser', available: names.some(name => /browser|playwright/i.test(name)), detail: names.filter(name => /browser|playwright/i.test(name)).join(', ') || 'No browser tool is currently registered' },
@@ -517,6 +534,21 @@ status: {offset?:number}; returns compact job/budget and latest-first paginated 
     if (!artifact) throw new Error('Register a generated plugin tarball before package inspection');
     return inspectArtifact(resolve(this.artifactRoot, artifact.path), artifact.sha256);
   }
+  private async completeAcceptance(id: string): Promise<void> {
+    const store = await this.store;
+    if (store.getJob(id).status === 'installed') return;
+    if (store.getJob(id).status !== 'ready') {
+      await this.validateArtifact(id);
+      await store.transitionJob(id, 'ready', { reason: 'All independent isolated acceptance scopes passed; installing through DSH' });
+      this.cancelSessions(store.getJob(id));
+    }
+    this.queueInstallation(id);
+  }
+  private queueInstallation(id: string): void {
+    void this.installer.then(installer => installer.install(id)).catch(error => {
+      if (!this.closed) this.ctx.logger.warn(`OpenCodex installation: ${errorText(error)}`);
+    });
+  }
   private scan(signal: AbortSignal): Promise<ScanResult> {
     if (this.scanOperation) return this.scanOperation;
     const run = this.store.then(store => scanSources(this.directory, store, AbortSignal.any([signal, this.lifetime.signal])));
@@ -566,6 +598,9 @@ status: {offset?:number}; returns compact job/budget and latest-first paginated 
     if (this.closed) return;
     const store = await this.store;
     const state = store.snapshot();
+    // Ready jobs never need a second install confirmation. Failed/interrupted attempts
+    // stay visible for explicit retry; polling must not loop native side effects.
+    for (const job of state.jobs) if (job.status === 'ready' && !job.installation) this.queueInstallation(job.id);
     for (const job of state.jobs) if (ACTIVE.has(job.status)) {
       const budget = store.budgetSummary(job.id);
       if (budget.elapsedMs >= job.budget.maxDurationMs || budget.job.remainingTokens <= 0 || budget.daily.remainingTokens <= 0) await this.stop(job.id, 'paused', 'Research budget exhausted');

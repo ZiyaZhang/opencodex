@@ -20,6 +20,14 @@ export interface ForegroundRequest {
 }
 export interface ForegroundLease { jobId: string; requestId: string; approvedAt: string }
 export interface SessionBinding { sessionId: string; parentSessionId?: string; boundAt: string }
+export interface PluginInstallation {
+  requestId: string; artifactId: string; artifactSha256: string;
+  status: 'installing' | 'installed' | 'failed' | 'interrupted';
+  startedAt: string; completedAt?: string;
+  packageName?: string; version?: string;
+  application?: 'applied' | 'restart-required' | 'overridden' | 'failed' | 'cancelled';
+  error?: string; logPath?: string; warnings?: string[];
+}
 export interface Job {
   id: string; title: string; description: string; source: 'user' | 'discovery'; candidateId?: string;
   mode: 'reconstruct' | 'investigate';
@@ -28,6 +36,7 @@ export interface Job {
   history: StateEvent[]; budgetHistory: Array<{ at: string; previous: JobBudget; next: JobBudget }>;
   sessionId?: string; sessionIds: string[]; sessionBindings: SessionBinding[]; workdir?: string;
   foreground?: ForegroundRequest; artifactId?: string; installedReceipt?: string;
+  installation?: PluginInstallation;
   coverage?: { specId: string; confirmedAt: string; reason: string };
 }
 export interface Candidate {

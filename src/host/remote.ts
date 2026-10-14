@@ -25,7 +25,7 @@ export type OpenCodexRequest =
   | { action: 'readPluginArtifact'; jobId: string; artifactId: string; offset?: number }
   | { action: 'settings'; patch: Partial<Settings> }
   | { action: 'start'; jobId: string; note?: string }
-  | { action: 'pause' | 'cancel' | 'validateArtifact'; jobId: string }
+  | { action: 'pause' | 'cancel' | 'validateArtifact' | 'installPlugin'; jobId: string }
   | { action: 'extendBudget'; jobId: string; patch: Partial<JobBudget> }
   | { action: 'approveForeground'; jobId: string; requestId: string }
   | { action: 'recordVerification'; jobId: string; input: VerificationInput }
@@ -52,9 +52,10 @@ function json(value: unknown): unknown {
 function request(value: unknown): OpenCodexRequest {
   const parsed = json(value);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !('action' in parsed)
-      || typeof parsed.action !== 'string' || !['snapshot', 'scan', 'scanLocalVersion', 'capabilities', 'create', 'readReferenceImage', 'readScreenshot', 'addScreenshot', 'readPluginArtifact', 'settings', 'start', 'pause', 'cancel', 'validateArtifact', 'extendBudget', 'approveForeground', 'recordVerification', 'markReady', 'markCovered', 'readResource'].includes(parsed.action)) {
+      || typeof parsed.action !== 'string' || !['snapshot', 'scan', 'scanLocalVersion', 'capabilities', 'create', 'readReferenceImage', 'readScreenshot', 'addScreenshot', 'readPluginArtifact', 'installPlugin', 'settings', 'start', 'pause', 'cancel', 'validateArtifact', 'extendBudget', 'approveForeground', 'recordVerification', 'markReady', 'markCovered', 'readResource'].includes(parsed.action)) {
     throw new Error('Unknown OpenCodex action');
   }
+  if (parsed.action === 'installPlugin' && (Object.keys(parsed).some(key => !['action', 'jobId'].includes(key)) || !('jobId' in parsed) || typeof parsed.jobId !== 'string')) throw new Error('Installation accepts a job identifier only, never a package spec or path');
   if (parsed.action === 'readReferenceImage' || parsed.action === 'readScreenshot') {
     const allowed = parsed.action === 'readScreenshot' ? ['action', 'jobId', 'artifactId'] : ['action', 'jobId'];
     if (Object.keys(parsed).some(key => !allowed.includes(key))) throw new Error('Image reads accept job/artifact identifiers only, never a path');

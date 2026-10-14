@@ -4,7 +4,7 @@ import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { gunzipSync } from 'node:zlib';
 
-export function inspectTarball(bytes: Buffer): { passed: boolean; details: string[] } {
+export function inspectTarball(bytes: Buffer): { passed: boolean; details: string[]; packageName: string; version: string } {
   if (bytes.byteLength > 16_000_000) throw new Error('Generated package exceeds the 16 MB inspection limit');
   const tar = gunzipSync(bytes, { maxOutputLength: 32_000_000 });
   const files = new Map<string, Buffer>();
@@ -34,11 +34,23 @@ export function inspectTarball(bytes: Buffer): { passed: boolean; details: strin
   const dsh = manifest.dsh as { bundle?: { patch?: string } } | undefined;
   const patch = dsh?.bundle?.patch;
   if (typeof manifest.name !== 'string' || typeof manifest.version !== 'string') throw new Error('Package requires a name and version');
+  if (manifest.name.length > 214 || !/^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/.test(manifest.name)) throw new Error('Invalid plugin package name');
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(manifest.version)) throw new Error('Plugin requires a concrete package version');
+  if (manifest.name === 'dsh-opencodex' || manifest.name.startsWith('@deepseek-ai/')) throw new Error('Generated features require their own package name, not OpenCodex or a DSH host package');
+  for (const field of ['dependencies', 'optionalDependencies', 'peerDependencies']) {
+    const dependencies = manifest[field];
+    if (dependencies === undefined) continue;
+    if (!dependencies || typeof dependencies !== 'object' || Array.isArray(dependencies)) throw new Error(`Invalid ${field}`);
+    for (const [name, spec] of Object.entries(dependencies)) {
+      if (name === 'dsh-opencodex') throw new Error('Feature plugins must run independently of OpenCodex');
+      if (typeof spec !== 'string' || /^(?:file:|link:|workspace:|\/|\.\.?[\\/]|[a-zA-Z]:[\\/])/.test(spec)) throw new Error('Feature runtime dependencies must not reference a local research workspace');
+    }
+  }
   if (typeof patch !== 'string' || !files.has(`package/${patch.replace(/^\.\//, '')}`)) throw new Error('Package requires a shipped dsh.bundle.patch');
   if (![...files.keys()].some(path => /\.(?:js|mjs|cjs)$/.test(path))) throw new Error('Package has no compiled JavaScript entry');
   const scripts = manifest.scripts as Record<string, unknown> | undefined;
   if (scripts && ['preinstall', 'install', 'postinstall'].some(key => key in scripts)) throw new Error('Generated bundles must not execute lifecycle install scripts');
-  return { passed: true, details: [`Inspected ${manifest.name}@${manifest.version}: ${files.size} files; bundle patch and compiled JavaScript present.`, 'No code was executed. Behavior, visuals and lifecycle still require independent isolated acceptance.'] };
+  return { passed: true, packageName: manifest.name, version: manifest.version, details: [`Inspected ${manifest.name}@${manifest.version}: ${files.size} files; bundle patch and compiled JavaScript present.`, 'No code was executed. Behavior, visuals and lifecycle still require independent isolated acceptance.'] };
 }
 
 export async function inspectArtifact(path: string, expectedHash: string): Promise<{ passed: boolean; details: string[] }> {

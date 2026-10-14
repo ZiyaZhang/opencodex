@@ -2,7 +2,7 @@ import { constants } from 'node:fs';
 import { mkdir, open, readFile, rename, unlink, realpath, lstat } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
-import type { Artifact, BudgetSummary, CandidateInput, CapabilitySnapshot, CreateJobInput, EvidenceInput, ForegroundRequest, Job, JobBudget, JobStatus, Settings, SpecInput, StoreOptions, StoreState, TokenReservation, TokenUsage, VerificationInput } from './types.js';
+import type { Artifact, BudgetSummary, CandidateInput, CapabilitySnapshot, CreateJobInput, EvidenceInput, ForegroundRequest, Job, JobBudget, JobStatus, PluginInstallation, Settings, SpecInput, StoreOptions, StoreState, TokenReservation, TokenUsage, VerificationInput } from './types.js';
 import { check, count, relativePath, textValue, validateCapabilities, validateScreenshotMetadata, validateSettings, validateState, ValidationError } from './validation.js';
 import { readScreenshotFile } from './screenshot.js';
 
@@ -113,6 +113,11 @@ export class OpenCodexStore {
       }
       const store = new OpenCodexStore(directory, resolvedArtifacts, state, now, lockToken);
       let recovered = false; const at = stamp(now);
+      for (const job of state.jobs) if (job.installation?.status === 'installing') {
+        job.installation.status = 'interrupted'; job.installation.completedAt = at;
+        job.installation.error = '安装过程被中断，结果尚未确认。可在 DSH 插件管理中查看，或重试以核对并继续。';
+        job.updatedAt = at; recovered = true;
+      }
       if (state.foregroundLease) { releaseForeground(state, state.foregroundLease.jobId, at, 'Process restarted; foreground control needs fresh user approval'); recovered = true; }
       for (const job of state.jobs) if (job.foreground?.approvedAt && !job.foreground.releasedAt && !job.foreground.completedAt) {
         job.foreground.releasedAt = at; job.foreground.releaseReason = 'No live foreground lease after restart; fresh approval required'; recovered = true;
@@ -182,6 +187,7 @@ export class OpenCodexStore {
   transitionJob(id: string, status: JobStatus, options: { reason?: string } = {}): Promise<Job> {
     return this.#mutate(async (state, at) => {
       const job = findJob(state, id); check(TRANSITIONS[job.status].includes(status), `Invalid transition ${job.status} -> ${status}`);
+      check(!job.installation, 'Manage this accepted plugin through DSH plugin management');
       if (job.mode === 'investigate') check(!['building', 'verifying', 'ready'].includes(status), 'Investigation jobs do not reconstruct plugins; select a feature to create a reconstruction job');
       if (ACTIVE.has(status)) {
         const usage = summary(state, id, at); check(usage.elapsedMs < job.budget.maxDurationMs, 'Run time budget exhausted');
@@ -403,7 +409,40 @@ export class OpenCodexStore {
     });
   }
 
-  /** Call only after an explicit UI action and a successful real installer result. */
+  /** Host-owned installation journal. No agent tool may call these methods. */
+  beginInstallation(jobId: string): Promise<PluginInstallation> {
+    return this.#mutate((state, at) => {
+      const job = findJob(state, jobId);
+      check(job.status === 'ready' && job.mode === 'reconstruct', 'Only an accepted reconstruction can be installed');
+      check(job.installation?.status !== 'installing', 'Installation is already in progress');
+      const artifact = state.artifacts.find(a => a.id === job.artifactId)!;
+      job.installation = { requestId: randomUUID(), artifactId: artifact.id, artifactSha256: artifact.sha256, status: 'installing', startedAt: at };
+      job.updatedAt = at; return job.installation;
+    });
+  }
+
+  async assertInstallable(jobId: string): Promise<void> {
+    await this.#queue;
+    const job = findJob(this.#state, jobId);
+    check(job.status === 'ready' && job.mode === 'reconstruct', 'Only an accepted reconstruction can be installed');
+    await this.#assertReady(this.#state, job);
+  }
+
+  finishInstallation(jobId: string, requestId: string, result: Pick<PluginInstallation, 'status' | 'packageName' | 'version' | 'application' | 'error' | 'warnings' | 'logPath'>): Promise<Job> {
+    return this.#mutate((state, at) => {
+      const job = findJob(state, jobId), current = job.installation;
+      check(job.status === 'ready' && current?.requestId === requestId && current.status === 'installing', 'Installation request is no longer current');
+      check(result.status !== 'installing', 'Installation result must be terminal');
+      job.installation = { ...current, ...result, completedAt: at }; job.updatedAt = at;
+      if (result.status === 'installed') {
+        job.installedReceipt = JSON.stringify(job.installation);
+        change(state, job, 'installed', at, result.application === 'restart-required' ? 'DSH installed and enabled the independent plugin; restart required' : 'DSH installed and enabled the independent plugin');
+      }
+      return job;
+    });
+  }
+
+  /** Legacy offline API for a user-provided successful installer receipt. */
   markInstalled(jobId: string, input: { userConfirmed: true; artifactId: string; receipt: string }): Promise<Job> {
     return this.#mutate(async (state, at) => {
       const job = findJob(state, jobId); check(job.status === 'ready', 'Only a ready job can be installed');
