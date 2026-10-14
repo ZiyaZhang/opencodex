@@ -1,0 +1,3 @@
+- insert:
+    - id: __PLUGIN_NAME__
+      name: __PLUGIN_NAME__
