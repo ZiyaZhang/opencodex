@@ -132,7 +132,9 @@ export function validateState(value: unknown): asserts value is StoreState {
     }
   }
   for (const raw of list(s.candidates, 'candidates')) {
-    const c = object(raw, 'candidate', ['id', 'title', 'description', 'sourceUrl', 'detectedAt', 'updatedAt', 'fingerprint', 'status'], ['version', 'sourceType', 'autoInvestigate']);
+    const c = object(raw, 'candidate', ['id', 'title', 'description', 'sourceUrl', 'detectedAt', 'updatedAt', 'fingerprint', 'status'], ['version', 'sourceType', 'autoInvestigate', 'publishedAt', 'releaseTitle']);
+    if (c.publishedAt !== undefined) isoDate(c.publishedAt, 'candidate publishedAt');
+    if (c.releaseTitle !== undefined) textValue(c.releaseTitle, 'candidate releaseTitle');
     for (const key of ['id', 'title', 'fingerprint']) textValue(c[key], key); textValue(c.description, 'description', true); webUrl(c.sourceUrl, 'sourceUrl'); isoDate(c.detectedAt, 'detectedAt'); isoDate(c.updatedAt, 'updatedAt'); enumeration(c.status, ['new', 'selected', 'dismissed'], 'candidate status'); if (c.version !== undefined) textValue(c.version, 'version');
     if (c.sourceType !== undefined) enumeration(c.sourceType, ['public-source', 'local-version'], 'candidate sourceType');
     if (c.autoInvestigate !== undefined) { check(typeof c.autoInvestigate === 'boolean', 'candidate autoInvestigate must be boolean'); check(!c.autoInvestigate || c.sourceType === 'local-version', 'Only local-version candidates can be automatically investigated'); }
@@ -152,7 +154,12 @@ export function validateState(value: unknown): asserts value is StoreState {
     check((f.evidenceIds as string[]).length > 0, 'Spec needs evidence');
   }
   for (const raw of list(s.artifacts, 'artifacts')) {
-    const a = object(raw, 'artifact', ['id', 'jobId', 'path', 'label', 'kind', 'sha256', 'bytes', 'createdAt'], ['screenshot']); idDates(a); textValue(a.jobId, 'jobId'); relativePath(a.path); textValue(a.label, 'label'); enumeration(a.kind, ['plugin', 'report', 'screenshot', 'log'], 'artifact kind'); digest(a.sha256); count(a.bytes, 'bytes');
+    const a = object(raw, 'artifact', ['id', 'jobId', 'path', 'label', 'kind', 'sha256', 'bytes', 'createdAt'], ['screenshot', 'provenance']); idDates(a); textValue(a.jobId, 'jobId'); relativePath(a.path); textValue(a.label, 'label'); enumeration(a.kind, ['plugin', 'report', 'screenshot', 'log'], 'artifact kind'); digest(a.sha256); count(a.bytes, 'bytes');
+    if (a.provenance !== undefined) {
+      const provenance = object(a.provenance, 'artifact provenance', ['kind', 'details']);
+      check(a.kind === 'plugin' && provenance.kind === 'operator-assisted', 'Only an imported plugin may carry operator provenance');
+      textValue(provenance.details, 'artifact provenance details');
+    }
     if (a.screenshot !== undefined) { check(a.kind === 'screenshot', 'Screenshot metadata requires a screenshot artifact'); validateScreenshotMetadata(a.screenshot); }
   }
   for (const raw of list(s.verifications, 'verifications')) {

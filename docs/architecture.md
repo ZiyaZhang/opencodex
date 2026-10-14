@@ -34,7 +34,7 @@ scaffold 在不存在或为空的 `plugin/` 中复制固定的八个通用模板
 
 ## v0.1 当前实现范围
 
-公开来源扫描针对官方 changelog 与 Codex CLI releases 的内容变化；它保存基线和候选线索，不自动证明具体功能上线。22 条公共来源索引用于选定任务的按需研究，不等于 22 个后台监测器。
+公开来源扫描读取官方 changelog 的 RSS，必要时回退 HTML，按具体功能生成候选；默认限最近 90 天、8 个适用发布条目、32 项功能。首次检查也解析条目，后续按功能指纹去重，保留用户已选择的状态。它筛除 CLI、移动端专属、纯模型和修复列表，解析失败与没有新增分别报告。文档不证明本机已开放。公共来源索引用于选定任务的按需研究，不等于同等数量的后台监测器。
 
 本地监测由用户设置 `localVersionFile` 的绝对路径，默认留空。当前只读取不超过 1 MiB 的 XML `Info.plist` 或 JSON 元数据（例如 `package.json`）；XML 使用 `CFBundleShortVersionString`/`CFBundleVersion`，JSON 使用 `version`/`build`。不执行文件、不主动搜索安装位置，不支持二进制 plist。只有版本或 build 变化才触发候选，其他打包内容变化不算产品更新。
 

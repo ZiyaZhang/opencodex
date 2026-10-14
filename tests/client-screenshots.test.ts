@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
-import { ScreenshotGallery } from '../src/client/page.js';
+import { JobReferenceThumbnail, ScreenshotGallery } from '../src/client/page.js';
 import type { Artifact } from '../src/core/types.js';
 import type { OpenCodexRequest, OpenCodexResponse } from '../src/host/remote.js';
 
@@ -58,5 +58,47 @@ test('image read failures remain visible instead of becoming a successful refere
   await act(async () => { renderer = create(createElement(ScreenshotGallery, { jobId: 'job', artifacts: [], call: async () => { throw new Error('Recorded image hash changed'); } })); });
   assert.equal(renderer.root.findAllByType('img').length, 0);
   assert.match(renderer.root.findByProps({ role: 'alert' }).children.join(''), /hash changed/);
+  await act(async () => renderer.unmount());
+});
+
+test('list thumbnails load real references once across snapshot refreshes and reload changed artifacts', async () => {
+  const calls: OpenCodexRequest[] = [];
+  const call = async (request: OpenCodexRequest) => { calls.push(request); return response({ screenshot: picture }); };
+  let renderer!: ReactTestRenderer;
+  await act(async () => { renderer = create(createElement(JobReferenceThumbnail, { jobId: 'job', artifacts: [shot('reference', 'codex')], call })); });
+  await act(async () => { renderer.update(createElement(JobReferenceThumbnail, { jobId: 'job', artifacts: [shot('reference', 'codex')], call })); });
+  assert.equal(calls.length, 1);
+  assert.equal(renderer.root.findByType('img').props.alt, 'codex visible feature');
+  await act(async () => { renderer.update(createElement(JobReferenceThumbnail, { jobId: 'job', artifacts: [{ ...shot('reference', 'codex'), sha256: 'changed' }], call })); });
+  assert.equal(calls.length, 2);
+  await act(async () => renderer.unmount());
+});
+
+test('list thumbnail keeps legacy uploads visible and distinguishes missing references', async () => {
+  const calls: OpenCodexRequest[] = [];
+  const call = async (request: OpenCodexRequest) => { calls.push(request); return response('jobId' in request && request.jobId === 'legacy' ? { referenceImage: picture } : {}); };
+  let renderer!: ReactTestRenderer;
+  await act(async () => { renderer = create(createElement(JobReferenceThumbnail, { jobId: 'legacy', artifacts: [], call })); });
+  assert.equal(renderer.root.findAllByType('img').length, 1);
+  await act(async () => { renderer.update(createElement(JobReferenceThumbnail, { jobId: 'missing', artifacts: [], call })); });
+  assert.equal(renderer.root.findAllByType('img').length, 0);
+  assert.match(JSON.stringify(renderer.toJSON()), /缺参考图/);
+  assert.deepEqual(calls, [{ action: 'readReferenceImage', jobId: 'legacy' }, { action: 'readReferenceImage', jobId: 'missing' }]);
+  await act(async () => renderer.unmount());
+});
+
+test('list thumbnail cancels a previous job request and ignores its late picture', async () => {
+  let resolveOld!: (value: OpenCodexResponse) => void;
+  let signalOld!: AbortSignal;
+  const call = async (request: OpenCodexRequest, signal?: AbortSignal) => {
+    if ('jobId' in request && request.jobId === 'old') { signalOld = signal!; return new Promise<OpenCodexResponse>(resolve => { resolveOld = resolve; }); }
+    return response();
+  };
+  let renderer!: ReactTestRenderer;
+  await act(async () => { renderer = create(createElement(JobReferenceThumbnail, { jobId: 'old', artifacts: [], call })); });
+  await act(async () => { renderer.update(createElement(JobReferenceThumbnail, { jobId: 'new', artifacts: [], call })); });
+  assert.equal(signalOld.aborted, true);
+  await act(async () => { resolveOld(response({ referenceImage: picture })); });
+  assert.equal(renderer.root.findAllByType('img').length, 0);
   await act(async () => renderer.unmount());
 });

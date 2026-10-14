@@ -35,8 +35,8 @@
         "ide"
       ],
       "sourceType": "official-changelog",
-      "checkedAt": "2026-10-13",
-      "notes": "Read the current changelog. The older developers.openai.com/codex/changelog URL redirects here; separate surface, release channel and local eligibility."
+      "checkedAt": "2026-10-14",
+      "notes": "Read the canonical HTML changelog or its /rss.xml feed. The .md endpoint returned 404 during this audit. Discovery extracts bounded recent desktop/Codex-related product announcements one feature at a time; CLI, mobile and model-only release entries are excluded. Public announcements do not establish availability in the local app."
     },
     {
       "id": "codex-features",

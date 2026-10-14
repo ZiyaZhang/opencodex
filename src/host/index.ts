@@ -25,7 +25,8 @@ import { scanSources, type ScanResult } from './discovery.js';
 import { inspectArtifact } from './artifact.js';
 import { VersionMonitor } from './version-monitor.js';
 import { scaffoldPlugin } from './scaffold.js';
-import { createJobWithReference, readReferenceImage, readScreenshot } from './reference-image.js';
+import { addScreenshot, createJobWithReference, readReferenceImage, readScreenshot } from './reference-image.js';
+import { readPluginArtifact } from './plugin-download.js';
 
 export interface Config { dataDirectory?: string; maxOutputTokens?: number; monitorTickMs?: number; allowSubagents?: boolean; backgroundToolNames?: string[] }
 const ACTIVE = new Set<JobStatus>(['researching', 'specifying', 'building', 'verifying']);
@@ -108,10 +109,17 @@ export default class OpenCodex extends TypertRemoteService {
       case 'snapshot': break;
       case 'readReferenceImage': extra = { referenceImage: await readReferenceImage(store, request.jobId, signal) }; break;
       case 'readScreenshot': extra = { screenshot: await readScreenshot(store, request.jobId, request.artifactId, signal) }; break;
-      case 'create':
-        if (request.referenceImage !== undefined) await createJobWithReference(store, request.input, request.referenceImage, signal);
-        else await store.createJob(request.input);
+      case 'addScreenshot': await addScreenshot(store, request.jobId, request.image, request.metadata, signal); break;
+      case 'readPluginArtifact': extra = { pluginArtifact: await readPluginArtifact(store, request.jobId, request.artifactId, request.offset, signal) }; break;
+      case 'create': {
+        const create = async () => {
+          if (request.referenceImage !== undefined) await createJobWithReference(store, request.input, request.referenceImage, signal);
+          else await store.createJob(request.input);
+        };
+        if (request.input?.candidateId) await this.serial(`candidate-create:${text(request.input.candidateId, 'candidateId')}`, create);
+        else await create();
         break;
+      }
       case 'settings': await store.updateSettings(request.patch); await this.versionMonitor.configure(store.snapshot().settings.localVersionFile); break;
       case 'start': await this.serial(text(request.jobId, 'jobId'), () => this.start(request.jobId, request.note)); break;
       case 'pause': await this.serial(text(request.jobId, 'jobId'), () => this.stop(request.jobId, 'paused', 'Paused by user')); break;
@@ -517,6 +525,13 @@ status: {offset?:number}; returns compact job/budget and latest-first paginated 
     return run;
   }
   private async localVersionCandidate(candidateId: string): Promise<void> {
+    // A version event is a trigger: refresh individual release-note features without a model.
+    try { await this.scan(this.lifetime.signal); }
+    catch (error) {
+      if (this.closed || this.lifetime.signal.aborted) return;
+      // A broken public checkpoint must not discard an independently detected local update.
+      this.ctx.logger.warn(`OpenCodex public source refresh: ${errorText(error)}`);
+    }
     await this.serial(`local-candidate:${candidateId}`, async () => {
       const store = await this.store;
       const state = store.snapshot();

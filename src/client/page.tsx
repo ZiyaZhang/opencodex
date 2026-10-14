@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import type { Artifact, Job, JobStatus, Settings, VerificationScope, Verification } from '../core/types.js';
 import type { OpenCodexRequest, OpenCodexResponse } from '../host/remote.js';
 import catalog from '../../resources/catalog.json';
 import { Icon, type IconName } from './icons.js';
+import { fetchPluginArtifact } from './plugin-download.js';
 
 type Call = (request: OpenCodexRequest, signal?: AbortSignal) => Promise<OpenCodexResponse>;
 type ReferenceImage = { mimeType: 'image/png' | 'image/jpeg' | 'image/webp'; dataBase64: string };
@@ -23,16 +25,52 @@ function Status({ status }: { status: JobStatus }) {
   return <span className={`oc-status oc-${status}`}><Icon name={icon} />{labels[status]}</span>;
 }
 
-function JobRow({ job, confirmed, open }: { job: Job; confirmed: number; open: () => void }) {
+function JobRow({ job, artifacts, confirmed, call, open }: { job: Job; artifacts: Artifact[]; confirmed: number; call: Call; open: () => void }) {
+  const plugin = artifacts.find(item => item.kind === 'plugin');
   return <button className="oc-job-row" onClick={open}>
-    <span className="oc-job-symbol"><Icon name={job.mode === 'investigate' ? 'search' : 'code'} /></span>
+    <JobReferenceThumbnail jobId={job.id} artifacts={artifacts} call={call} />
     <span className="oc-job-content">
       <span className="oc-row-title"><strong>{job.title}</strong><Status status={job.status} /></span>
       <span className="oc-job-description">{featureDescription(job.description) || '尚无补充描述'}</span>
-      <span className="oc-row-meta"><span><Icon name="clock" />{date(job.updatedAt)}</span><span><Icon name="gauge" /><span className="oc-numeric">{number(confirmed)} <span className="oc-separator">/</span> {number(job.budget.tokenLimit)}</span><span className="oc-unit">tokens</span></span></span>
+      <span className="oc-row-meta"><span><Icon name="package" />{plugin ? (['ready', 'installed'].includes(job.status) ? '已有插件包 · 已验收' : '已有实验包 · 待验收') : '尚未产出插件包'}</span><span><Icon name="clock" />{date(job.updatedAt)}</span><span><Icon name="gauge" /><span className="oc-numeric">{number(confirmed)} <span className="oc-separator">/</span> {number(job.budget.tokenLimit)}</span><span className="oc-unit">tokens</span></span></span>
     </span>
     <Icon name="next" className="oc-row-arrow" />
   </button>;
+}
+
+/** Image reads begin near the viewport and depend on identity/hash, never snapshot object identity. */
+export function JobReferenceThumbnail({ jobId, artifacts, call }: { jobId: string; artifacts: Artifact[]; call: Call }) {
+  const selected = artifacts.filter(item => item.jobId === jobId && item.kind === 'screenshot' && item.screenshot?.subject === 'codex').at(-1);
+  const container = useRef<HTMLSpanElement>(null);
+  const [visible, setVisible] = useState(false);
+  const [picture, setPicture] = useState<ReferenceImage>();
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    if (typeof IntersectionObserver === 'undefined' || !container.current) { setVisible(true); return; }
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) { setVisible(true); observer.disconnect(); }
+    }, { rootMargin: '160px' });
+    observer.observe(container.current);
+    return () => observer.disconnect();
+  }, []);
+  useEffect(() => {
+    const controller = new AbortController();
+    setPicture(undefined); setError('');
+    if (!visible) return () => controller.abort();
+    setLoading(true);
+    const request: OpenCodexRequest = selected ? { action: 'readScreenshot', jobId, artifactId: selected.id } : { action: 'readReferenceImage', jobId };
+    void call(request, controller.signal).then(result => {
+      if (!controller.signal.aborted) setPicture(selected ? result.screenshot : result.referenceImage);
+    }).catch(err => { if (!controller.signal.aborted) setError(err instanceof Error ? err.message : String(err)); })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, [call, visible, jobId, selected?.id, selected?.sha256]);
+  const caption = selected?.screenshot?.caption ?? '用户提供的 Codex 参考截图';
+  return <span ref={container} className="oc-job-thumbnail" title={error || (picture ? caption : undefined)}>
+    {picture ? <><img src={`data:${picture.mimeType};base64,${picture.dataBase64}`} alt={caption} loading="lazy" /><span>Codex 参考</span></>
+      : <span className="oc-thumb-empty">{loading || !visible ? '读取参考图…' : error ? '参考图不可读' : '缺参考图'}</span>}
+  </span>;
 }
 
 export function OpenCodexPage({ call }: { call: Call }) {
@@ -51,6 +89,7 @@ export function OpenCodexPage({ call }: { call: Call }) {
   const [readingImage, setReadingImage] = useState(false);
   const [tokens, setTokens] = useState(100_000);
   const [resource, setResource] = useState<{ id: string; content: string }>();
+  const [selectedCandidates, setSelectedCandidates] = useState<string[]>([]);
   const lifecycle = useRef<AbortController>();
   const refresh = useCallback(async (signal?: AbortSignal) => {
     const result = await call({ action: 'snapshot' }, signal);
@@ -74,7 +113,14 @@ export function OpenCodexPage({ call }: { call: Call }) {
       const response = await call(request, lifecycle.current?.signal);
       setData(response);
       if (response.resource) setResource(response.resource);
-      if (response.scan) setNotice(`检查完成：${response.scan.baseline} 个基线，${response.scan.changed} 个变化，${response.scan.unchanged} 个未变化。${response.scan.errors.join('；')}`);
+      if (response.scan) {
+        const scan = response.scan;
+        if (scan.errors.length) {
+          const partial = scan.baseline + scan.changed + scan.unchanged > 0 || (scan.discovered ?? 0) > 0;
+          setError(`${partial ? '部分来源检查失败' : '检查失败'}：${scan.errors.join('；')}`);
+          if ((scan.discovered ?? 0) > 0) setNotice(`已保存 ${scan.discovered} 项功能候选，其余来源可稍后重试。`);
+        } else setNotice(`检查完成：${scan.discovered ?? 0} 项新功能候选，${scan.changed} 个来源变化。`);
+      }
       else if (response.validation) setNotice(response.validation.details.join('\n'));
       else if (success) setNotice(success);
       return response;
@@ -104,10 +150,29 @@ export function OpenCodexPage({ call }: { call: Call }) {
     if (result) { const previous = new Set(data?.state.jobs.map(item => item.id)); setSelected(result.state.jobs.find(item => !previous.has(item.id))?.id); setNewJob(false); setTitle(''); setDescription(''); setReferenceImage(undefined); setReferenceName(''); setTab('research'); }
   };
   const openNew = () => { setReferenceImage(undefined); setReferenceName(''); setTokens(data?.state.settings.defaultJobTokenLimit ?? 100_000); setNewJob(true); setSelected(undefined); setTab('research'); };
+  const createSelectedCandidates = async () => {
+    if (busy || !data) return;
+    const candidates = data.state.candidates.filter(item => selectedCandidates.includes(item.id) && item.status === 'new' && item.sourceType !== 'local-version');
+    if (!candidates.length) return;
+    setBusy(true); setError(''); setNotice('');
+    const created: string[] = [];
+    try {
+      for (const candidate of candidates) {
+        const result = await call({ action: 'create', input: { title: candidate.title, description: candidate.description, source: 'discovery', candidateId: candidate.id, budget: { tokenLimit: data.state.settings.defaultJobTokenLimit } } }, lifecycle.current?.signal);
+        setData(result); created.push(candidate.id);
+      }
+      setSelected(undefined); setNewJob(false); setTab('research');
+    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    finally {
+      setSelectedCandidates(previous => previous.filter(id => !created.includes(id)));
+      if (created.length) setNotice(`已创建 ${created.length} 项研究任务。打开任务选择开始后，才会调用模型。`);
+      setBusy(false);
+    }
+  };
 
   return <div className="oc-page">
     <header className="oc-header"><div><div className="oc-brand">OpenCodex <span>预览版</span></div><p>从功能发现，到本机研究与 DSH 插件。</p></div><button className="oc-primary" onClick={openNew}><Icon name="plus" />主动研究功能</button></header>
-    <nav className="oc-tabs" aria-label="OpenCodex"><div>{tabs.map(([id, label]) => <button key={id} aria-current={tab === id ? 'page' : undefined} onClick={() => { setTab(id); setSelected(undefined); setNewJob(false); }}><Icon name={tabIcons[id]} />{label}{id === "discover" && (data?.state.candidates.filter(c => c.status === "new").length ?? 0) > 0 && <span className="oc-count">{data!.state.candidates.filter(c => c.status === "new").length}</span>}</button>)}</div><span className="oc-local"><Icon name="desktop" />本机执行</span></nav>
+    <nav className="oc-tabs" aria-label="OpenCodex"><div>{tabs.map(([id, label]) => <button key={id} aria-current={tab === id ? 'page' : undefined} onClick={() => { setTab(id); setSelected(undefined); setNewJob(false); }}><Icon name={tabIcons[id]} />{label}{id === "discover" && (data?.state.candidates.filter(c => c.status === "new" && c.sourceType !== "local-version").length ?? 0) > 0 && <span className="oc-count">{data!.state.candidates.filter(c => c.status === "new" && c.sourceType !== "local-version").length}</span>}</button>)}</div><span className="oc-local"><Icon name="desktop" />本机执行</span></nav>
     {error && <div className="oc-notice oc-error" role="alert">{error}</div>}
     {connectionError && <div className="oc-notice oc-error" role="alert">连接异常：{connectionError}</div>}
     {notice && <div className="oc-notice" role="status">{notice}</div>}
@@ -123,9 +188,16 @@ export function OpenCodexPage({ call }: { call: Call }) {
         <button className="oc-primary" disabled={busy || readingImage || !title.trim()}><Icon name="plus" />创建研究任务</button>
       </form> : job ? <JobDetail key={job.id} job={job} data={data} busy={busy} run={run} call={call} back={() => setSelected(undefined)} /> : <>
         <div className="oc-section-head"><h2>研究任务 <span className="oc-heading-count">{data.state.jobs.length}</span></h2></div>
-        {data.state.jobs.length === 0 ? <div className="oc-empty"><div className="oc-empty-mark"><Icon name="search" /></div><h2>下一项功能，从这里开始</h2><p>描述你想复刻的交互，或从更新中选择候选。<br />研究证据、生成代码和验收结果都保存在本机。</p><button onClick={openNew}><Icon name="plus" />创建第一个任务</button></div> : <div className="oc-list">{[...data.state.jobs].reverse().map(item => <JobRow key={item.id} job={item} confirmed={data.budgets[item.id]?.job.confirmedTokens ?? 0} open={() => setSelected(item.id)} />)}</div>}
+        {data.state.jobs.length === 0 ? <div className="oc-empty"><div className="oc-empty-mark"><Icon name="search" /></div><h2>下一项功能，从这里开始</h2><p>描述你想复刻的交互，或从更新中选择候选。<br />研究证据、生成代码和验收结果都保存在本机。</p><button onClick={openNew}><Icon name="plus" />创建第一个任务</button></div> : <div className="oc-list">{[...data.state.jobs].reverse().map(item => <JobRow key={item.id} job={item} artifacts={data.state.artifacts.filter(artifact => artifact.jobId === item.id)} confirmed={data.budgets[item.id]?.job.confirmedTokens ?? 0} call={call} open={() => setSelected(item.id)} />)}</div>}
       </>)}
-      {tab === 'discover' && <><div className="oc-section-head"><div><h2>更新发现</h2><p className="oc-muted">轻量检查公开来源；首次检查保存基线，变化需进一步研究确认。</p></div><button disabled={busy} onClick={() => void run({ action: 'scan' })}><Icon name="refresh" />{busy ? '检查中…' : '检查更新'}</button></div>{data.state.candidates.length ? <div className="oc-list">{data.state.candidates.map(candidate => <article className="oc-candidate" key={candidate.id}><div className="oc-row-title"><strong>{candidate.title}</strong><span className="oc-status">{candidate.status === 'selected' ? '已选择' : '待确认'}</span></div><p>{candidate.description}</p><div className="oc-row-title"><a href={link(candidate.sourceUrl)} target="_blank" rel="noreferrer">查看来源<Icon name="external" /></a><button disabled={busy || candidate.status === 'selected'} onClick={() => { setTokens(data.state.settings.defaultJobTokenLimit); void create(candidate.id); }}><Icon name="search" />选择研究</button></div></article>)}</div> : <div className="oc-empty"><h2>还没有候选变化</h2><p>检查不会启动模型，也不会自动进入深入研究。</p></div>}</>}
+      {tab === 'discover' && <>
+        <div className="oc-section-head"><div><h2>更新发现</h2><p className="oc-muted">从更新日志选择功能。先创建任务，再选择开始研究。</p></div><button disabled={busy} onClick={() => void run({ action: 'scan' })}><Icon name="refresh" />{busy ? '检查中…' : '检查更新'}</button></div>
+        {data.state.candidates.some(item => item.sourceType !== 'local-version') ? <>
+          <div className="oc-discovery-actions"><label className="oc-checkbox"><input type="checkbox" disabled={busy || !data.state.candidates.some(item => item.status === 'new' && item.sourceType !== 'local-version')} checked={data.state.candidates.filter(item => item.status === 'new' && item.sourceType !== 'local-version').length > 0 && data.state.candidates.filter(item => item.status === 'new' && item.sourceType !== 'local-version').every(item => selectedCandidates.includes(item.id))} onChange={event => setSelectedCandidates(event.target.checked ? data.state.candidates.filter(item => item.status === 'new' && item.sourceType !== 'local-version').map(item => item.id) : [])} />选择未研究功能</label><button className="oc-primary" disabled={busy || !data.state.candidates.some(item => selectedCandidates.includes(item.id) && item.status === 'new' && item.sourceType !== 'local-version')} onClick={() => void createSelectedCandidates()}><Icon name="search" />研究所选 ({data.state.candidates.filter(item => selectedCandidates.includes(item.id) && item.status === 'new' && item.sourceType !== 'local-version').length})</button></div>
+          <div className="oc-list">{data.state.candidates.filter(item => item.sourceType !== 'local-version').map(candidate => <article className="oc-candidate" key={candidate.id}><div className="oc-row-title"><label className="oc-checkbox"><input type="checkbox" disabled={busy || candidate.status !== 'new'} checked={candidate.status === 'selected' || selectedCandidates.includes(candidate.id)} onChange={event => setSelectedCandidates(previous => event.target.checked ? [...new Set([...previous, candidate.id])] : previous.filter(id => id !== candidate.id))} /><strong>{candidate.title}</strong></label><span className="oc-status">{candidate.status === 'selected' ? '已创建研究' : candidate.status === 'dismissed' ? '已忽略' : '待选择'}</span></div><p>{candidate.description}</p>{(candidate.publishedAt || candidate.releaseTitle) && <p className="oc-release-meta">{[candidate.publishedAt?.slice(0, 10), candidate.releaseTitle].filter(Boolean).join(' · ')}</p>}{link(candidate.sourceUrl) && <a href={candidate.sourceUrl} target="_blank" rel="noreferrer">查看更新来源<Icon name="external" /></a>}</article>)}</div>
+        </> : <div className="oc-empty"><h2>还没有功能候选</h2><p>检查更新后，会按日志条目列出可研究的功能。</p></div>}
+        {data.state.candidates.some(item => item.sourceType === 'local-version') && <details className="oc-section"><summary><Icon name="desktop" />本机版本信号</summary><p className="oc-muted">版本变化用于触发检查，具体功能以更新日志与研究证据为准。</p>{data.state.candidates.filter(item => item.sourceType === 'local-version').map(candidate => <article className="oc-candidate" key={candidate.id}><strong>{candidate.title}</strong><p>{candidate.description}</p></article>)}</details>}
+      </>}
       {tab === 'library' && <><div className="oc-section-head"><div><h2>研究资料</h2><p className="oc-muted">按问题加载具体手册，保留证据与未知项。</p></div><button disabled={busy} onClick={() => void run({ action: 'capabilities' })}><Icon name="desktop" />检查环境能力</button></div><Library busy={busy} read={id => void run({ action: 'readResource', id })} />{resource && <details className="oc-resource" open key={resource.id}><summary>{resource.id}</summary><pre>{resource.content}</pre></details>}{data.state.capabilities && <section className="oc-section"><h3>当前环境</h3>{data.state.capabilities.checks.map(check => <div className="oc-capability" key={check.id}><span className={check.available ? 'oc-ok' : 'oc-muted'}><Icon name={check.available ? 'check' : 'circle'} />{check.id}</span><p>{check.detail}</p></div>)}</section>}</>}
       {tab === 'settings' && <SettingsForm settings={data.state.settings} busy={busy} inspect={() => void run({ action: "scanLocalVersion" })} save={patch => void run({ action: 'settings', patch }, '设置已保存')} />}
     </>}
@@ -148,7 +220,8 @@ function JobDetail({ job, data, busy, run, call, back }: { job: Job; data: OpenC
     <button className="oc-back" onClick={back}><Icon name="back" />全部任务</button>
     <div className="oc-section-head"><h2>{job.title}</h2><Status status={job.status} /></div>
     <p className="oc-description">{featureDescription(job.description)}</p>
-    <ScreenshotGallery jobId={job.id} artifacts={artifacts} call={call} />
+    <ScreenshotGallery jobId={job.id} artifacts={artifacts} call={call} upload={<ScreenshotUpload job={job} busy={busy} run={run} />} />
+    <PluginResultSummary job={job} artifacts={artifacts} checks={checks} latestSpecId={specs.at(-1)?.id} call={call} />
     {['paused', 'blocked', 'failed'].includes(job.status) && job.history.at(-1)?.reason && <div className="oc-notice" role="status">暂停原因：{job.history.at(-1)!.reason}</div>}
     <div className="oc-budget"><div><span>已确认</span><strong>{number(budget?.job.confirmedTokens ?? 0)}</strong></div><div><span>待结算预留</span><strong>{number(budget?.job.reservedTokens ?? 0)}</strong></div><div><span>本项上限</span><strong>{number(job.budget.tokenLimit)}</strong></div><div><span>每日已用 / 上限</span><strong>{number(budget?.daily.confirmedTokens ?? 0)} <small>/ {number(data.state.settings.dailyTokenLimit)}</small></strong></div></div>
     <div className="oc-progress" role="meter" aria-label="任务预算使用" aria-valuemin={0} aria-valuemax={job.budget.tokenLimit} aria-valuenow={Math.min(job.budget.tokenLimit, (budget?.job.confirmedTokens ?? 0) + (budget?.job.reservedTokens ?? 0))}><span style={{ width: `${Math.min(100, 100 * ((budget?.job.confirmedTokens ?? 0) + (budget?.job.reservedTokens ?? 0)) / job.budget.tokenLimit)}%` }} /></div>
@@ -164,23 +237,103 @@ function JobDetail({ job, data, busy, run, call, back }: { job: Job; data: OpenC
     <details className="oc-section"><summary><Icon name="gauge" />预算与执行环境</summary><p>最长 {Math.round(job.budget.maxDurationMs / 60_000)} 分钟 · 最多 {job.budget.maxRepairRounds} 轮修复 · 已运行 {Math.round((budget?.elapsedMs ?? job.elapsedMs) / 60_000)} 分钟</p><p className="oc-path">研究会话：{job.sessionId ?? '尚未创建'}<br />工作目录：{job.workdir ?? '开始研究时创建'}</p><form className="oc-inline-form" onSubmit={event => { event.preventDefault(); void run({ action: 'extendBudget', jobId: job.id, patch: { tokenLimit: extraTokens, maxDurationMs: extraMinutes * 60_000, maxRepairRounds: extraRepairs } }, '预算已更新，点击继续研究恢复任务'); }}><label>新的 token 总上限<input required type="number" min={job.budget.tokenLimit} step={1000} value={extraTokens} onChange={event => setExtraTokens(Number(event.target.value))} /></label><label>最长运行时间（分钟）<input required type="number" min={job.budget.maxDurationMs / 60_000} value={extraMinutes} onChange={event => setExtraMinutes(Number(event.target.value))} /></label><label>最大修复轮数<input required type="number" min={job.budget.maxRepairRounds} value={extraRepairs} onChange={event => setExtraRepairs(Number(event.target.value))} /></label><button disabled={busy}>调整预算</button></form></details>
     <section className="oc-section"><h3><Icon name="file" />研究证据 <span>{evidence.length}</span></h3>{evidence.length === 0 ? <p className="oc-muted">尚未记录。推断与未知项会单独标记。</p> : evidence.map(item => <article className="oc-evidence" key={item.id}><span className={`oc-status oc-evidence-${item.kind}`}>{({ observed: '已观察', inferred: '推断', unknown: '未知' })[item.kind]}</span><p>{item.claim}</p>{link(item.sourceUrl) && <a href={item.sourceUrl} target="_blank" rel="noreferrer">查看来源<Icon name="external" /></a>}{item.localPath && <code className="oc-path">{item.localPath}</code>}</article>)}</section>
     {specs.map(spec => <section className="oc-section" key={spec.id}><h3><Icon name="file" />功能规格：{spec.title}</h3>{([['行为', spec.behavior], ['视觉', spec.visual], ['生命周期', spec.lifecycle], ['已有能力', spec.existingCapabilities], ['缺口', spec.gaps]] as [string, string[]][]).map(([name, rows]) => rows.length > 0 && <div key={name}><h4>{name}</h4><ul>{rows.map((row, i) => <li key={i}>{row}</li>)}</ul></div>)}</section>)}
-    <section className="oc-section"><h3><Icon name="package" />产物与验收</h3>{artifacts.length === 0 ? <p className="oc-muted">尚无产物。行为、视觉和生命周期须分别验收。</p> : artifacts.map(item => <article className="oc-artifact" key={item.id}><strong>{item.label}</strong><span className="oc-status">{item.kind}</span><code className="oc-path">{item.path}</code><small>SHA-256 · {item.sha256}</small></article>)}{checks.map(check => <div className="oc-check" key={check.id}><strong>{({ behavior: '行为', visual: '视觉', lifecycle: '生命周期' })[check.scope]} · {({ passed: '通过', failed: '失败', partial: '部分完成' })[check.outcome]}</strong><p>{check.details}</p></div>)}{artifacts.some(item => item.kind === 'plugin') && <p className="oc-muted">包检查只验证结构。隔离环境中的行为、视觉和卸载验收完成后，才可标记就绪；安装由用户在 DSH 插件管理中选择本地产物。</p>}</section>
+    <details className="oc-section"><summary><Icon name="file" />产物文件与验收记录 · {artifacts.length} 个文件</summary>{artifacts.length === 0 ? <p className="oc-muted">尚无登记文件。</p> : artifacts.map(item => <article className="oc-artifact" key={item.id}><strong>{item.label}</strong><span className="oc-status">{item.kind}</span><code className="oc-path">{item.path}</code><small>SHA-256 · {item.sha256}</small></article>)}{checks.map(check => <div className="oc-check" key={check.id}><strong>{({ behavior: '行为', visual: '视觉', lifecycle: '生命周期' })[check.scope]} · {({ passed: '通过', failed: '失败', partial: '部分完成' })[check.outcome]}</strong><p>{check.details}</p></div>)}</details>
     {specs.length > 0 && specs.at(-1)!.existingCapabilities.length > 0 && specs.at(-1)!.gaps.length === 0 && ['researching', 'specifying', 'verifying'].includes(job.status) && <div className="oc-notice"><p>规格记录了 DSH 已有能力，且没有待解决缺口。核对证据后，可结束研究而不生成重复插件。</p><button disabled={busy} onClick={() => void run({ action: 'markCovered', jobId: job.id, specId: specs.at(-1)!.id, reason: 'User reviewed the latest specification and observed evidence; existing DSH capabilities cover the requested feature.' }, '已记录为已有能力可用')}>确认已有能力满足需求</button></div>}
-    {job.artifactId && <AcceptanceForm job={job} data={data} busy={busy} run={run} />}
+    {job.artifactId && job.status === 'verifying' && <AcceptanceForm job={job} data={data} busy={busy} run={run} />}
     <details className="oc-section"><summary><Icon name="clock" />任务记录</summary><ol className="oc-timeline">{[...job.history].reverse().map((event, i) => <li key={i}><time>{date(event.at)}</time><strong>{labels[event.to]}</strong><p>{event.reason}</p></li>)}</ol></details>
   </section>;
 }
 
-export function ScreenshotGallery({ jobId, artifacts, call }: { jobId: string; artifacts: Artifact[]; call: Call }) {
+export function PluginResultSummary({ job, artifacts, checks, latestSpecId, call }: { job: Job; artifacts: Artifact[]; checks: Verification[]; latestSpecId?: string; call: Call }) {
+  const plugins = artifacts.filter(item => item.jobId === job.id && item.kind === 'plugin');
+  return <section className="oc-plugin-results" aria-label="插件产出">
+    <h3><Icon name="package" />插件产出{plugins.length > 0 && <span>{plugins.length} 个包</span>}</h3>
+    {plugins.length === 0 ? <p className="oc-muted">尚未产出插件包。已有研究进展保留在下方；完成构建并登记后，这里会出现可下载的安装包。</p>
+      : <>{[...plugins].reverse().map(artifact => <PluginDownload key={`${job.id}:${artifact.id}:${artifact.sha256}`} job={job} artifact={artifact} checks={checks} latestSpecId={latestSpecId} call={call} />)}<p className="oc-result-note">下载后可在隔离 DSH 的插件管理中选择本地安装包。下载不会自动安装到日常环境。</p></>}
+  </section>;
+}
+
+function PluginDownload({ job, artifact, checks, latestSpecId, call }: { job: Job; artifact: Artifact; checks: Verification[]; latestSpecId?: string; call: Call }) {
+  const [downloading, setDownloading] = useState(false);
+  const [percent, setPercent] = useState(0);
+  const [error, setError] = useState('');
+  const [saved, setSaved] = useState(false);
+  const request = useRef<AbortController>();
+  useEffect(() => () => request.current?.abort(), []);
+  const ready = ['ready', 'installed'].includes(job.status) && job.artifactId === artifact.id;
+  const currentChecks = checks.filter(item => item.jobId === job.id && item.artifactId === artifact.id && item.artifactSha256 === artifact.sha256 && item.specId === latestSpecId);
+  const filename = artifact.path.split('/').at(-1);
+  const download = async () => {
+    if (request.current) return;
+    const controller = new AbortController(); request.current = controller;
+    setDownloading(true); setError(''); setSaved(false); setPercent(0);
+    try {
+      const result = await fetchPluginArtifact(call, job.id, artifact, controller.signal, (received, total) => {
+        if (!controller.signal.aborted) setPercent(Math.round(received * 100 / total));
+      });
+      controller.signal.throwIfAborted();
+      const url = URL.createObjectURL(new Blob([result.bytes], { type: 'application/gzip' }));
+      const anchor = document.createElement('a');
+      try {
+        anchor.href = url; anchor.download = result.filename; anchor.hidden = true;
+        document.body.append(anchor); anchor.click(); setSaved(true);
+      } finally { anchor.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
+    } catch (err) { if (!controller.signal.aborted) setError(err instanceof Error ? err.message : String(err)); }
+    finally { request.current = undefined; if (!controller.signal.aborted) setDownloading(false); }
+  };
+  return <article className="oc-plugin-result">
+    <div className="oc-plugin-result-head"><div><strong>{filename}</strong><p>{artifact.label}</p><span className="oc-result-size">{artifact.bytes >= 1_000_000 ? `${(artifact.bytes / 1_000_000).toFixed(1)} MB` : `${Math.max(1, Math.round(artifact.bytes / 1000))} KB`} · {date(artifact.createdAt)}</span></div><button className="oc-primary" disabled={downloading} onClick={() => void download()}><Icon name="package" />{downloading ? `下载并校验 ${percent}%` : ready ? '下载插件包' : '下载实验包'}</button></div>
+    {artifact.provenance?.kind === 'operator-assisted' && <p className="oc-result-provenance"><strong>人工协助产物</strong> · {artifact.provenance.details}</p>}
+    <div className="oc-result-checks" aria-label="插件验收状态">{(['behavior', 'visual', 'lifecycle'] as const).map(scope => {
+      const check = currentChecks.filter(item => item.scope === scope).at(-1);
+      return <span key={scope} className={check?.outcome === 'passed' ? 'oc-ok' : ''}><Icon name={check?.outcome === 'passed' ? 'check' : check?.outcome === 'failed' ? 'warning' : 'circle'} />{({ behavior: '行为', visual: '视觉', lifecycle: '生命周期' })[scope]} · {check ? ({ passed: '通过', partial: '部分完成', failed: '失败' })[check.outcome] : '待验收'}</span>;
+    })}</div>
+    {!ready && <p className="oc-result-note">{job.status === 'verifying' ? '实验产物，等待完成全部隔离验收。' : '实验产物，当前未处于验收阶段；可先下载到隔离环境检查。'}</p>}
+    {error && <p className="oc-error" role="alert">{error}</p>}
+    {saved && <p className="oc-result-note" role="status">SHA-256 校验通过，已发起文件保存。</p>}
+  </article>;
+}
+
+export function ScreenshotGallery({ jobId, artifacts, call, upload }: { jobId: string; artifacts: Artifact[]; call: Call; upload?: ReactNode }) {
   const shots = artifacts.filter(item => item.kind === 'screenshot');
   const other = shots.filter(item => !item.screenshot || item.screenshot.subject === 'other');
   return <section className="oc-visual-study" aria-label="功能截图对照">
+    {upload}
     <div className="oc-screenshot-pair">
       <ScreenshotPanel jobId={jobId} subject="codex" shots={shots.filter(item => item.screenshot?.subject === 'codex')} call={call} />
       <ScreenshotPanel jobId={jobId} subject="dsh" shots={shots.filter(item => item.screenshot?.subject === 'dsh')} call={call} />
     </div>
     {other.length > 0 && <details className="oc-other-screenshots"><summary>其他研究截图 · {other.length}</summary><ScreenshotPanel jobId={jobId} subject="other" shots={other} call={call} /></details>}
   </section>;
+}
+
+export function ScreenshotUpload({ job, busy, run }: { job: Job; busy: boolean; run: Run }) {
+  const [subject, setSubject] = useState<'codex' | 'dsh'>('codex');
+  const [caption, setCaption] = useState('');
+  const [version, setVersion] = useState('');
+  const [image, setImage] = useState<ReferenceImage>();
+  const [reading, setReading] = useState(false);
+  const [error, setError] = useState('');
+  const disclosure = useRef<HTMLDetailsElement>(null);
+  const input = useRef<HTMLInputElement>(null);
+  const choose = async (file: File) => {
+    setError(''); setImage(undefined);
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type) || file.size > 2 * 1024 * 1024) { setError('请选择不超过 2 MB 的 PNG、JPEG 或 WebP 图片'); return; }
+    setReading(true);
+    try {
+      const data = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(new Error('图片读取失败')); reader.readAsDataURL(file);
+      });
+      setImage({ mimeType: file.type as ReferenceImage['mimeType'], dataBase64: data.slice(data.indexOf(',') + 1) });
+    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    finally { setReading(false); }
+  };
+  return <details className="oc-shot-upload" ref={disclosure}><summary><Icon name="plus" />添加截图</summary><form className="oc-form" onSubmit={event => {
+    event.preventDefault(); if (!image || busy || reading) return;
+    void run({ action: 'addScreenshot', jobId: job.id, image, metadata: { subject, caption: caption.trim(), provenance: 'user', ...(version.trim() ? { version: version.trim() } : {}) } }, '截图已添加，不会启动模型调用').then(result => {
+      if (result) { setImage(undefined); setCaption(''); setVersion(''); if (input.current) input.current.value = ''; if (disclosure.current) disclosure.current.open = false; }
+    });
+  }}><div className="oc-two-columns"><label>截图内容<select value={subject} onChange={event => setSubject(event.target.value as 'codex' | 'dsh')}><option value="codex">Codex 参考</option><option value="dsh">DSH 实现</option></select></label><label>应用版本（可选）<input value={version} maxLength={120} onChange={event => setVersion(event.target.value)} /></label></div><label>图中展示了什么<input required maxLength={1000} placeholder="例如：回复结束后，输入框显示可用 Tab 接受的建议" value={caption} onChange={event => setCaption(event.target.value)} /></label><label>选择截图<input ref={input} type="file" accept="image/png,image/jpeg,image/webp" disabled={busy || reading} onChange={event => { const file = event.currentTarget.files?.[0]; if (file) void choose(file); }} /></label>{image && <div className="oc-reference"><img src={`data:${image.mimeType};base64,${image.dataBase64}`} alt="待添加的截图预览" /></div>}{error && <p className="oc-error" role="alert">{error}</p>}<div className="oc-upload-actions"><button className="oc-primary" disabled={busy || reading || !image || !caption.trim()}><Icon name="plus" />{reading ? '读取中…' : '添加到研究'}</button><span className="oc-muted">标注为用户提供，不会启动模型。</span></div></form></details>;
 }
 
 function ScreenshotPanel({ jobId, subject, shots, call }: { jobId: string; subject: 'codex' | 'dsh' | 'other'; shots: Artifact[]; call: Call }) {

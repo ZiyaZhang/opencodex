@@ -3,8 +3,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { constants, type Stats } from 'node:fs';
 import { link, lstat, mkdir, open, realpath, unlink } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { MAX_SCREENSHOT_BYTES, validateScreenshotBytes, type OpenCodexStore } from '../core/index.js';
-import type { CreateJobInput, Job } from '../core/types.js';
+import { MAX_SCREENSHOT_BYTES, validateScreenshotBytes, validateScreenshotMetadata, type OpenCodexStore } from '../core/index.js';
+import type { Artifact, CreateJobInput, Job, ScreenshotMetadata } from '../core/types.js';
 import type { ReferenceImageInput } from './remote.js';
 
 export const MAX_REFERENCE_IMAGE_BYTES = MAX_SCREENSHOT_BYTES;
@@ -126,10 +126,73 @@ export async function readScreenshot(store: OpenCodexStore, jobId: string, artif
   return encodedImage(bytes);
 }
 
+/** A user can supplement any existing dossier without resuming research or claiming acceptance. */
+export async function addScreenshot(store: OpenCodexStore, jobId: string, image: ReferenceImageInput, metadata: ScreenshotMetadata, signal: AbortSignal): Promise<Artifact> {
+  signal.throwIfAborted();
+  validateScreenshotMetadata(metadata);
+  if (metadata.provenance !== 'user') throw new Error('Uploaded screenshots must use user provenance');
+  const screenshot = structuredClone(metadata);
+  const decoded = decodeReferenceImage(image);
+  const root = await checkedJobRoot(store, jobId);
+  const rootStat = await lstat(root);
+  const directory = join(root, jobId);
+  try { await mkdir(directory, { mode: 0o700 }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+  const directoryStat = await lstat(directory);
+  if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || await realpath(directory) !== directory) throw new Error('Screenshot job directory must not contain symlinks');
+  const checkDirectories = async () => {
+    for (const [path, before] of [[root, rootStat], [directory, directoryStat]] as const) {
+      const current = await lstat(path);
+      if (!current.isDirectory() || current.isSymbolicLink() || !sameFile(before, current) || await realpath(path) !== path) throw new Error('Screenshot directory changed while writing');
+    }
+  };
+  const filename = `screenshot-${randomUUID()}.${decoded.filename.split('.').at(-1)}`;
+  const destination = join(directory, filename);
+  const temporary = join(directory, `.screenshot-${randomUUID()}.tmp`);
+  let ownedFile: Stats | undefined;
+  let ownsTemporary = false, ownsDestination = false;
+  const removeOwned = async (path: string) => {
+    try {
+      const current = await lstat(path);
+      if (ownedFile && current.isFile() && !current.isSymbolicLink() && sameFile(ownedFile, current)) await unlink(path);
+    } catch (error) { if (!missing(error)) throw error; }
+  };
+  try {
+    signal.throwIfAborted();
+    await checkDirectories();
+    const file = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    ownsTemporary = true;
+    try {
+      ownedFile = await file.stat();
+      if (!ownedFile.isFile() || ownedFile.nlink !== 1) throw new Error('Screenshot temporary file must be a regular unlinked file');
+      await checkDirectories();
+      await file.writeFile(decoded.bytes); await file.sync();
+    } finally { await file.close(); }
+    signal.throwIfAborted();
+    await checkDirectories();
+    const temporaryStat = await lstat(temporary);
+    if (!temporaryStat.isFile() || temporaryStat.isSymbolicLink() || temporaryStat.nlink !== 1 || !ownedFile || !sameFile(ownedFile, temporaryStat)) throw new Error('Screenshot temporary path changed while writing');
+    await link(temporary, destination); // No existing file, reference image or previous upload can be overwritten.
+    ownsDestination = true;
+    await unlink(temporary); ownsTemporary = false;
+    await checkDirectories();
+    signal.throwIfAborted();
+    return await store.registerArtifact(jobId, { path: `${jobId}/${filename}`, kind: 'screenshot', label: screenshot.caption, screenshot });
+  } catch (error) {
+    if (ownsDestination) await removeOwned(destination).catch(() => undefined);
+    if (ownsTemporary) await removeOwned(temporary).catch(() => undefined);
+    throw error;
+  }
+}
+
 export async function createJobWithReference(store: OpenCodexStore, input: CreateJobInput, image: ReferenceImageInput, signal: AbortSignal): Promise<Job> {
   const decoded = decodeReferenceImage(image); // Every upload check precedes any job or file mutation.
   if (!input || typeof input !== 'object' || (input.description !== undefined && typeof input.description !== 'string')) throw new Error('Job description must be text');
   signal.throwIfAborted();
+  // Candidate creation is idempotent. A retried create must not replace a reference
+  // or run failure transitions against the already existing research job.
+  const existing = input.candidateId ? store.snapshot().jobs.find(job => job.candidateId === input.candidateId) : undefined;
+  if (existing) return store.getJob(existing.id);
   const description = `${input.description ?? ''}\n\nUser-supplied visual reference: ${decoded.filename} (relative to this job's workspace). Inspect it with the installed read_image tool or equivalent before recording visual observations. This file is stored locally; exclude it from published plugin artifacts.`.trim();
   const root = await realpath(store.artifactRoot);
   const job = await store.createJob({ ...input, description });

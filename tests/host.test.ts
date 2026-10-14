@@ -580,7 +580,12 @@ test('locked store initialization is contained before any RPC instead of rejecti
 });
 
 
-test('selected local updates notify by default; opted-in changes queue investigation-only sessions once', async () => {
+test('selected local updates notify by default; opted-in changes queue investigation-only sessions once', async t => {
+  // A local-version event now refreshes public announcements. Keep this lifecycle
+  // test deterministic and offline; feature parsing has its own source fixtures.
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('<rss><channel><item><title>Codex CLI fixture</title><pubDate>Wed, 14 Oct 2026 00:00:00 GMT</pubDate><description>Non-desktop fixture</description></item></channel></rss>', { headers: { 'content-type': 'application/rss+xml' } });
+  t.after(() => { globalThis.fetch = originalFetch; });
   const f = await fixture();
   try {
     const versionFile = join(f.directory, 'version-input.json');
@@ -590,7 +595,7 @@ test('selected local updates notify by default; opted-in changes queue investiga
     await writeFile(versionFile, JSON.stringify({ version: '1.1.0', build: '2' }));
     await f.call({ action: 'scanLocalVersion' });
     let state = (await f.call({ action: 'snapshot' })).state;
-    assert.equal(state.candidates.length, 1); assert.equal(state.jobs.length, 0);
+    assert.equal(state.candidates.filter(candidate => candidate.sourceType === 'local-version').length, 1); assert.equal(state.jobs.length, 0);
     await f.call({ action: 'settings', patch: { updateResearchMode: 'investigate' } });
     await new Promise(resolve => setTimeout(resolve, 1100));
     assert.equal((await f.call({ action: 'snapshot' })).state.jobs.length, 0, 'Notify-era candidates must not become automatic work after opting in');
@@ -616,7 +621,11 @@ test('selected local updates notify by default; opted-in changes queue investiga
   } finally { await f.close(); }
 });
 
-test('startup recovers eligible detected updates and half-created jobs without retroactive opt-in', async () => {
+test('startup recovers eligible detected updates and half-created jobs without retroactive opt-in', async t => {
+  const originalFetch = globalThis.fetch;
+  // Public-source failure must not prevent an already eligible local investigation.
+  globalThis.fetch = async () => new Response('Synthetic source unavailable', { status: 503 });
+  t.after(() => { globalThis.fetch = originalFetch; });
   const directory = await mkdtemp(join(tmpdir(), 'opencodex-recover-'));
   const store = await OpenCodexStore.open({ directory, artifactRoot: join(directory, 'jobs') });
   const candidate = (fingerprint: string) => ({ title: fingerprint, description: 'Synthetic local update', sourceUrl: 'https://example.com/fixture', fingerprint, sourceType: 'local-version' as const });
@@ -643,4 +652,21 @@ test('startup recovers eligible detected updates and half-created jobs without r
     state = (await f.call({ action: 'snapshot' })).state;
     assert.equal(state.jobs.length, 2); assert.equal(f.prompts.length, 1);
   } finally { await f.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test('a failed public checkpoint cannot block an opted-in local version investigation', async () => {
+  const f = await fixture();
+  try {
+    const store = await (f.plugin as unknown as { store: Promise<OpenCodexStore> }).store;
+    await store.updateSettings({ updateResearchMode: 'investigate' });
+    const candidate = await store.saveCandidate({ title: 'Local version fixture', description: 'Synthetic update already detected locally', sourceUrl: 'https://example.com/fixture', fingerprint: 'local-checkpoint-failure', sourceType: 'local-version' });
+    await writeFile(join(f.directory, 'discovery.json'), '{ malformed checkpoint');
+    await (f.plugin as unknown as { localVersionCandidate: (id: string) => Promise<void> }).localVersionCandidate(candidate.id);
+    const state = store.snapshot();
+    assert.equal(state.jobs.length, 1);
+    assert.equal(state.jobs[0]!.mode, 'investigate');
+    assert.equal(state.jobs[0]!.status, 'researching');
+    assert.equal(f.prompts.length, 1);
+    assert.equal(await readFile(join(f.directory, 'discovery.json'), 'utf8'), '{ malformed checkpoint', 'Failure is reported, not silently reset');
+  } finally { await f.close(); }
 });

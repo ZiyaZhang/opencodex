@@ -32,6 +32,7 @@ export interface Job {
 }
 export interface Candidate {
   id: string; title: string; description: string; sourceUrl: string; version?: string;
+  publishedAt?: string; releaseTitle?: string;
   detectedAt: string; updatedAt: string; fingerprint: string; status: 'new' | 'selected' | 'dismissed';
   sourceType?: 'public-source' | 'local-version';
   /** Captured at first detection; changing settings later does not opt in old candidates. */
@@ -54,6 +55,8 @@ export interface Artifact {
   sha256: string; bytes: number; createdAt: string;
   /** Optional only for compatibility with screenshots recorded before this contract. */
   screenshot?: ScreenshotMetadata;
+  /** Present for a package explicitly supplied outside the research agent. */
+  provenance?: { kind: 'operator-assisted'; details: string };
 }
 export interface Verification {
   id: string; jobId: string; specId: string; artifactId: string; artifactSha256: string; scope: VerificationScope;
@@ -88,7 +91,7 @@ export interface CreateJobInput {
   mode?: Job['mode'];
   budget?: Partial<JobBudget>;
 }
-export type CandidateInput = Pick<Candidate, 'title' | 'description' | 'sourceUrl' | 'fingerprint'> & Partial<Pick<Candidate, 'version' | 'status' | 'sourceType'>>;
+export type CandidateInput = Pick<Candidate, 'title' | 'description' | 'sourceUrl' | 'fingerprint'> & Partial<Pick<Candidate, 'version' | 'status' | 'sourceType' | 'publishedAt' | 'releaseTitle'>>;
 export type EvidenceInput = Pick<Evidence, 'kind' | 'claim'> & Partial<Pick<Evidence, 'sourceUrl' | 'localPath' | 'relatedEvidenceIds'>>;
 export type SpecInput = Omit<FeatureSpec, 'id' | 'jobId' | 'createdAt'>;
 export type VerificationInput = Omit<Verification, 'id' | 'jobId' | 'specId' | 'createdAt' | 'artifactSha256'>;

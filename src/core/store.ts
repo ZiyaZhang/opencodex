@@ -166,6 +166,10 @@ export class OpenCodexStore {
 
   createJob(input: CreateJobInput): Promise<Job> {
     return this.#mutate((state, at) => {
+      if (input.candidateId) {
+        const existing = state.jobs.find(job => job.candidateId === input.candidateId);
+        if (existing) return existing; // Retries and multi-tab batch selection must not duplicate work.
+      }
       const source = input.source ?? 'user';
       const job: Job = { id: randomUUID(), title: input.title, description: input.description ?? '', source, mode: input.mode ?? 'reconstruct', status: source === 'discovery' ? 'detected' : 'draft', createdAt: at, updatedAt: at,
         budget: { tokenLimit: state.settings.defaultJobTokenLimit, maxDurationMs: state.settings.maxDurationMs, maxRepairRounds: state.settings.maxRepairRounds, ...input.budget }, elapsedMs: 0, activeSince: null, repairRounds: 0, history: [], budgetHistory: [], sessionIds: [], sessionBindings: [], ...(input.candidateId ? { candidateId: input.candidateId } : {}) };
@@ -291,6 +295,33 @@ export class OpenCodexStore {
       const file = await this.#inspectFile(input.path, kind === 'screenshot' ? jobId : undefined);
       const artifact: Artifact = { id: randomUUID(), jobId, path: input.path, label: input.label ?? input.path, kind, ...file, ...(input.screenshot ? { screenshot: structuredClone(input.screenshot) } : {}), createdAt: at };
       state.artifacts.push(artifact); if (kind === 'plugin') { job.artifactId = artifact.id; job.updatedAt = at; } return artifact;
+    });
+  }
+
+  /** Explicit offline/user maintenance. Never exposed as an agent tool or an acceptance shortcut. */
+  importPluginArtifact(jobId: string, input: { path: string; label: string; details: string; userConfirmed: true }): Promise<Artifact> {
+    return this.#mutate(async (state, at) => {
+      check(input.userConfirmed === true, 'Import requires explicit user confirmation');
+      textValue(input.details, 'Import provenance'); textValue(input.label, 'Import label'); relativePath(input.path);
+      const job = findJob(state, jobId);
+      check(job.mode === 'reconstruct', 'Investigation jobs cannot import plugin artifacts');
+      check(['draft', 'paused', 'blocked', 'failed'].includes(job.status), 'Import requires an inactive, unaccepted job');
+      check(input.path.startsWith(`${jobId}/`) && /\.(?:tgz|tar\.gz)$/.test(input.path), 'Imported package must be a tarball inside its own job');
+      let path = this.artifactRoot;
+      const parts = input.path.split('/');
+      for (const [index, part] of parts.entries()) {
+        path = join(path, part); const stat = await lstat(path);
+        check(!stat.isSymbolicLink() && await realpath(path) === path, 'Imported package paths must not contain links');
+        check(index === parts.length - 1 ? stat.isFile() && stat.nlink === 1 : stat.isDirectory(), 'Imported package must be a regular file without hard links');
+      }
+      const file = await this.#inspectFile(input.path);
+      check(file.bytes > 0 && file.bytes <= 16_000_000, 'Imported package must be nonempty and at most 16 MB');
+      const existing = state.artifacts.find(item => item.jobId === jobId && item.path === input.path && item.sha256 === file.sha256 && item.provenance?.kind === 'operator-assisted');
+      if (existing) return existing;
+      const artifact: Artifact = { id: randomUUID(), jobId, path: input.path, label: input.label, kind: 'plugin', ...file, provenance: { kind: 'operator-assisted', details: input.details }, createdAt: at };
+      state.artifacts.push(artifact); job.artifactId = artifact.id; job.updatedAt = at;
+      state.evidence.push({ id: randomUUID(), jobId, kind: 'observed', claim: `Operator supplied package: ${input.details}`, localPath: input.path, sha256: file.sha256, relatedEvidenceIds: [], createdAt: at });
+      return artifact;
     });
   }
 
