@@ -1,6 +1,6 @@
 {
   "name": "dsh-opencodex",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local, budgeted Codex feature research and DSH plugin reconstruction",
   "type": "module",
   "license": "MIT",

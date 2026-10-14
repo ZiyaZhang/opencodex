@@ -43,10 +43,10 @@ export DSH_HOME="$HOME/.dsh-opencodex"
 dsh --profile opencodex --from-default-profile web --dump-config
 ```
 
-从 [GitHub Releases](https://github.com/ZiyaZhang/opencodex/releases) 下载预构建的 `dsh-opencodex-0.1.0.tgz`，再安装：
+从 [GitHub Releases](https://github.com/ZiyaZhang/opencodex/releases) 下载预构建的 `dsh-opencodex-0.1.1.tgz`，再安装：
 
 ```sh
-dsh plugin --profile opencodex add /absolute/path/dsh-opencodex-0.1.0.tgz
+dsh plugin --profile opencodex add /absolute/path/dsh-opencodex-0.1.1.tgz
 dsh --profile opencodex
 ```
 
