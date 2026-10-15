@@ -2,7 +2,7 @@ import { constants } from 'node:fs';
 import { mkdir, open, readFile, rename, unlink, realpath, lstat } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
-import type { Artifact, BudgetSummary, CandidateInput, CapabilitySnapshot, CreateJobInput, EvidenceInput, ForegroundRequest, Job, JobBudget, JobStatus, PluginInstallation, Settings, SpecInput, StoreOptions, StoreState, TokenReservation, TokenUsage, VerificationInput } from './types.js';
+import type { AcceptanceRun, Artifact, BudgetSummary, CandidateInput, CapabilitySnapshot, CreateJobInput, EvidenceInput, ForegroundRequest, Job, JobBudget, JobStatus, PluginInstallation, Settings, SpecInput, StoreOptions, StoreState, TokenReservation, TokenUsage, VerificationInput } from './types.js';
 import { check, count, relativePath, textValue, validateCapabilities, validateScreenshotMetadata, validateSettings, validateState, ValidationError } from './validation.js';
 import { readScreenshotFile } from './screenshot.js';
 
@@ -113,6 +113,10 @@ export class OpenCodexStore {
       }
       const store = new OpenCodexStore(directory, resolvedArtifacts, state, now, lockToken);
       let recovered = false; const at = stamp(now);
+      for (const job of state.jobs) if (job.acceptance?.status === 'running') {
+        job.acceptance.status = 'interrupted'; job.acceptance.completedAt = at;
+        job.acceptance.details = '隔离验收被中断，继续验收会使用已登记的插件包。'; recovered = true;
+      }
       for (const job of state.jobs) if (job.installation?.status === 'installing') {
         job.installation.status = 'interrupted'; job.installation.completedAt = at;
         job.installation.error = '安装过程被中断，结果尚未确认。可在 DSH 插件管理中查看，或重试以核对并继续。';
@@ -347,13 +351,52 @@ export class OpenCodexStore {
     });
   }
 
+  /** Host-owned handoff journal. A research tool cannot write or certify this run. */
+  beginAcceptance(jobId: string): Promise<AcceptanceRun> {
+    return this.#mutate(async (state, at) => {
+      const job = findJob(state, jobId);
+      check(job.status === 'verifying' && !job.installation, 'Acceptance needs an uninstalled verifying job');
+      check(job.acceptance?.status !== 'running', 'Acceptance is already running');
+      const artifact = state.artifacts.find(item => item.id === job.artifactId && item.jobId === jobId && item.kind === 'plugin');
+      const spec = state.specs.filter(item => item.jobId === jobId).at(-1);
+      check(artifact && spec, 'Acceptance requires a specification and actual plugin package');
+      check((await this.#inspectFile(artifact.path)).sha256 === artifact.sha256, 'Acceptance package changed after registration');
+      job.acceptance = { id: randomUUID(), specId: spec.id, artifactId: artifact.id, artifactSha256: artifact.sha256, status: 'running', startedAt: at };
+      job.updatedAt = at; return job.acceptance;
+    });
+  }
+
+  finishAcceptance(jobId: string, id: string, result: { status: Exclude<AcceptanceRun['status'], 'running'>; details: string; reportPath?: string }): Promise<AcceptanceRun> {
+    return this.#mutate((state, at) => {
+      const job = findJob(state, jobId), run = job.acceptance;
+      check(run?.id === id && run.status === 'running', 'Acceptance run is stale or already finished');
+      check(run.artifactId === job.artifactId && state.specs.filter(item => item.jobId === jobId).at(-1)?.id === run.specId, 'Acceptance input changed during execution');
+      Object.assign(run, result, { completedAt: at }); job.updatedAt = at; return run;
+    });
+  }
+
+  resumeAcceptance(jobId: string): Promise<Job> {
+    return this.#mutate(async (state, at) => {
+      const job = findJob(state, jobId);
+      check(['paused', 'blocked', 'failed'].includes(job.status) && !job.installation, 'Only interrupted acceptance can resume');
+      const phase = [...job.history].reverse().find(event => ['paused', 'blocked', 'failed'].includes(event.to) && event.from && ACTIVE.has(event.from))?.from;
+      check(phase === 'verifying', 'The interrupted stage was not acceptance');
+      const artifact = state.artifacts.find(item => item.id === job.artifactId && item.jobId === jobId && item.kind === 'plugin');
+      check(artifact && state.specs.some(item => item.jobId === jobId), 'Resume needs the saved specification and package');
+      check((await this.#inspectFile(artifact.path)).sha256 === artifact.sha256, 'Saved package changed');
+      check(elapsed(job, at) < job.budget.maxDurationMs, 'Run time budget exhausted');
+      change(state, job, 'verifying', at, 'Resuming independent acceptance of the saved package; research is not restarted'); return job;
+    });
+  }
+
   saveCapabilities(capabilities: CapabilitySnapshot): Promise<CapabilitySnapshot> {
     return this.#mutate(state => { validateCapabilities(capabilities); state.capabilities = structuredClone(capabilities); return capabilities; });
   }
 
-  bindSession(jobId: string, input: { sessionId: string; parentSessionId?: string; workdir?: string }): Promise<Job> {
+  bindSession(jobId: string, input: { sessionId: string; parentSessionId?: string; workdir?: string; continuation?: boolean }): Promise<Job> {
     return this.#mutate(async (state, at) => {
       const job = findJob(state, jobId); textValue(input.sessionId, 'sessionId');
+      if (input.continuation) check(['paused', 'blocked', 'failed'].includes(job.status) && job.sessionId && input.parentSessionId, 'Context continuation requires a stopped job with an existing session');
       const existing = state.jobs.find(j => j.sessionIds.includes(input.sessionId));
       if (existing) { check(existing.id === jobId && existing.sessionBindings.find(b => b.sessionId === input.sessionId)?.parentSessionId === input.parentSessionId, 'Session is already bound elsewhere'); return job; }
       if (job.sessionId) check(input.parentSessionId && job.sessionIds.includes(input.parentSessionId), 'Child session needs an already registered parent');
@@ -362,7 +405,9 @@ export class OpenCodexStore {
         const path = await realpath(resolve(input.workdir)); check(inRoot(this.artifactRoot, path), 'Session workdir must stay inside the artifact root'); check((await lstat(path)).isDirectory(), 'Session workdir must be a directory');
         check(!job.workdir || job.workdir === path, 'Job workdir is immutable'); job.workdir = path;
       }
-      job.sessionIds.push(input.sessionId); job.sessionBindings.push({ sessionId: input.sessionId, ...(input.parentSessionId ? { parentSessionId: input.parentSessionId } : {}), boundAt: at }); job.updatedAt = at; return job;
+      job.sessionIds.push(input.sessionId); job.sessionBindings.push({ sessionId: input.sessionId, ...(input.parentSessionId ? { parentSessionId: input.parentSessionId } : {}), boundAt: at });
+      if (input.continuation) job.executionSessionId = input.sessionId;
+      job.updatedAt = at; return job;
     });
   }
 

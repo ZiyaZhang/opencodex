@@ -22,3 +22,11 @@ If the Codex reference, DSH capture, image-reading capability or permitted UI ac
 In the final artifact handoff, provide the behavior implemented, visual differences, versions tested, limits, required permissions/dependencies, package digest and rollback procedure. After changes, rerun the affected assertions against the new digest; prior screenshots do not verify new code.
 
 The repository's use-case document provides starter scenarios. They remain planned or not-run until real evidence is recorded. Sources: `playwright-visual`, `aria-combobox`, `dsh-plugin-manager`.
+
+## Host handoff and recoverable runs
+
+`stage: verifying` validates the registered tarball and queues a Host-owned run. Its durable identity binds the latest spec ID and package SHA-256. Duplicate handoffs coalesce. The built-in runner starts a fresh DSH profile with no OpenCodex, no model credential environment, and tests native install, restart, disable, restart, enable, restart, removal and absence. It retains phase receipts and logs. Profile separation is not an OS security boundary. These native observations do not prove UI rendering or feature-specific behavior.
+
+An installed `opencodexFeatureVerifier` adapter receives the exact job/spec/artifact and cancellation signal. Each scope's assertions are identified by `behavior:1`, `visual:1`, `lifecycle:1`, etc. A passed result must cover every row in that scope; visual success also requires the matching registered screenshot pair. Missing providers or uncovered scopes remain partial and block installation. Native lifecycle success alone never certifies the whole feature.
+
+Actual failed checks may start a bounded repair in the same metered research session. Environment/capability gaps stop without model repair loops. Resume of interrupted verification uses the same saved package; it does not restart investigation. The journal and reports distinguish passed, blocked, failed and interrupted runs.

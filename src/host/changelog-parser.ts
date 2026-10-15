@@ -16,7 +16,7 @@ interface Block { kind: 'heading' | 'item' | 'text'; text: string; anchor?: stri
 interface Release { date: string; title: string; anchor?: string; url?: string; blocks: Block[] }
 const GENERIC = /^(?:new features?|features?|what[’']?s new|highlights?|improvements?|新增功能|新功能)$/i;
 const SKIP_SECTION = /bug\s*fix|performance|chore|changelog|install|availability|pricing|修复|性能|安装/i;
-const SKIP_RELEASE = /\b(?:CLI|mobile|iOS|Android|SDK|API)\b|^(?:introducing\s+)?GPT[-\s]|\b(?:model|models)\b.*\b(?:retir|available|release)|\bultrafast\b.*\b(?:Codex|ChatGPT)\b/i;
+const SKIP_RELEASE = /\b(?:CLI|mobile|iOS|Android|SDK|API)\b|\b(?:deprecated|removed|retired|security update)\b|^(?:introducing\s+)?GPT[-\s]|\b(?:model|models)\b.*\b(?:retir|available|release)|\bultrafast\b.*\b(?:Codex|ChatGPT)\b/i;
 const NON_FEATURE = /^(?:(?:additional|various|general)\s+)?(?:performance improvements?|bug fixes?|stability improvements?)\b|^(?:fixed?|fixes|resolved?|corrected)\b|^(?:support for|introducing|added support for)\s+GPT[-\s]|^(?:full changelog|learn more|view details|download|npm install|\$ npm)/i;
 
 function plain(value: string): string {

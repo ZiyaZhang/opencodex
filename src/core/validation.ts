@@ -91,7 +91,7 @@ export function validateState(value: unknown): asserts value is StoreState {
   check(s.schemaVersion === 1, 'Unsupported OpenCodex state version'); isoDate(s.createdAt, 'createdAt'); isoDate(s.updatedAt, 'updatedAt'); validateSettings(s.settings);
   if (s.capabilities !== null) validateCapabilities(s.capabilities);
   for (const raw of list(s.jobs, 'jobs')) {
-    const j = object(raw, 'job', ['id', 'title', 'description', 'source', 'mode', 'status', 'createdAt', 'updatedAt', 'budget', 'elapsedMs', 'activeSince', 'repairRounds', 'history', 'budgetHistory', 'sessionIds', 'sessionBindings'], ['candidateId', 'sessionId', 'workdir', 'foreground', 'artifactId', 'installedReceipt', 'installation', 'coverage']);
+    const j = object(raw, 'job', ['id', 'title', 'description', 'source', 'mode', 'status', 'createdAt', 'updatedAt', 'budget', 'elapsedMs', 'activeSince', 'repairRounds', 'history', 'budgetHistory', 'sessionIds', 'sessionBindings'], ['candidateId', 'sessionId', 'executionSessionId', 'workdir', 'foreground', 'artifactId', 'installedReceipt', 'installation', 'coverage', 'acceptance']);
     idDates(j, true); textValue(j.title, 'title'); textValue(j.description, 'description', true); enumeration(j.source, ['user', 'discovery'], 'source'); enumeration(j.status, JOB_STATUSES, 'status'); budget(j.budget);
     enumeration(j.mode, ['reconstruct', 'investigate'], 'job mode');
     if (j.mode === 'investigate') check(!['building', 'verifying', 'ready', 'covered', 'installed'].includes(j.status as string), 'Investigation jobs cannot reconstruct or install plugins');
@@ -118,6 +118,7 @@ export function validateState(value: unknown): asserts value is StoreState {
       seen.add(b.sessionId);
     }
     check(seen.size === sessionIds.length && sessionIds.every(id => seen.has(id)), 'Session indexes disagree');
+    if (j.executionSessionId !== undefined) check(typeof j.executionSessionId === 'string' && seen.has(j.executionSessionId), 'Execution session must belong to this job');
     if (!seen.size) check(j.sessionId === undefined, 'Root session without a binding');
     if (j.foreground !== undefined) {
       const f = object(j.foreground, 'foreground', ['id', 'target', 'scope', 'steps', 'requestedAt'], ['approvedAt', 'completedAt', 'releasedAt', 'releaseReason']);
@@ -129,6 +130,16 @@ export function validateState(value: unknown): asserts value is StoreState {
     }
     if (j.coverage !== undefined) {
       const coverage = object(j.coverage, 'coverage', ['specId', 'confirmedAt', 'reason']); textValue(coverage.specId, 'specId'); isoDate(coverage.confirmedAt, 'confirmedAt'); textValue(coverage.reason, 'reason'); check(j.status === 'covered', 'Coverage receipt requires the covered state');
+    }
+    if (j.acceptance !== undefined) {
+      const run = object(j.acceptance, 'acceptance', ['id', 'specId', 'artifactId', 'artifactSha256', 'status', 'startedAt'], ['completedAt', 'reportPath', 'details']);
+      for (const key of ['id', 'specId', 'artifactId']) textValue(run[key], `acceptance ${key}`);
+      digest(run.artifactSha256); isoDate(run.startedAt, 'acceptance startedAt');
+      enumeration(run.status, ['running', 'passed', 'blocked', 'failed', 'interrupted'], 'acceptance status');
+      if (run.completedAt !== undefined) isoDate(run.completedAt, 'acceptance completedAt');
+      check((run.status === 'running') === (run.completedAt === undefined), 'Acceptance completion time disagrees with status');
+      if (run.reportPath !== undefined) relativePath(run.reportPath);
+      if (run.details !== undefined) textValue(run.details, 'acceptance details');
     }
     if (j.installation !== undefined) {
       const install = object(j.installation, 'installation', ['requestId', 'artifactId', 'artifactSha256', 'status', 'startedAt'], ['completedAt', 'packageName', 'version', 'application', 'error', 'logPath', 'warnings']);
@@ -148,7 +159,12 @@ export function validateState(value: unknown): asserts value is StoreState {
     }
   }
   for (const raw of list(s.candidates, 'candidates')) {
-    const c = object(raw, 'candidate', ['id', 'title', 'description', 'sourceUrl', 'detectedAt', 'updatedAt', 'fingerprint', 'status'], ['version', 'sourceType', 'autoInvestigate', 'publishedAt', 'releaseTitle']);
+    const c = object(raw, 'candidate', ['id', 'title', 'description', 'sourceUrl', 'detectedAt', 'updatedAt', 'fingerprint', 'status'], ['version', 'sourceType', 'autoInvestigate', 'publishedAt', 'releaseTitle', 'sourceSnapshot']);
+    if (c.sourceSnapshot !== undefined) {
+      const source = object(c.sourceSnapshot, 'sourceSnapshot', ['path', 'sha256', 'bytes', 'fetchedAt']);
+      digest(source.sha256); count(source.bytes, 'source bytes'); isoDate(source.fetchedAt, 'source fetchedAt');
+      check(source.path === `source-captures/${source.sha256}.txt` && Number(source.bytes) <= 1_500_000, 'Invalid source capture');
+    }
     if (c.publishedAt !== undefined) isoDate(c.publishedAt, 'candidate publishedAt');
     if (c.releaseTitle !== undefined) textValue(c.releaseTitle, 'candidate releaseTitle');
     for (const key of ['id', 'title', 'fingerprint']) textValue(c[key], key); textValue(c.description, 'description', true); webUrl(c.sourceUrl, 'sourceUrl'); isoDate(c.detectedAt, 'detectedAt'); isoDate(c.updatedAt, 'updatedAt'); enumeration(c.status, ['new', 'selected', 'dismissed'], 'candidate status'); if (c.version !== undefined) textValue(c.version, 'version');
@@ -214,6 +230,10 @@ export function validateState(value: unknown): asserts value is StoreState {
     if (j.candidateId) check(state.candidates.some(c => c.id === j.candidateId), 'Unknown candidate');
     if (j.artifactId) check(artifacts.get(j.artifactId)?.jobId === j.id, 'Unknown job artifact');
     if (j.installation) check(artifacts.get(j.installation.artifactId)?.sha256 === j.installation.artifactSha256, 'Installation artifact digest mismatch');
+    if (j.acceptance) {
+      check(artifacts.get(j.acceptance.artifactId)?.jobId === j.id && artifacts.get(j.acceptance.artifactId)?.sha256 === j.acceptance.artifactSha256, 'Acceptance artifact digest mismatch');
+      check(state.specs.some(spec => spec.jobId === j.id && spec.id === j.acceptance!.specId), 'Acceptance specification mismatch');
+    }
     if (j.status === 'ready' || j.status === 'installed') {
       check(state.specs.some(f => f.jobId === j.id), 'Ready job needs a feature spec');
       check(j.artifactId && artifacts.get(j.artifactId)?.kind === 'plugin', 'Ready job needs a plugin artifact');

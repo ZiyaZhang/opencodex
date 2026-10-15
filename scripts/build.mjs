@@ -8,6 +8,8 @@ await build({
   bundle: true, packages: 'external', platform: 'node', target: 'node22',
   format: 'esm', sourcemap: true,
 });
+await build({ entryPoints: ['src/host/acceptance-probe.ts'], outfile: 'dist/host/acceptance-probe.js', bundle: true, packages: 'external', platform: 'node', target: 'node22', format: 'esm' });
+await build({ entryPoints: ['src/host/verification-api.ts'], outfile: 'dist/host/verification-api.js', bundle: true, packages: 'external', platform: 'node', target: 'node22', format: 'esm' });
 const client = await build({
   entryPoints: ['src/client/index.tsx'], bundle: true, write: false,
   platform: 'browser', target: 'es2022', format: 'cjs', jsx: 'automatic',

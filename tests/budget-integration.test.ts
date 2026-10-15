@@ -7,7 +7,7 @@ import { Context } from '@deepseek-ai/cordis';
 import { LlmAdapter, LlmRuntime, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm';
 import { SessionId } from '@deepseek-ai/dsh-session';
 import OpenCodex from '../src/host/index.js';
-import { billableUsage, estimateRequestTokens } from '../src/host/budget.js';
+import { billableUsage, estimateRequestTokens, requestShape, calibratedRequestTokens } from '../src/host/budget.js';
 import { OpenCodexStore } from '../src/core/index.js';
 
 class FixtureAdapter extends LlmAdapter {
@@ -39,12 +39,25 @@ async function fixture(t: TestContext) {
   // Exercise the actual plugin's hooks through the real Cordis waterfall and
   // LlmRuntime adapter dispatch. Only session registry/provider I/O is synthetic.
   const host = Object.create(OpenCodex.prototype) as { installHooks(): void };
-  Object.assign(host, { ctx, store: Promise.resolve(store), maxOutputTokens: 4096, allowSubagents: true, researchProgress: new Map() });
+  Object.assign(host, { ctx, store: Promise.resolve(store), acceptance: Promise.resolve({ cancel() {} }), maxOutputTokens: 4096, allowSubagents: true, researchProgress: new Map(), requestCalibrations: new Map() });
   host.installHooks();
   t.after(async () => { for (const dispose of disposers.reverse()) dispose(); await store.close(); await rm(directory, { recursive: true, force: true }); });
   const options = (sessionId: string | undefined = 'research-root', maxTokens = 256): GenerateOptions => ({ provider: 'test-fixture', model: 'fixture', messages: [{ role: 'user', content: [{ type: 'text', text: 'Research the composer interaction' }] }], maxTokens, ...(sessionId ? { sessionId: SessionId(sessionId) } : {}) });
   return { store, jobId: job.id, runtime, adapter, options, sessions, workdir, cancellations, setInitiator(id?: string) { initiator = id; }, setTime(at: string) { date = new Date(at); } };
 }
+
+test('calibration reuses settled input while changed content and route changes remain conservatively reserved', () => {
+  const options: GenerateOptions = { provider: 'fixture', model: 'one', system: 'stable context '.repeat(3000), messages: [{ role: 'user', content: [{ type: 'text', text: 'Original' }] }], maxTokens: 1000 };
+  const previous = { shape: requestShape(options), inputTokens: 8000 };
+  assert.equal(calibratedRequestTokens(previous.shape), previous.shape.upper);
+  assert.equal(calibratedRequestTokens(previous.shape, previous), 11024);
+  const appended = requestShape({ ...options, messages: [...options.messages, { role: 'user', content: [{ type: 'text', text: '新增信息'.repeat(100) }] }] });
+  assert.ok(calibratedRequestTokens(appended, previous) >= 11024 + Buffer.byteLength('新增信息'.repeat(100)));
+  const switched = requestShape({ ...options, model: 'two' });
+  assert.equal(calibratedRequestTokens(switched, previous), switched.upper);
+  const replaced = requestShape({ ...options, system: 'replacement '.repeat(3000) });
+  assert.equal(calibratedRequestTokens(replaced, previous), replaced.upper);
+});
 
 test('real LlmRuntime retries enter separate reservations and retain unknown failed-attempt usage', async t => {
   const f = await fixture(t);

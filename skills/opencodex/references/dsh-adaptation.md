@@ -8,9 +8,13 @@ Keep business state owned by the appropriate host/session service. Use UI extens
 
 Persist stable IDs and schema versions, not labels or in-memory handles. Make migration and downgrade behavior explicit. Generated packages need a declared host compatibility range, dependencies, entry points, build instructions, a license for original code, and an uninstall/rollback path. Keep REA and CUA optional capabilities for research unless the generated feature actually requires them at runtime.
 
-Build and test inside the research workspace. Submit the produced package path through the job's artifact action. Do not install into the everyday profile from a research tool or package script. The host's isolated validation and the user's installation choice follow separately.
+Build and test inside the research workspace. Submit the produced package path through the job's artifact action. Do not install into the everyday profile from a research tool or package script. The Host performs independent acceptance and installs automatically only after all required scopes pass.
 
 Sources: `dsh-repository`, `dsh-slots`, `dsh-plugin-manager`, `rea-dsh-adapter`. Reconfirm exports and installed interfaces before using names from these moving branches.
+
+## Resolve a public signature
+
+Use `opencodex_job` action `sdk` with one package and then one returned declaration path. Common packages are `@deepseek-ai/dsh-client-ui-conversation`, `@deepseek-ai/dsh-client-ui-renderer`, `@deepseek-ai/dsh-api-session-controller`, `@deepseek-ai/dsh-tools`, and `@deepseek-ai/dsh-host-webserver`. The response binds its bounded excerpt to the actual installed version and digest. A negative symbol match applies only to the returned file. Do not read the entire framework to establish a missing capability.
 
 ## Start from the shipped scaffold
 

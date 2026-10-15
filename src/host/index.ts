@@ -20,16 +20,18 @@ import type { EvidenceInput, Job, JobStatus, ScreenshotMetadata, SpecInput } fro
 import { OPEN_CODEX_DESCRIPTOR, type OpenCodexRequest, type OpenCodexResponse } from './remote.js';
 import { ResourceReader } from './resources.js';
 import { researchPrompt } from './prompt.js';
-import { billableUsage, estimateRequestTokens } from './budget.js';
-import { scanSources, type ScanResult } from './discovery.js';
+import { billableUsage, requestShape, calibratedRequestTokens, type BudgetCalibration } from './budget.js';
+import { scanSources, seedDiscoveryEvidence, type ScanResult } from './discovery.js';
 import { inspectArtifact } from './artifact.js';
 import { VersionMonitor } from './version-monitor.js';
 import { scaffoldPlugin } from './scaffold.js';
 import { addScreenshot, createJobWithReference, readReferenceImage, readScreenshot } from './reference-image.js';
 import { readPluginArtifact } from './plugin-download.js';
 import { PluginInstaller } from './plugin-install.js';
+import { AcceptanceController } from './acceptance.js';
+import { inspectJobSdk } from './sdk.js';
 
-export interface Config { dataDirectory?: string; maxOutputTokens?: number; monitorTickMs?: number; allowSubagents?: boolean; backgroundToolNames?: string[] }
+export interface Config { dataDirectory?: string; maxOutputTokens?: number; monitorTickMs?: number; allowSubagents?: boolean; backgroundToolNames?: string[]; automaticVerification?: boolean }
 const ACTIVE = new Set<JobStatus>(['researching', 'specifying', 'building', 'verifying']);
 const GENERATING = new Set<JobStatus>(['researching', 'specifying', 'building']);
 function text(value: unknown, name: string): string {
@@ -49,8 +51,11 @@ export default class OpenCodex extends TypertRemoteService {
   readonly directory: string;
   readonly artifactRoot: string;
   private readonly resources = new ResourceReader(fileURLToPath(new URL('../../', import.meta.url)));
+  private readonly requestCalibrations = new Map<string, BudgetCalibration>();
   private readonly store: Promise<OpenCodexStore>;
   private readonly installer: Promise<PluginInstaller>;
+  private readonly acceptance: Promise<AcceptanceController>;
+  private readonly automaticVerification: boolean;
   private readonly versionMonitor: VersionMonitor;
   private readonly lifetime = new AbortController();
   private readonly jobOperations = new Map<string, Promise<unknown>>();
@@ -63,13 +68,16 @@ export default class OpenCodex extends TypertRemoteService {
   private lastScanAt = 0;
   private readonly allowSubagents: boolean;
   private readonly backgroundToolNames: ReadonlySet<string>;
+  private readonly discoveryFetch?: typeof fetch;
 
-  constructor(ctx: Context, config: Config = {}) {
+  constructor(ctx: Context, config: Config = {}, dependencies: { fetch?: typeof fetch } = {}) {
     super(ctx, 'opencodex', { namespace: 'opencodex' });
     this.directory = resolve(config.dataDirectory ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'opencodex'));
     this.artifactRoot = join(this.directory, 'jobs');
     this.maxOutputTokens = config.maxOutputTokens ?? 4096;
     this.allowSubagents = config.allowSubagents ?? false;
+    this.automaticVerification = config.automaticVerification ?? true;
+    this.discoveryFetch = dependencies.fetch;
     if (config.backgroundToolNames !== undefined && (!Array.isArray(config.backgroundToolNames) || config.backgroundToolNames.some(name => typeof name !== 'string' || !name.trim()))) throw new Error('backgroundToolNames must be exact operator-verified tool names');
     this.backgroundToolNames = new Set(config.backgroundToolNames ?? []);
     if (!Number.isSafeInteger(this.maxOutputTokens) || this.maxOutputTokens < 256 || this.maxOutputTokens > 32768) throw new Error('maxOutputTokens must be an integer from 256 to 32768');
@@ -77,6 +85,14 @@ export default class OpenCodex extends TypertRemoteService {
     if (!Number.isSafeInteger(tick) || tick < 1000) throw new Error('monitorTickMs must be at least 1000');
     this.store = OpenCodexStore.open({ directory: this.directory, artifactRoot: this.artifactRoot });
     this.installer = this.store.then(store => new PluginInstaller(store, this.directory, () => ctx.get('pluginManager'), this.lifetime.signal));
+    this.acceptance = this.store.then(store => new AcceptanceController(store, {
+      signal: this.lifetime.signal,
+      whenResearchIdle: async job => { await Promise.all(job.sessionIds.map(id => this.ctx.agents.get(SessionId(id))?.whenIdle())); },
+      verifier: () => this.ctx.get('opencodexFeatureVerifier'),
+      accepted: id => this.completeAcceptance(id),
+      repair: (id, details) => this.repairAfterAcceptance(id, details),
+    }));
+    void this.acceptance.catch(() => undefined);
     void this.installer.catch(() => undefined);
     // Retain the failure for RPC callers without an unhandled rejection before the first call.
     void this.store.catch(() => undefined);
@@ -97,6 +113,7 @@ export default class OpenCodex extends TypertRemoteService {
       for (const job of store.snapshot().jobs) if (ACTIVE.has(job.status)) await this.stop(job.id, 'paused', 'OpenCodex plugin unloaded');
       await Promise.allSettled([...this.jobOperations.values(), ...(this.scanOperation ? [this.scanOperation] : [])]);
       await (await this.installer).whenIdle();
+      await (await this.acceptance).whenIdle();
       const idle = store.snapshot().jobs.flatMap(job => job.sessionIds.map(id => this.ctx.agents.get(SessionId(id)))).filter(agent => agent !== undefined);
       for (const agent of idle) agent.cancel({ kind: 'user' });
       await Promise.allSettled(idle.map(agent => agent.whenIdle()));
@@ -126,7 +143,7 @@ export default class OpenCodex extends TypertRemoteService {
         break;
       }
       case 'settings': await store.updateSettings(request.patch); await this.versionMonitor.configure(store.snapshot().settings.localVersionFile); break;
-      case 'start': await this.serial(text(request.jobId, 'jobId'), () => this.start(request.jobId, request.note)); break;
+      case 'start': await this.serial(text(request.jobId, 'jobId'), () => this.start(request.jobId, request.note, request.freshContext)); break;
       case 'pause': await this.serial(text(request.jobId, 'jobId'), () => this.stop(request.jobId, 'paused', 'Paused by user')); break;
       case 'cancel': await this.serial(text(request.jobId, 'jobId'), () => this.stop(request.jobId, 'cancelled', 'Cancelled by user')); break;
       case 'extendBudget': await store.extendBudget(text(request.jobId, 'jobId'), request.patch); break;
@@ -175,6 +192,7 @@ export default class OpenCodex extends TypertRemoteService {
       { id: 'local-version', available: localVersion.selected && !localVersion.error, detail: localVersion.error ?? (localVersion.selected ? `Local version ${localVersion.version ?? 'baseline pending'}${localVersion.build ? ` (${localVersion.build})` : ''}; ${localVersion.watching ? 'watcher active' : 'periodic fallback'}` : 'Select a local version metadata file to enable immediate version checks') },
       { id: 'dsh-sessions', available: true, detail: 'Uses DSH sessionController and the configured main Agent' },
       { id: 'plugin-manager', available: Boolean(this.ctx.get('pluginManager')), detail: 'Accepted generated bundles install and enable automatically through the current DSH profile plugin manager' },
+      { id: 'feature-verifier', available: Boolean(this.ctx.get('opencodexFeatureVerifier')), detail: this.ctx.get('opencodexFeatureVerifier') ? 'Independent feature verifier is registered; each specification obligation must be covered' : 'Native package lifecycle runs automatically. Behavior and visual comparison need a configured verifier or actual user acceptance; missing checks never pass automatically' },
       { id: 'workspace-sandbox', available: Boolean(this.ctx.get('sandbox') && this.ctx.get('sandboxPolicy')), detail: 'Research requires workspace-write confinement; no escalation is allowed' },
       { id: 'cua', available: names.some(name => /cua|computer/i.test(name)), detail: names.filter(name => /cua|computer/i.test(name)).join(', ') || 'Install and configure a DSH CUA provider' },
       { id: 'browser', available: names.some(name => /browser|playwright/i.test(name)), detail: names.filter(name => /browser|playwright/i.test(name)).join(', ') || 'No browser tool is currently registered' },
@@ -183,13 +201,14 @@ export default class OpenCodex extends TypertRemoteService {
     ];
     await (await this.store).saveCapabilities({ checkedAt: new Date().toISOString(), checks });
   }
-  private async start(id: string, note?: string): Promise<void> {
+  private async start(id: string, note?: string, freshContext = false): Promise<void> {
+    if (typeof freshContext !== 'boolean') throw new Error('freshContext must be boolean');
     if (note !== undefined && (typeof note !== 'string' || note.length > 4000)) throw new Error('Start note must be at most 4000 characters');
     note = note?.trim();
     const current = (await this.store).getJob(id);
     if (ACTIVE.has(current.status)) return; // Duplicate UI delivery must not cancel the existing run.
     if (['ready', 'installed', 'covered', 'researched', 'cancelled'].includes(current.status)) throw new Error('This job cannot be started');
-    try { await this.startUnsafe(id, note); } catch (error) {
+    try { await this.startUnsafe(id, note, freshContext); } catch (error) {
       const store = await this.store;
       const job = store.getJob(id);
       if (!job.foreground || job.foreground.completedAt || this.hasForegroundLease(job, store)) {
@@ -201,7 +220,7 @@ export default class OpenCodex extends TypertRemoteService {
       throw error;
     }
   }
-  private async startUnsafe(id: string, note?: string): Promise<void> {
+  private async startUnsafe(id: string, note?: string, freshContext = false): Promise<void> {
     const store = await this.store;
     let job = store.getJob(id);
     if (ACTIVE.has(job.status)) throw new Error('Research is already running');
@@ -215,15 +234,28 @@ export default class OpenCodex extends TypertRemoteService {
     const validSpec = savedSpec && savedSpec.behavior.length > 0 && savedSpec.visual.length > 0 && savedSpec.lifecycle.length > 0 && savedSpec.evidenceIds.length > 0
       && savedSpec.evidenceIds.every(evidenceId => snapshot.evidence.some(evidence => evidence.id === evidenceId && evidence.jobId === job.id));
     const restorePhase = validSpec && (previousPhase === 'specifying' || (previousPhase === 'building' && job.mode === 'reconstruct')) ? previousPhase : undefined;
+    if (previousPhase === 'verifying' && validSpec && job.artifactId) {
+      await store.resumeAcceptance(id);
+      this.queueAcceptance(id);
+      return;
+    }
     const workdir = join(this.artifactRoot, job.id);
     await mkdir(workdir, { recursive: true, mode: 0o700 });
     const normalizedWorkdir = await realpath(workdir);
-    if (!job.sessionId) {
+    const continuation = freshContext && resuming && Boolean(job.sessionId);
+    const previousGuidance = continuation ? job.history.map(event => event.reason.match(/; user note: ([\s\S]*)$/)?.[1]).filter(Boolean).join('\n\n') : '';
+    if (previousGuidance.length > 16_000) throw new Error('Prior user guidance is too large for a bounded fresh context; continue the existing session instead');
+    if (!job.sessionId || continuation) {
+      if (continuation) {
+        this.cancelSessions(job);
+        await Promise.all(job.sessionIds.map(id => this.ctx.agents.get(SessionId(id))?.whenIdle()));
+      }
       const created = await this.ctx.sessionController.create({ cwd: normalizedWorkdir });
-      job = await store.bindSession(id, { sessionId: created.sessionId, workdir: normalizedWorkdir });
+      job = await store.bindSession(id, { sessionId: created.sessionId, workdir: normalizedWorkdir, ...(continuation ? { parentSessionId: job.executionSessionId ?? job.sessionId, continuation: true } : {}) });
       await this.ctx.sessionController.rename({ sessionId: created.sessionId, title: `OpenCodex · ${job.title}` });
     }
-    const sessionId = SessionId(job.sessionId!);
+    const sessionId = SessionId(job.executionSessionId ?? job.sessionId!);
+    await seedDiscoveryEvidence(this.directory, store, job.id);
     const activation = await this.ctx.sessionController.resolveAgent(sessionId);
     if ('error' in activation) throw activation.error;
     const session = this.ctx.sessions.get(sessionId);
@@ -241,8 +273,9 @@ export default class OpenCodex extends TypertRemoteService {
     try {
       await this.capabilities();
       const entry = await this.resources.read('opencodex', 32_000);
-      const content = researchPrompt(job, await this.resources.catalog(), this.ctx.tools.schemas(activation.agent).map(tool => tool.name), resuming, entry.content)
-        + (previousPhase === 'verifying' ? '\n\nResume limitation: the previous phase was verifying. Automatic restoration of verification or repair is not implemented; this explicit resume retains the existing research restart behavior. No repair round was started. Inspect the existing dossier and report the needed acceptance/repair step rather than claiming verification has resumed.' : '')
+      const content = researchPrompt(job, await this.resources.catalog(), this.ctx.tools.schemas(activation.agent).map(tool => tool.name), resuming && !continuation, entry.content)
+        + (continuation ? `\n\nThis is a fresh execution context of the SAME job. All prior sessions, evidence, code, limits and spent tokens remain in its ledger. Read saved records instead of repeating research. Target access denials remain binding. No budget was reset.\nPrevious user guidance remains binding:\n${previousGuidance}` : '')
+        + (previousPhase === 'verifying' ? '\n\nThe previous phase was verifying, but its current package or specification is missing. Recover the required deliverable before handing off again; no acceptance was resumed. No repair round was started.' : '')
         + (note ? `\n\nUser guidance for this run:\n${note}` : '');
       await this.ctx.sessionController.prompt({ sessionId, requestId: randomUUID() as SessionRequestId, mode: 'queue', content: [{ type: 'text', text: content }] }, this.lifetime.signal);
     } catch (error) { await this.stop(id, 'paused', errorText(error)); throw error; }
@@ -250,6 +283,7 @@ export default class OpenCodex extends TypertRemoteService {
   private async stop(id: string, status: 'paused' | 'cancelled', reason: string): Promise<void> {
     const store = await this.store;
     const job = store.getJob(id);
+    (await this.acceptance).cancel(id);
     if (job.status === status && job.foreground && this.hasForegroundLease(job, store)) await store.revokeForeground(job.id, job.foreground.id, reason);
     if (job.status !== status && !['installed', 'covered', 'researched', 'cancelled'].includes(job.status)) await store.transitionJob(id, status, { reason });
     this.cancelSessions(job);
@@ -295,6 +329,7 @@ export default class OpenCodex extends TypertRemoteService {
     const store = await this.store;
     const current = store.getJob(job.id);
     const budget = store.budgetSummary(job.id);
+    if (current.status === 'verifying') throw new Error('The Host is verifying the saved package; research calls are closed during acceptance');
     if (!ACTIVE.has(current.status)) throw new Error(`OpenCodex job is ${current.status}; resume from the UI`);
     if (budget.elapsedMs >= current.budget.maxDurationMs || budget.job.remainingTokens <= 0 || budget.daily.remainingTokens <= 0) {
       await this.stop(job.id, 'paused', 'Research budget exhausted');
@@ -306,11 +341,12 @@ export default class OpenCodex extends TypertRemoteService {
       if (this.closed) return;
       const store = await this.store;
       const job = store.getJob(id);
-      if (!GENERATING.has(job.status) || !job.sessionId || !this.drivenSessions.has(job.sessionId)) return;
+      const executionId = job.executionSessionId ?? job.sessionId;
+      if (!GENERATING.has(job.status) || !executionId || !this.drivenSessions.has(executionId)) return;
       // A completed child must not pause its still-running parent or siblings.
       if (job.sessionIds.some(sessionId => this.ctx.agents.get(SessionId(sessionId))?.status === 'running')) return;
       if (store.snapshot().reservations.some(request => request.jobId === id && request.status === 'inflight')) return;
-      const kind = this.turnEndReasons.get(job.sessionId);
+      const kind = this.turnEndReasons.get(executionId);
       const reason = kind === 'max-tokens'
         ? 'The DSH turn reached its single-call output token limit before finishing the job. Review the session, DSH model output settings and OpenCodex maxOutputTokens cap, then explicitly resume; the job budget and saved specification are unchanged.'
         : kind === 'error'
@@ -383,7 +419,8 @@ export default class OpenCodex extends TypertRemoteService {
         self.researchProgress.set(job.id, progress);
       }
       const requestId = randomUUID();
-      try { await store.reserveTokens(job.id, { requestId, reservedTokens: estimateRequestTokens(options) + options.maxTokens! }); }
+      const shape = requestShape(options), calibrationKey = `${job.id}:${options.sessionId ?? initiator?.session.id ?? 'auxiliary'}`;
+      try { await store.reserveTokens(job.id, { requestId, reservedTokens: calibratedRequestTokens(shape, self.requestCalibrations.get(calibrationKey)) + options.maxTokens! }); }
       catch (error) { await self.stop(job.id, 'paused', errorText(error)); throw error; }
       let usage: DshUsage | undefined;
       try {
@@ -392,7 +429,11 @@ export default class OpenCodex extends TypertRemoteService {
           yield chunk;
         }
       } finally {
-        try { await store.reconcileUsage(requestId, usage ? billableUsage(usage) : null); } catch (error) {
+        try {
+          const measured = usage ? billableUsage(usage) : null;
+          await store.reconcileUsage(requestId, measured);
+          if (measured) self.requestCalibrations.set(calibrationKey, { shape, inputTokens: measured.inputTokens });
+        } catch (error) {
           await store.reconcileUsage(requestId, null);
           if (ACTIVE.has(store.getJob(job.id).status)) await self.stop(job.id, 'paused', `Unusable provider usage: ${errorText(error)}`);
           throw error;
@@ -437,8 +478,8 @@ export default class OpenCodex extends TypertRemoteService {
     }));
     this.ctx.tools.register(defineTool({
       name: 'opencodex_job', description: `Maintain the calling OpenCodex job dossier. Cannot approve foreground operations, increase budgets, mark ready, or install. Payloads by action:
-status: {offset?:number}; returns compact job/budget and latest-first paginated dossier summaries, 30 per category, without the description or full history. record: {id:string,offset?:number}; returns one same-job dossier record as JSON text in 16000-character chunks; concatenate content using nextOffset until absent. repair: {}. scaffold: {packageName:string}; reconstruction only, copies the bundled feature-free skeleton into an absent/empty plugin directory, refuses symlinks and overwrites, does not install or build. Returns exact starter Client source, target SDK versions and build/package commands; use this brief instead of rereading every template file. Use an unscoped lowercase name with letters/digits/hyphens, at most 80 characters. evidence: {kind:'observed'|'inferred'|'unknown',claim:string,sourceUrl?:string,localPath?:string,relatedEvidenceIds?:string[]}; observed needs sourceUrl or localPath. spec: {title:string,behavior:string[],visual:string[],lifecycle:string[],existingCapabilities:string[],gaps:string[],evidenceIds:string[]}; required arrays behavior/visual/lifecycle/evidenceIds must be nonempty. artifact: {path:string,label?:string,kind?:'plugin'|'report'|'screenshot'|'log',screenshot?:{subject:'codex'|'dsh'|'other',caption:string,provenance:'user'|'capture'|'public-source',sourceUrl?:string,version?:string}}; plugin is a real npm tarball. New screenshot artifacts require screenshot metadata, a real PNG/JPEG/WebP file at most 2 MiB, a concise caption explaining the visible feature, and honest subject/source labels. Capture Codex reference and DSH implementation separately; missing reference is a visual gap, not a passed comparison. verification: {details:string,localPath?:string}; records an agent report only. stage: {status:'specifying'|'building'|'verifying'|'blocked'|'researched',reason:string}; advance sequentially. request_foreground: {target:string,scope:string,steps:string[]}; pauses the job until user approval. foreground_done: {requestId:string}. Stage, repair and foreground_done return compact acknowledgements. Paths are relative to the dedicated job workspace.`,
-      parameters: { action: { type: 'string', required: true, enum: ['status', 'record', 'evidence', 'spec', 'scaffold', 'artifact', 'verification', 'stage', 'request_foreground', 'foreground_done', 'repair'] }, payload: { type: 'object', additionalProperties: true } },
+sdk: {package:string,path?:string,symbol?:string,offset?:number}; returns the installed version, export/type paths, digest and at most 5000 declaration characters for one allowlisted DSH package. Start with the package, then follow only relevant returned declarations; prefer this to scanning node_modules. status: {offset?:number}; returns compact job/budget and latest-first paginated dossier summaries, 30 per category, without the description or full history. record: {id:string,offset?:number}; returns one same-job dossier record as JSON text in 16000-character chunks; concatenate content using nextOffset until absent. repair: {}. scaffold: {packageName:string}; reconstruction only, copies the bundled feature-free skeleton into an absent/empty plugin directory, refuses symlinks and overwrites, does not install or build. Returns exact starter Client source, target SDK versions and build/package commands; use this brief instead of rereading every template file. Use an unscoped lowercase name with letters/digits/hyphens, at most 80 characters. evidence: {kind:'observed'|'inferred'|'unknown',claim:string,sourceUrl?:string,localPath?:string,relatedEvidenceIds?:string[]}; observed needs sourceUrl or localPath. spec: {title:string,behavior:string[],visual:string[],lifecycle:string[],existingCapabilities:string[],gaps:string[],evidenceIds:string[]}; required arrays behavior/visual/lifecycle/evidenceIds must be nonempty. artifact: {path:string,label?:string,kind?:'plugin'|'report'|'screenshot'|'log',screenshot?:{subject:'codex'|'dsh'|'other',caption:string,provenance:'user'|'capture'|'public-source',sourceUrl?:string,version?:string}}; plugin is a real npm tarball. New screenshot artifacts require screenshot metadata, a real PNG/JPEG/WebP file at most 2 MiB, a concise caption explaining the visible feature, and honest subject/source labels. Capture Codex reference and DSH implementation separately; missing reference is a visual gap, not a passed comparison. verification: {details:string,localPath?:string}; records an agent report only. stage: {status:'specifying'|'building'|'verifying'|'blocked'|'researched',reason:string}; advance sequentially. request_foreground: {target:string,scope:string,steps:string[]}; pauses the job until user approval. foreground_done: {requestId:string}. Stage, repair and foreground_done return compact acknowledgements. Paths are relative to the dedicated job workspace.`,
+      parameters: { action: { type: 'string', required: true, enum: ['status', 'record', 'sdk', 'evidence', 'spec', 'scaffold', 'artifact', 'verification', 'stage', 'request_foreground', 'foreground_done', 'repair'] }, payload: { type: 'object', additionalProperties: true } },
       output: { schema: { type: 'object', properties: { result: { type: 'string', required: true } }, additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: String(value.result) }] },
       execute: async (args, exec) => {
         exec.signal.throwIfAborted();
@@ -459,6 +500,7 @@ status: {offset?:number}; returns compact job/budget and latest-first paginated 
             return { id, offset, totalCharacters: content.length, content: content.slice(offset, offset + 16000), ...(offset + 16000 < content.length ? { nextOffset: offset + 16000 } : {}) };
           }
           case 'evidence': return store.addEvidence(job.id, this.evidenceInput(job, payload));
+          case 'sdk': return inspectJobSdk(store, job.id, { package: text(payload.package, 'package'), ...(typeof payload.path === 'string' ? { path: payload.path } : {}), ...(typeof payload.symbol === 'string' ? { symbol: payload.symbol } : {}), ...(payload.offset !== undefined ? { offset: Number(payload.offset) } : {}) });
           case 'spec': return store.saveSpec(job.id, payload as SpecInput);
           case 'scaffold': return this.serial(`scaffold:${job.id}`, () => scaffoldPlugin(this.resources.packageRoot, this.artifactRoot, store.getJob(job.id), text(payload.packageName, 'packageName')));
           case 'artifact': return store.registerArtifact(job.id, { path: this.artifactPath(job, text(payload.path, 'path')), ...(typeof payload.label === 'string' ? { label: payload.label } : {}), ...(typeof payload.kind === 'string' ? { kind: payload.kind as 'plugin' | 'report' | 'screenshot' | 'log' } : {}), ...(payload.screenshot !== undefined ? { screenshot: payload.screenshot as ScreenshotMetadata } : {}) });
@@ -467,7 +509,11 @@ status: {offset?:number}; returns compact job/budget and latest-first paginated 
             const stage = text(payload.status, 'status');
             if (!['specifying', 'building', 'verifying', 'blocked', 'researched'].includes(stage)) throw new Error('Agents may only advance specification, build, verification or report a blocker');
             if (job.mode === 'investigate' && ['building', 'verifying'].includes(stage)) throw new Error('Version investigations only inventory changes; choose a feature in a new reconstruction job before implementing it');
-            return this.jobAcknowledgement(await store.transitionJob(job.id, stage as JobStatus, { reason: text(payload.reason, 'reason') }));
+            if (stage === 'building' && !store.snapshot().specs.some(spec => spec.jobId === job.id && spec.evidenceIds.some(id => store.snapshot().evidence.some(e => e.id === id && e.kind === 'observed')))) throw new Error('Save the minimal specification grounded in observed evidence before implementation');
+            if (stage === 'verifying') await this.validateArtifact(job.id);
+            const advanced = await store.transitionJob(job.id, stage as JobStatus, { reason: text(payload.reason, 'reason') });
+            if (stage === 'verifying') this.queueAcceptance(job.id);
+            return this.jobAcknowledgement(advanced);
           }
           case 'request_foreground': {
             const request = await store.requestForeground(job.id, { target: text(payload.target, 'target'), scope: text(payload.scope, 'scope'), steps: Array.isArray(payload.steps) ? payload.steps.map(step => text(step, 'step')) : [] });
@@ -500,7 +546,7 @@ status: {offset?:number}; returns compact job/budget and latest-first paginated 
   private jobSummary(job: Job) {
     const last = job.history.at(-1);
     return { ...this.jobAcknowledgement(job), title: job.title, budget: job.budget,
-      ...(job.sessionId ? { sessionId: job.sessionId } : {}), ...(job.workdir ? { workdir: job.workdir } : {}),
+      ...(job.sessionId ? { sessionId: job.executionSessionId ?? job.sessionId } : {}), ...(job.workdir ? { workdir: job.workdir } : {}),
       ...(last ? { lastHistory: { ...last, reason: last.reason.slice(0, 512) } } : {}),
     };
   }
@@ -549,9 +595,32 @@ status: {offset?:number}; returns compact job/budget and latest-first paginated 
       if (!this.closed) this.ctx.logger.warn(`OpenCodex installation: ${errorText(error)}`);
     });
   }
+  private queueAcceptance(id: string): void {
+    if (!this.automaticVerification || this.closed) return;
+    void this.acceptance.then(controller => controller.run(id)).catch(error => {
+      if (!this.closed) this.ctx.logger.warn(`OpenCodex acceptance: ${errorText(error)}`);
+    });
+  }
+  private async repairAfterAcceptance(id: string, details: string): Promise<void> {
+    const store = await this.store;
+    if (this.closed || store.getJob(id).status !== 'verifying') return;
+    const job = store.getJob(id);
+    const executionId = job.executionSessionId ?? job.sessionId;
+    if (!executionId || !this.ctx.agents.get(SessionId(executionId))) {
+      await store.transitionJob(id, 'blocked', { reason: details }); return;
+    }
+    try {
+      const repairing = await store.startRepair(id);
+      const content = researchPrompt(repairing, await this.resources.catalog(), this.ctx.tools.schemas().map(tool => tool.name), true)
+        + `\n\nIndependent acceptance failed. Repair only the failing implementation, rerun the affected checks, register a new tarball, and hand off to verifying. Do not repeat research or erase contrary evidence. Failure: ${details.slice(0, 4000)}. Full report: ${repairing.acceptance?.reportPath ?? 'see dossier'}`;
+      await this.ctx.sessionController.prompt({ sessionId: SessionId(executionId), requestId: randomUUID() as SessionRequestId, mode: 'queue', content: [{ type: 'text', text: content }] }, this.lifetime.signal);
+    } catch (error) {
+      if (GENERATING.has(store.getJob(id).status)) await this.stop(id, 'paused', errorText(error));
+    }
+  }
   private scan(signal: AbortSignal): Promise<ScanResult> {
     if (this.scanOperation) return this.scanOperation;
-    const run = this.store.then(store => scanSources(this.directory, store, AbortSignal.any([signal, this.lifetime.signal])));
+    const run = this.store.then(store => scanSources(this.directory, store, AbortSignal.any([signal, this.lifetime.signal]), this.discoveryFetch));
     this.scanOperation = run;
     void run.finally(() => { this.lastScanAt = Date.now(); if (this.scanOperation === run) this.scanOperation = undefined; }).catch(() => undefined);
     return run;
@@ -603,8 +672,9 @@ status: {offset?:number}; returns compact job/budget and latest-first paginated 
     for (const job of state.jobs) if (job.status === 'ready' && !job.installation) this.queueInstallation(job.id);
     for (const job of state.jobs) if (ACTIVE.has(job.status)) {
       const budget = store.budgetSummary(job.id);
-      if (budget.elapsedMs >= job.budget.maxDurationMs || budget.job.remainingTokens <= 0 || budget.daily.remainingTokens <= 0) await this.stop(job.id, 'paused', 'Research budget exhausted');
+      if (budget.elapsedMs >= job.budget.maxDurationMs || (GENERATING.has(job.status) && (budget.job.remainingTokens <= 0 || budget.daily.remainingTokens <= 0))) await this.stop(job.id, 'paused', 'Research budget exhausted');
       else if (GENERATING.has(job.status)) await this.reconcileIdleJob(job.id);
+      else if (job.status === 'verifying' && (!job.acceptance || job.acceptance.artifactId !== job.artifactId)) this.queueAcceptance(job.id);
     }
     await this.versionMonitor.configure(state.settings.localVersionFile);
     await this.versionMonitor.tick(state.settings.monitorIntervalMinutes);

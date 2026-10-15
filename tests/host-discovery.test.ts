@@ -1,10 +1,10 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { OpenCodexStore } from '../src/core/index.js';
-import { scanSources, fetchDiscoverySource, DISCOVERY_SOURCES } from '../src/host/discovery.js';
+import { scanSources, fetchDiscoverySource, seedDiscoveryEvidence, DISCOVERY_SOURCES } from '../src/host/discovery.js';
 
 const date = new Date().toISOString().slice(0, 10);
 const source = DISCOVERY_SOURCES[0];
@@ -14,7 +14,7 @@ async function fixture(t: TestContext) {
   const store = await OpenCodexStore.open({ directory });
   const original = globalThis.fetch;
   t.after(async () => { globalThis.fetch = original; await store.close(); await rm(directory, { recursive: true, force: true }); });
-  return { directory, store, scan: () => scanSources(directory, store, new AbortController().signal) };
+  return { directory, store, scan: () => scanSources(directory, store, new AbortController().signal, (...args) => globalThis.fetch(...args)) };
 }
 
 test('first scan discovers individual recent features without starting research; repeated and edited sources deduplicate', async t => {
@@ -71,6 +71,21 @@ test('compatible ETags avoid reparsing; failed fetch or unsupported format never
   assert.equal(f.store.snapshot().candidates.length, 2);
 });
 
+test('legacy or missing source captures cannot be hidden behind a 304 checkpoint', async t => {
+  const f = await fixture(t);
+  await writeFile(join(f.directory, 'discovery.json'), JSON.stringify({ schemaVersion: 2, sources: { [source.id]: { hash: 'a'.repeat(64), etag: 'old', url: source.url, checkedAt: new Date().toISOString() } } }));
+  let requests = 0;
+  globalThis.fetch = async (_url, options) => {
+    requests++;
+    assert.equal(new Headers(options?.headers).get('if-none-match'), null);
+    return new Response(body(), { headers: { etag: 'captured' } });
+  };
+  assert.equal((await f.scan()).discovered, 2);
+  await rm(join(f.directory, f.store.snapshot().candidates[0]!.sourceSnapshot!.path));
+  assert.equal((await f.scan()).discovered, 0);
+  assert.equal(requests, 2);
+});
+
 test('official HTML fallback is bounded and used after RSS fetch failure', async t => {
   const f = await fixture(t);
   const requests: string[] = [];
@@ -103,9 +118,38 @@ test('an unparseable successful RSS response falls back to HTML and checkpoints 
 test('discovery rejects oversized responses and unsolicited 304, and does not follow redirects', async t => {
   await fixture(t);
   globalThis.fetch = async () => new Response('x', { headers: { 'content-length': '1500001' } });
-  await assert.rejects(fetchDiscoverySource(source.url, undefined, new AbortController().signal), /byte limit/);
+  await assert.rejects(fetchDiscoverySource(source.url, undefined, new AbortController().signal, globalThis.fetch), /byte limit/);
   globalThis.fetch = async () => new Response('unavailable', { status: 503 });
-  await assert.rejects(fetchDiscoverySource(source.url, undefined, new AbortController().signal), /HTTP 503/);
+  await assert.rejects(fetchDiscoverySource(source.url, undefined, new AbortController().signal, globalThis.fetch), /HTTP 503/);
   globalThis.fetch = async () => new Response(null, { status: 304 });
-  await assert.rejects(fetchDiscoverySource(source.url, undefined, new AbortController().signal), /Unexpected 304/);
+  await assert.rejects(fetchDiscoverySource(source.url, undefined, new AbortController().signal, globalThis.fetch), /Unexpected 304/);
+});
+
+test('selected candidates reuse immutable fetched sources in the same job and reject altered captures', async t => {
+  const f = await fixture(t);
+  globalThis.fetch = async () => new Response(body());
+  await f.scan();
+  const candidate = f.store.snapshot().candidates[0]!;
+  assert.ok(candidate.sourceSnapshot);
+  const job = await f.store.createJob({ title: candidate.title, source: 'discovery', candidateId: candidate.id });
+  const workdir = join(f.store.artifactRoot, job.id); await mkdir(workdir);
+  await f.store.bindSession(job.id, { sessionId: 'source-fixture', workdir });
+  await seedDiscoveryEvidence(f.directory, f.store, job.id);
+  await seedDiscoveryEvidence(f.directory, f.store, job.id);
+  const evidence = f.store.snapshot().evidence;
+  assert.equal(evidence.length, 2); assert.equal(evidence[0]!.sha256, candidate.sourceSnapshot!.sha256);
+  assert.equal(await readFile(join(f.store.artifactRoot, evidence[0]!.localPath!), 'utf8'), body());
+  const selected = JSON.parse(await readFile(join(f.store.artifactRoot, evidence[1]!.localPath!), 'utf8'));
+  assert.equal(selected.title, candidate.title);
+  assert.equal(selected.rawSource.sha256, candidate.sourceSnapshot!.sha256);
+  assert.equal(selected.announcement, candidate.description);
+  assert.equal(f.store.snapshot().jobs[0]!.status, 'detected');
+  const other = await f.store.createJob({ title: 'Second source reader' });
+  const another = f.store.snapshot().candidates[1]!;
+  const second = await f.store.createJob({ title: another.title, source: 'discovery', candidateId: another.id });
+  await mkdir(join(f.store.artifactRoot, second.id));
+  await f.store.bindSession(second.id, { sessionId: 'second-source-fixture', workdir: join(f.store.artifactRoot, second.id) });
+  await writeFile(join(f.directory, candidate.sourceSnapshot!.path), 'tampered');
+  await assert.rejects(seedDiscoveryEvidence(f.directory, f.store, second.id), /Invalid saved discovery source|digest mismatch/);
+  assert.equal(f.store.getJob(other.id).status, 'draft');
 });

@@ -12,7 +12,7 @@ import OpenCodex from '../src/host/index.js';
 import { OpenCodexStore } from '../src/core/index.js';
 import type { OpenCodexRequest } from '../src/host/remote.js';
 import { MAX_REFERENCE_IMAGE_BYTES } from '../src/host/reference-image.js';
-import { verifyingPlugin } from './helpers/plugin-fixture.js';
+import { fixtureTarball, verifyingPlugin } from './helpers/plugin-fixture.js';
 import type { PluginInstaller } from '../src/host/plugin-install.js';
 
 const PNG_REFERENCE = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jQ8sAAAAASUVORK5CYII=';
@@ -48,7 +48,7 @@ async function fixture(sandbox = true, existingDirectory?: string) {
     ctx.provide('sandbox', {} as never);
     ctx.provide('sandboxPolicy', { resolve: ({ session }: { session: { header: { cwd: string }; mode: string } }) => ({ mode: session.mode, workspaceRoot: session.header.cwd }) } as never);
   }
-  const plugin = new OpenCodex(ctx, { dataDirectory: directory, monitorTickMs: 1000 });
+  const plugin = new OpenCodex(ctx, { dataDirectory: directory, monitorTickMs: 1000, automaticVerification: false }, { fetch: (...args) => globalThis.fetch(...args) });
   const call = (request: OpenCodexRequest) => plugin.call(request, new AbortController().signal);
   const close = async () => { await ctx.fiber.dispose(); if (!existingDirectory) await rm(directory, { recursive: true, force: true }); };
   return { plugin, ctx, call, tools, descriptors, sessions, agents, prompts, counts: () => ({ createCount, cancels }), directory, close };
@@ -128,6 +128,43 @@ test('manual research starts one ordinary DSH session in a confined workdir and 
     assert.equal(f.prompts.length, 2);
     assert.ok(f.counts().cancels >= 1);
     assert.equal(f.descriptors[0]?.namespace, 'opencodex');
+  } finally { await f.close(); }
+});
+
+test('fresh continuation retains ledger, SDK evidence, code, prior guidance and session ownership', async () => {
+  const f = await fixture();
+  try {
+    const made = await f.call({ action: 'create', input: { title: 'Context handoff' } });
+    const id = made.state.jobs[0]!.id;
+    await f.call({ action: 'start', jobId: id, note: 'Do not access the denied target.' });
+    const store = await (f.plugin as unknown as { store: Promise<OpenCodexStore> }).store;
+    const workdir = store.getJob(id).workdir!;
+    await writeFile(join(workdir, 'kept.ts'), 'export const retained = true;');
+    await store.reserveTokens(id, { requestId: 'prior-call', reservedTokens: 2000 });
+    await store.reconcileUsage('prior-call', { inputTokens: 1000, outputTokens: 10 });
+    const tool = f.tools.get('opencodex_job')!;
+    const execute = async () => JSON.parse((await tool.execute({ action: 'sdk', payload: { package: '@deepseek-ai/dsh-api-session-controller' } }, { signal: new AbortController().signal, agent: f.agents.get('research-1') } as never) as { result: string }).result);
+    const first = await execute(), repeat = await execute();
+    assert.equal(first.evidenceId, repeat.evidenceId);
+    assert.equal(store.snapshot().evidence.length, 1);
+    const retained = await readFile(join(workdir, first.savedView), 'utf8');
+    assert.match(retained, /\nexport (?:declare|type)/);
+    assert.ok(retained.includes(first.content), 'Retained declarations preserve real lines instead of an escaped JSON string');
+    await f.call({ action: 'pause', jobId: id });
+    await f.call({ action: 'start', jobId: id, freshContext: true, note: 'Continue the saved implementation.' });
+    const job = store.getJob(id);
+    assert.equal(job.sessionId, 'research-1'); assert.equal(job.executionSessionId, 'research-2');
+    assert.deepEqual(job.sessionIds, ['research-1', 'research-2']);
+    assert.equal(job.workdir, workdir);
+    assert.equal(store.budgetSummary(id).job.confirmedTokens, 1010);
+    assert.equal(await readFile(join(workdir, 'kept.ts'), 'utf8'), 'export const retained = true;');
+    assert.match(JSON.stringify(f.prompts.at(-1)), /Do not access the denied target/);
+    assert.match(JSON.stringify(f.prompts.at(-1)), /opencodex-entry-skill/);
+    assert.match(JSON.stringify(f.prompts.at(-1)), /No budget was reset/);
+    await setAgentStatus(f, 'research-2', 'running');
+    await endAgentTurn(f, 'research-2', 'stop');
+    await setAgentStatus(f, 'research-2', 'idle');
+    assert.equal(store.getJob(id).status, 'paused', 'Idle reconciliation follows the current execution session');
   } finally { await f.close(); }
 });
 
@@ -460,6 +497,9 @@ test('registered evidence and specifications reset research progress; building h
     for (let i = 0; i < 6; i++) await provider.request();
     assert.equal(provider.dispatches(), 18);
     assert.equal((await f.call({ action: 'snapshot' })).state.jobs[0]!.status, 'building');
+    const workdir = (await f.call({ action: 'snapshot' })).state.jobs[0]!.workdir!;
+    await writeFile(join(workdir, 'feature.tgz'), fixtureTarball());
+    await execute({ action: 'artifact', payload: { path: 'feature.tgz' } });
     const args = { action: 'stage', payload: { status: 'verifying', reason: 'Package handed off for independent acceptance' } };
     const result = await f.ctx.waterfall('tools/execute', { name: 'opencodex_job', arguments: args, agent: f.agents.get('research-1'), signal: new AbortController().signal } as never, async () => ({ content: [], isError: false, value: await execute(args) }));
     assert.equal(result.concludesTurn, true);
@@ -588,7 +628,13 @@ test('agent status and transitions stay compact while the UI retains complete de
     const completed = await execute({ action: 'foreground_done', payload: { requestId: foreground.id } });
     assert.equal(completed.id, id); assert.equal(completed.foreground.id, foreground.id);
     assert.ok(completed.foreground.completedAt); assert.equal(completed.history, undefined);
+    const evidence = await execute({ action: 'evidence', payload: { kind: 'observed', claim: 'Synthetic interface', sourceUrl: 'https://example.test/interface' } });
+    await execute({ action: 'spec', payload: { title: 'Fixture', behavior: ['Fixture'], visual: ['Fixture'], lifecycle: ['Fixture'], existingCapabilities: [], gaps: [], evidenceIds: [evidence.id] } });
     for (const stage of ['specifying', 'building', 'verifying']) {
+      if (stage === 'verifying') {
+        await writeFile(join(status.job.workdir, 'feature.tgz'), fixtureTarball());
+        await execute({ action: 'artifact', payload: { path: 'feature.tgz' } });
+      }
       const ack = await execute({ action: 'stage', payload: { status: stage, reason: 'Advance bounded fixture' } });
       assert.equal(ack.id, id); assert.equal(ack.status, stage); assert.equal(ack.mode, 'reconstruct');
       assert.equal(ack.description, undefined); assert.equal(ack.history, undefined);

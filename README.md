@@ -2,7 +2,7 @@
 
 在自己的 DSH 中发现、研究 Codex 功能，生成可审阅的 DSH 插件。
 
-OpenCodex 是独立第三方项目，与 OpenAI 无隶属关系。当前为 **0.1 预览版**：提供真实 DSH 研究会话、预算账本、资料库和验收流程；不承诺任意 Codex 功能都能自动复刻。目标应用的访问权限、DSH 扩展点和真实验收结果决定可完成的范围。
+OpenCodex 是独立第三方项目，与 OpenAI 无隶属关系。当前为 **0.2 预览版**：提供真实 DSH 研究会话、预算账本、资料库和验收流程；不承诺任意 Codex 功能都能自动复刻。目标应用的访问权限、DSH 扩展点和真实验收结果决定可完成的范围。
 
 ## 使用路径
 
@@ -43,10 +43,10 @@ export DSH_HOME="$HOME/.dsh-opencodex"
 dsh --profile opencodex --from-default-profile web --dump-config
 ```
 
-从 [GitHub Releases](https://github.com/ZiyaZhang/opencodex/releases) 下载预构建的 `dsh-opencodex-0.1.4.tgz`，再安装：
+从 [GitHub Releases](https://github.com/ZiyaZhang/opencodex/releases) 下载预构建的 `dsh-opencodex-0.2.0.tgz`，再安装：
 
 ```sh
-dsh plugin --profile opencodex add /absolute/path/dsh-opencodex-0.1.4.tgz
+dsh plugin --profile opencodex add /absolute/path/dsh-opencodex-0.2.0.tgz
 dsh --profile opencodex
 ```
 
@@ -68,19 +68,19 @@ npm pack
 
 OpenCodex 使用 **DSH 已安装的 CUA / 浏览器工具**。它不调用运行开发过程的 Codex 助手内置 CUA，也不会借助另一通道绕过目标访问拒绝。
 
-REA 是可选研究依赖。参阅 [REA](https://github.com/morluto/rea) 当前的 DSH adapter 安装说明；在**准备使用的 DSH_HOME** 下配置，避免改动其他 profile。研究以实际 tools/schema 为准，不把新文档中的工具当成已安装能力。首版的 REA 资料参考 `rea-agents@6.4.0`，不自动安装或接管其进程。
+REA 是可选研究依赖。参阅 [REA](https://github.com/morluto/rea) 当前的 DSH adapter 安装说明；在**准备使用的 DSH_HOME** 下配置，避免改动其他 profile。研究以实际 tools/schema 为准，不把新文档中的工具当成已安装能力。本轮方法复核固定在 REA commit `4692bb3`；公开包为 `rea-agents@6.5.0`。没有把其 conformance fixture 当成通用 UI 验收器，也不自动安装或接管 REA 进程。具体版本与范围见 [REA 复核](docs/chain-review-2026-10-15.md)。
 
 工具存在仅说明可以尝试，不代表有权访问任意目标。无法访问的原生 Codex UI、不可读资源和不可见云端实现会记为缺口。
 
 ## 预算、恢复与验收
 
-账本覆盖本插件追踪的 DSH 模型调用，按尝试记录输入（含缓存）和输出。调用前预留，结束后以 provider usage 结算；未知用量继续占用预留，重启不清零。每日额度按 UTC 结算。用量估算故意保守，因此可能提前暂停；在途请求也可能超出估算，**不是逐 token 的账单硬上限**。
+账本覆盖本插件追踪的 DSH 模型调用，按尝试记录输入（含缓存）和输出。调用前预留，结束后以 provider usage 结算；同一模型路线可复用上次真实输入用量，加 25% 余量，并对变化内容按 UTF-8 字节保守计数。没有有效校准或切换模型时退回完整字节预留；未知用量继续占用预留，重启不清零。每日额度按 UTC 结算。用量估算故意保守，因此可能提前暂停；在途请求也可能超出估算，**不是逐 token 的账单硬上限**。
 
 默认每项 120,000 tokens、每日 300,000 tokens 是保守的短调查起始额度，不是完整复刻的成本承诺。先查看证据和规格，再按剩余工作续额。调查连续四次模型尝试没有登记新证据或规格会自动暂停；失败重试也计入，避免持续查阅却没有进展。
 
 单次输出上限与任务总预算分开。OpenCodex Host 的 `maxOutputTokens` 默认 4,096，可在 DSH 插件配置中设置为 256–32,768；有效值还受 DSH 模型配置限制。模型达到单次上限或提前结束而未交付时，任务暂停并保留进度；不会自动反复调用。修改上限不会自动提高已有会话固化的输出设置，需要同时核对 DSH 会话配置。
 
-恢复时保留已有证据、代码和消耗；已有有效规格的任务可恢复编写规格或开发阶段，不必重新调查。当前不会自动恢复验收阶段或启动修复。生成任务内置可构建的通用插件骨架，包含包结构、浏览器加载器和空 Slot 示例；它帮助开始实现，不代表具体功能已经完成。
+恢复时保留已有证据、代码和消耗。上下文过长时可以勾选「使用新会话继续」：原会话保留，新会话接续同一个任务及账本，不重置预算或先前访问限制；已有有效规格的任务可恢复编写规格或开发阶段，不必重新调查。已有规格和同一产物的验收任务可直接继续验收，不重新调用模型调查；真实验收失败才进入受预算和轮数约束的修复，缺少环境能力则阻塞。生成任务内置可构建的通用插件骨架，包含包结构、浏览器加载器和空 Slot 示例；它帮助开始实现，不代表具体功能已经完成。
 
 研究要求 DSH workspace-write 沙箱。外部模型进程和 API 不属于允许的研究路径；DSH 文件沙箱并不封闭全部网络，所以本插件的账本也不是账号级计费防火墙。必要时另设模型服务商额度。
 
@@ -88,7 +88,7 @@ REA 是可选研究依赖。参阅 [REA](https://github.com/morluto/rea) 当前�
 
 已由用户确认的后台浏览器工具可通过 `backgroundToolNames` 配置精确工具名；其余识别到的桌面/浏览器控制会要求前台批准。同一时刻只有一个任务持有前台许可，暂停、取消和重启会撤销许可。
 
-证据区分已观察、推断、未知。包结构检查不执行生成代码，不等同功能通过。模型可提交测试报告；用户依据真实隔离结果分别确认行为、视觉与生命周期。视觉通过还要求已登记的 Codex 参考图与 DSH 结果图；文件有效不代表画面等价。只有当前产物、证据摘要及三个维度的验收都符合要求，才完成验收，并立即调用 DSH 的公开 `pluginManager.installBundle` 接口安装和启用；无需再确认安装。生成了 tarball 但尚未验收的任务会保留实验包，不冒充可用成果。
+证据区分已观察、推断、未知。Host 在独立 DSH_HOME 内运行真实安装、禁用、再启用、重启和卸载检查；这不等同功能通过。行为、视觉和功能状态恢复由独立的 `opencodexFeatureVerifier` 适配器逐项验收，也可由用户登记实际隔离结果。**当前未内置通用 CUA 功能验收器**；未配置适配器且缺少人工验收时，任务停在具体缺口，不自动安装。模型提交的自测报告不能替代独立验收。视觉通过还要求已登记的 Codex 参考图与 DSH 结果图；文件有效不代表画面等价。只有当前产物、证据摘要及三个维度的验收都符合要求，才完成验收，并立即调用 DSH 的公开 `pluginManager.installBundle` 接口安装和启用；无需再确认安装。生成了 tarball 但尚未验收的任务会保留实验包，不冒充可用成果。
 
 任务列表显示真实参考缩略图和产物状态。已登记的包在详情提供「下载实验包」；三项验收通过后会自动安装，并保留「下载插件包」供备份。下载按分片传输并验证完整 SHA-256；自动安装由 Host 独立执行，关闭页面也不取消安装。人工补交的包单独记录协助说明，保留原暂停状态和预算；不会因有文件就变成验收通过。
 
@@ -120,7 +120,8 @@ npm run build
 
 - [架构与边界](docs/architecture.md)
 - [验收标准](docs/validation.md)
-- [本次实测与失败记录](docs/validation-2026-10-14.md)
+- [本轮链路复核与真实运行](docs/chain-review-2026-10-15.md)
+- [早期实测与失败记录](docs/validation-2026-10-14.md)
 - [REA 对照与调用效率改进](docs/rea-learning.md)
 - [研究入口 skill](skills/opencodex/SKILL.md)
 - [公共来源索引](resources/sources.json)

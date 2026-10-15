@@ -24,7 +24,7 @@ export type OpenCodexRequest =
   | { action: 'addScreenshot'; jobId: string; image: ReferenceImageInput; metadata: ScreenshotMetadata }
   | { action: 'readPluginArtifact'; jobId: string; artifactId: string; offset?: number }
   | { action: 'settings'; patch: Partial<Settings> }
-  | { action: 'start'; jobId: string; note?: string }
+  | { action: 'start'; jobId: string; note?: string; freshContext?: boolean }
   | { action: 'pause' | 'cancel' | 'validateArtifact' | 'installPlugin'; jobId: string }
   | { action: 'extendBudget'; jobId: string; patch: Partial<JobBudget> }
   | { action: 'approveForeground'; jobId: string; requestId: string }

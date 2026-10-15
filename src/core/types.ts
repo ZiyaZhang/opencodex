@@ -28,15 +28,21 @@ export interface PluginInstallation {
   application?: 'applied' | 'restart-required' | 'overridden' | 'failed' | 'cancelled';
   error?: string; logPath?: string; warnings?: string[];
 }
+export interface AcceptanceRun {
+  id: string; specId: string; artifactId: string; artifactSha256: string;
+  status: 'running' | 'passed' | 'blocked' | 'failed' | 'interrupted';
+  startedAt: string; completedAt?: string; reportPath?: string; details?: string;
+}
 export interface Job {
   id: string; title: string; description: string; source: 'user' | 'discovery'; candidateId?: string;
   mode: 'reconstruct' | 'investigate';
   status: JobStatus; createdAt: string; updatedAt: string; budget: JobBudget;
   elapsedMs: number; activeSince: string | null; repairRounds: number;
   history: StateEvent[]; budgetHistory: Array<{ at: string; previous: JobBudget; next: JobBudget }>;
-  sessionId?: string; sessionIds: string[]; sessionBindings: SessionBinding[]; workdir?: string;
+  sessionId?: string; executionSessionId?: string; sessionIds: string[]; sessionBindings: SessionBinding[]; workdir?: string;
   foreground?: ForegroundRequest; artifactId?: string; installedReceipt?: string;
   installation?: PluginInstallation;
+  acceptance?: AcceptanceRun;
   coverage?: { specId: string; confirmedAt: string; reason: string };
 }
 export interface Candidate {
@@ -46,6 +52,7 @@ export interface Candidate {
   sourceType?: 'public-source' | 'local-version';
   /** Captured at first detection; changing settings later does not opt in old candidates. */
   autoInvestigate?: boolean;
+  sourceSnapshot?: { path: string; sha256: string; bytes: number; fetchedAt: string };
 }
 export interface Evidence {
   id: string; jobId: string; kind: EvidenceKind; claim: string; createdAt: string;
@@ -100,7 +107,7 @@ export interface CreateJobInput {
   mode?: Job['mode'];
   budget?: Partial<JobBudget>;
 }
-export type CandidateInput = Pick<Candidate, 'title' | 'description' | 'sourceUrl' | 'fingerprint'> & Partial<Pick<Candidate, 'version' | 'status' | 'sourceType' | 'publishedAt' | 'releaseTitle'>>;
+export type CandidateInput = Pick<Candidate, 'title' | 'description' | 'sourceUrl' | 'fingerprint'> & Partial<Pick<Candidate, 'version' | 'status' | 'sourceType' | 'publishedAt' | 'releaseTitle' | 'sourceSnapshot'>>;
 export type EvidenceInput = Pick<Evidence, 'kind' | 'claim'> & Partial<Pick<Evidence, 'sourceUrl' | 'localPath' | 'relatedEvidenceIds'>>;
 export type SpecInput = Omit<FeatureSpec, 'id' | 'jobId' | 'createdAt'>;
 export type VerificationInput = Omit<Verification, 'id' | 'jobId' | 'specId' | 'createdAt' | 'artifactSha256'>;
