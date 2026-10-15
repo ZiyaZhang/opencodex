@@ -196,13 +196,26 @@ test('startWork reads lists and quotes laid out unusually the way the page does'
   });
 });
 
-test('startWork leaves a report with a textarea as written, since the page shows the text in one', async () => {
+test('startWork leaves a report as written when its raw HTML holds a <!-- the browser reads as no comment', async () => {
   await withData(async dirs => {
-    const report = '前文 <!-- 页面藏起来的注释 --> 留下\n\n<textarea>\n<!-- 文本框里的字，页面照样显示 -->\n</textarea>\n';
-    await writeFile(join(dirs.directory, 'reports', ID, 'report.md'), report);
-    const { host, seen } = fakeHost();
-    await startWork(host, inputFor(dirs));
-    assert.equal(reportIn(textOf(seen.prompt)).body, report);
+    // Each report also holds a comment the page hides; it stays too, since the rest of the raw HTML is read in a way not followed here.
+    const cases = [
+      // In an attribute, past a `>` in the quoted value: the page shows both the text in the element and the text after it.
+      '<div title="a>b <!--">属性后的字</div> 标签后的字 -->',
+      // In a declaration, which the browser ends at its first `>`: the text after it shows.
+      '<?x <!-- 声明里的字 ?> 声明后的字 -->',
+      // In a textarea, whose text the page shows as it is.
+      '<textarea>\n<!-- 文本框里的字 -->\n</textarea>',
+      // In a style element, whose text ends at `</style>`: the text after it shows.
+      '<style><!-- </style> 样式后的字 -->',
+    ];
+    for (const html of cases) {
+      const report = `前文 <!-- 页面藏起来的注释 --> 留下\n\n${html}\n`;
+      await writeFile(join(dirs.directory, 'reports', ID, 'report.md'), report);
+      const { host, seen } = fakeHost();
+      await startWork(host, inputFor(dirs));
+      assert.equal(reportIn(textOf(seen.prompt)).body, report, html);
+    }
   });
 });
 

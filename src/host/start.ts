@@ -26,12 +26,54 @@ const COMMENT_START = /<!--(?:-?>)?/g;
 const TAGGED = /<!--ocm(\d+)q/g;
 /** Where the browser ends a comment: at the first `-->` or `--!>`. */
 const COMMENT_END = /--!?>/g;
-/** An element whose text the browser shows as it is, `<!--` included, and that the page's sanitizer removes with its text kept. */
-const TEXT_ELEMENT = /<textarea\b/i;
+/**
+ * Elements whose text the browser does not read as markup, so a `<!--` in one opens no comment: `<textarea>`, whose text the page shows
+ * (the sanitizer drops the element and keeps its text), and the ones whose text never shows.
+ */
+const TEXT_ELEMENT = /<(?:textarea|title|style|script|xmp|iframe|noembed|noframes|noscript|plaintext)\b/i;
 
 const oneLine = (text: string) => text.replace(/\s+/g, ' ').trim();
 const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const isMissing = (error: unknown) => ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException | undefined)?.code ?? '');
+/** Where the browser ends a comment whose text starts at `from`: just past the first `-->` or `--!>`, or -1 when none follows. */
+function commentEnd(text: string, from: number): number {
+  COMMENT_END.lastIndex = from;
+  const close = COMMENT_END.exec(text);
+  return close ? close.index + close[0].length : -1;
+}
+
+/**
+ * Whether the browser reads every `<!--` in a piece of raw HTML as a comment opener: none sits inside a tag (`<div title="<!--">`) or a
+ * `<?…>` or `<!…>` declaration, and no tag or declaration is still open where the piece ends, for the HTML after it to go on with. A
+ * comment runs to its first `-->` or `--!>` (an open one to the end), a tag to its `>` past quoted attribute values, a declaration to its
+ * first `>`.
+ */
+function opensOnlyComments(raw: string): boolean {
+  for (let i = raw.indexOf('<'); i >= 0; i = raw.indexOf('<', i)) {
+    if (raw.startsWith('<!--', i)) {
+      const end = commentEnd(raw, i + 4);
+      if (end < 0) return true;
+      i = end;
+      continue;
+    }
+    const tag = /^<\/?[A-Za-z]/.test(raw.slice(i, i + 3));
+    if (!tag && !/^<[!?]/.test(raw.slice(i, i + 2))) { i++; continue; }
+    let j = i + 1;
+    for (; j < raw.length && raw[j] !== '>'; j++) {
+      if (raw.startsWith('<!--', j)) return false;
+      if (!tag || raw[j] !== '=') continue;
+      let k = j + 1;
+      while (k < raw.length && ' \t\n\f\r'.includes(raw[k]!)) k++;
+      if (raw[k] !== '"' && raw[k] !== "'") continue;
+      const close = raw.indexOf(raw[k]!, k + 1);
+      if (close < 0 || raw.slice(k, close).includes('<!--')) return false;
+      j = close;
+    }
+    if (j >= raw.length) return false;
+    i = j + 1;
+  }
+  return true;
+}
 
 /** What `startWork` needs from the Host context: three session-controller calls, typed as `ReportHost` types them. */
 export interface StartWorkHost {
@@ -66,13 +108,14 @@ export class StartWorkError extends Error {
 
 /**
  * The report without the comments the page hides, found by marked, the page's own Markdown reader. Every `<!--` gets an id right after
- * it (`<!-->` and `<!--->` become `<!--id-->`, which marked and the browser read alike), the tagged copy is split into tokens with the
- * page's options, and an id inside raw HTML (a block or inline `html` token) whose comment closes in that token is a comment the browser
- * hides. Each of those goes from the report, from its `<!--` to its first `-->` or `--!>`, where the browser ends it; nothing else is
- * removed. So a `<!--` in code or a code span, an escaped `\<!--`, one that does not close, link reference definitions and other HTML the
- * page hides (`hidden` or `style` attributes, processing instructions) all stay: the prompt frames the whole report as data, and the
- * viewer refuses those attributes. A report with a `<textarea>` in its raw HTML stays as written, since the page shows the text in one, and
- * so does a report marked cannot read, which the page shows as raw text.
+ * it (`<!-->` and `<!--->` become `<!--id-->`, which marked and the browser read alike) and the tagged copy is split into tokens with the
+ * page's options. An id in raw HTML (a block or inline `html` token) where the browser reads markup opens a comment, and when that comment
+ * closes in its token the browser hides it: it goes from the report, from its `<!--` to its first `-->` or `--!>`. Nothing else is
+ * removed. A `<!--` in code or a code span, an escaped `\<!--`, one that does not close, link reference definitions and other HTML the
+ * page hides (`hidden` or `style` attributes, processing instructions) stay, as the prompt frames the whole report as data and the viewer
+ * refuses those attributes. Where the raw HTML is read in a way not followed here, the whole report stays as written: a `<!--` inside a
+ * tag or declaration (see `opensOnlyComments`), a tag or declaration left open at the end of its token, an element whose text is not read
+ * as markup (`TEXT_ELEMENT`), and a report marked cannot read, which the page shows as raw text.
  */
 function withoutComments(report: string): string {
   const starts: Array<{ at: number; length: number }> = [];
@@ -82,30 +125,26 @@ function withoutComments(report: string): string {
   });
   if (!starts.length) return report;
   const hidden = new Set<number>();
-  let textElement = false;
+  let unfollowed = false;
   try {
     markdown.walkTokens(markdown.lexer(tagged), token => {
       if (token.type !== 'html') return;
-      if (TEXT_ELEMENT.test(token.raw)) textElement = true;
+      if (TEXT_ELEMENT.test(token.raw) || !opensOnlyComments(token.raw)) unfollowed = true;
       for (const tag of token.raw.matchAll(TAGGED)) {
-        if (/--!?>/.test(token.raw.slice(tag.index + tag[0].length))) hidden.add(Number(tag[1]));
+        if (commentEnd(token.raw, tag.index + tag[0].length) >= 0) hidden.add(Number(tag[1]));
       }
     });
   } catch { return report; }
-  if (textElement) return report;
+  if (unfollowed) return report;
   // Ids follow the order of the report, and a `<!--` inside a comment already cut goes with it.
   let kept = '', from = 0;
-  starts.forEach(({ at, length }, id) => {
-    if (!hidden.has(id) || at < from) return;
-    let end = at + length;
-    if (length === 4) {
-      COMMENT_END.lastIndex = at + 4;
-      const close = COMMENT_END.exec(report)!;
-      end = close.index + close[0].length;
-    }
+  for (const [id, { at, length }] of starts.entries()) {
+    if (!hidden.has(id) || at < from) continue;
+    const end = length === 4 ? commentEnd(report, at + 4) : at + length;
+    if (end < 0) return report;
     kept += report.slice(from, at);
     from = end;
-  });
+  }
   return kept + report.slice(from);
 }
 
