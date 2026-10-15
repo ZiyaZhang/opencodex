@@ -27,8 +27,12 @@ export interface ChangedFile extends ChangedPath {
   error?: string;
 }
 export interface FileGroup { key: string; title: string; kind: EvidenceKind; files: ChangedFile[]; excerpt: string }
-/** What one check of this source did: the window it covered (none when there was nothing new), the candidates it created and the existing ones it added to. */
-export interface FilesCollection { window?: StableWindow; added: number; merged: number }
+/**
+ * What one check of this source did: the window it covered (none when there was nothing new), the candidates it created and the existing ones it added to.
+ * `gap` is true when the stored checkpoint could not start the window (its tag is gone, or it is no usable tag), so that the window starts at the previous minor
+ * and the releases in between were not collected.
+ */
+export interface FilesCollection { window?: StableWindow; added: number; merged: number; gap: boolean }
 
 /** The window is worked out from this many of the newest stable tags, as the release source does. */
 const RECENT_STABLE_TAGS = 12;
@@ -40,7 +44,7 @@ const CHECKPOINT = 'lastFilesTag';
 const DEFAULT_BUDGET = 60;
 const OVER_BUDGET = '超出本次读取上限';
 const RATE_LIMITED = '已达 GitHub 速率限制';
-const EXCERPT_LIMIT = 6_000, SUMMARY_LIMIT = 1_000, EVIDENCE_LIMIT = 2_000, ERROR_LIMIT = 200, LONG_LINE = 200;
+const EXCERPT_LIMIT = 6_000, SUMMARY_LIMIT = 1_000, EVIDENCE_LIMIT = 2_000, ERROR_LIMIT = 200;
 const LINE_BREAK = /\r\n|\r|\n/;
 
 type Family = 'feature-flag' | 'config' | 'doc' | 'schema';
@@ -50,7 +54,7 @@ const familyOf = (path: string): Family => FEATURE_SOURCE.test(path) ? 'feature-
 const PRIORITY: Record<Family, number> = { 'feature-flag': 0, config: 1, doc: 2, schema: 3 };
 const byPriority = (a: ChangedPath, b: ChangedPath): number =>
   PRIORITY[familyOf(a.path)] - PRIORITY[familyOf(b.path)] || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
-/** `index.ts` and `v2/index.ts` only re-export the type files. */
+/** `index.ts` and `v2/index.ts` only re-export the type files. They never reach a candidate, so they are listed in the snapshot but not read. */
 const isIndex = (path: string): boolean => familyOf(path) === 'schema' && path.split('/').at(-1) === 'index.ts';
 
 /** Paths in either tree whose blob sha differs, sorted by path. */
@@ -79,24 +83,29 @@ function newLines(before: string[], after: string[]): string[] {
 export const addedLines = (before: string, after: string): string[] => newLines(before.split(LINE_BREAK), after.split(LINE_BREAK));
 
 const CLOSER: Record<string, string> = { '}': '{', ']': '[', ')': '(', '>': '<' };
+/** Where the scan of a ts-rs file stands between two lines: the brackets still open, and whether a block comment is. */
+interface Scan { open: string[]; comment: boolean }
 /**
- * A line longer than 200 characters cut after each top-level `, ` or `; `, so that one added field is one line. Top level is directly inside a `{`: the fields of the type,
- * or of one variant of a union. Nested objects, generics, tuples and strings stay whole.
+ * A line cut after each top-level `, ` or `; `, so that one field is one line whatever the length of the line it sits on: a type that grows from 185 to 210 characters
+ * must not turn all its fields into new lines. Top level is directly inside the braces of the type, or of one variant of a union, with no other bracket open.
+ * ts-rs breaks a type at its doc comments, and the field lines after a comment have no `{` of their own, so `scan` keeps the open brackets from line to line.
+ * Nested objects, generics, tuples, strings and comments stay whole.
  */
-function splitFields(line: string): string[] {
-  if (line.length <= LONG_LINE) return [line];
+function splitFields(line: string, scan: Scan): string[] {
   const pieces: string[] = [];
-  const open: string[] = [];
   let start = 0, inString = false;
   for (let i = 0; i < line.length; i++) {
     const ch = line[i]!;
-    if (inString) {
+    if (scan.comment) {
+      if (ch === '*' && line[i + 1] === '/') { scan.comment = false; i++; }
+    } else if (inString) {
       if (ch === '\\') i++;
       else if (ch === '"') inString = false;
-    } else if (ch === '"') inString = true;
-    else if ('{[(<'.includes(ch)) open.push(ch);
-    else if (CLOSER[ch] !== undefined) { if (open.at(-1) === CLOSER[ch]) open.pop(); }
-    else if ((ch === ',' || ch === ';') && line[i + 1] === ' ' && open.length === 1 && open[0] === '{') {
+    } else if (ch === '/' && line[i + 1] === '*') { scan.comment = true; i++; }
+    else if (ch === '"') inString = true;
+    else if ('{[(<'.includes(ch)) scan.open.push(ch);
+    else if (CLOSER[ch] !== undefined) { if (scan.open.at(-1) === CLOSER[ch]) scan.open.pop(); }
+    else if ((ch === ',' || ch === ';') && line[i + 1] === ' ' && scan.open.length === 1 && scan.open[0] === '{') {
       pieces.push(line.slice(start, i + 1));
       start = i + 2;
     }
@@ -106,15 +115,16 @@ function splitFields(line: string): string[] {
 }
 /**
  * The lines compared for a ts-rs generated file: without the leading `//` header and the `import type` lines, which change when the generator or an unrelated type does,
- * and with a long type line cut into its fields. Blank lines are dropped.
+ * and with every line cut into its fields. Blank lines are dropped.
  */
 export function schemaLines(text: string): string[] {
   const lines: string[] = [];
+  const scan: Scan = { open: [], comment: false };
   let header = true;
   for (const line of text.split(LINE_BREAK)) {
     if (header && (!line.trim() || line.startsWith('//'))) continue;
     header = false;
-    if (line.trim() && !/^import type .*;\s*$/.test(line)) lines.push(...splitFields(line).filter(piece => piece.trim()));
+    if (line.trim() && !/^import type .*;\s*$/.test(line)) lines.push(...splitFields(line, scan).filter(piece => piece.trim()));
   }
   return lines;
 }
@@ -169,7 +179,7 @@ function nameOf(path: string): string {
  * - A file that could not be read (over 1 MB, a failed request, the rate limit, past the budget) shows as `（内容未读取：<reason>）`. The marker is a line of its excerpt, in the
  *   evidence and in the summary, so that the candidate is not an empty shell. Such a file still makes a candidate: "not read" is not "nothing new", and the change would be
  *   lost for good, because a window is collected once.
- * - A modified file that gained no line (a reordering, blank lines, only removed lines, a generator header) has nothing to report and is left out.
+ * - A file that gained no line has nothing to report and is left out: a modified one (a reordering, blank lines, only removed lines, a generator header) and a new one without a non-blank line.
  */
 const DELETED = '（文件已删除）';
 const unread = (reason: string): string => `（内容未读取：${cutText(reason.replace(/\s+/g, ' ').trim(), ERROR_LIMIT)}）`;
@@ -179,7 +189,7 @@ function linesOf(file: ChangedFile): string[] {
   if (file.error) return [unread(file.error)];
   return file.status === 'removed' ? [DELETED] : [];
 }
-const hasNews = (file: ChangedFile): boolean => file.status !== 'modified' || file.added.length > 0 || file.error !== undefined;
+const hasNews = (file: ChangedFile): boolean => file.status === 'removed' || file.added.length > 0 || file.error !== undefined;
 
 function groupOf(path: string): Pick<FileGroup, 'key' | 'kind'> {
   const family = familyOf(path);
@@ -280,17 +290,55 @@ async function readChange(github: Pick<GitHubClient, 'fileAt'>, window: StableWi
   }
 }
 
+const STABLE_TAG = /^rust-v(\d+)\.(\d+)\.(\d+)$/;
+/** True when stable tag `a` is an older release than `b`. */
+function isOlder(a: string, b: string): boolean {
+  const x = STABLE_TAG.exec(a)?.slice(1).map(Number), y = STABLE_TAG.exec(b)?.slice(1).map(Number);
+  return x !== undefined && y !== undefined && (x[0]! - y[0]! || x[1]! - y[1]! || x[2]! - y[2]!) < 0;
+}
+
 /**
- * Finds the window of stable releases this source has not covered yet (from `lastFilesTag`, the 12 newest stable tags), and stores one `codex-files` candidate per group of watched files
- * that changed in it: the feature-flag sources, all protocol types together, and each doc on its own. `added` counts the candidates created, `merged` the existing ones added to.
+ * The window to collect and the watched blobs at its two ends. Normally that is `stableWindow` of the newest tags and the checkpoint. A checkpoint that fell out of the newest
+ * tags (a long absence) still starts the window: it is a stable tag, and two trees cover any range. Only when the tree of that tag cannot be fetched (404) is the window the previous
+ * minor's instead; a checkpoint that cannot be a start at all (no stable tag, or not older than the newest one) is ignored in the same way. Both are a `gap`.
+ */
+async function planWindow(github: Pick<GitHubClient, 'stableTags' | 'treePaths'>, checkpoint: string | undefined, signal?: AbortSignal): Promise<{ window?: StableWindow; before: Map<string, string>; after: Map<string, string>; gap: boolean }> {
+  const tags = await github.stableTags(RECENT_STABLE_TAGS, signal);
+  const trees = async (window: StableWindow, gap: boolean) => {
+    const [before, after] = await Promise.all([github.treePaths(window.from, WATCHED, signal), github.treePaths(window.to, WATCHED, signal)]);
+    return { window, before, after, gap };
+  };
+  const none = (gap: boolean) => ({ before: new Map<string, string>(), after: new Map<string, string>(), gap });
+  const newest = tags[0];
+  if (newest === undefined || checkpoint === undefined || tags.includes(checkpoint)) { // the usual case: no checkpoint yet, or one among the newest tags
+    const window = stableWindow(tags, checkpoint);
+    return window ? trees(window, false) : none(false);
+  }
+  if (STABLE_TAG.test(checkpoint) && isOlder(checkpoint, newest)) {
+    const window: StableWindow = { from: checkpoint, to: newest, releases: [...tags] };
+    const [from, to] = await Promise.allSettled([github.treePaths(window.from, WATCHED, signal), github.treePaths(window.to, WATCHED, signal)]);
+    if (to.status === 'rejected') throw to.reason;
+    if (from.status === 'fulfilled') return { window, before: from.value, after: to.value, gap: false };
+    if (!(from.reason instanceof GitHubError && from.reason.status === 404)) throw from.reason;
+    const previous = stableWindow(tags); // the stored tag is gone
+    return previous ? { window: previous, before: await github.treePaths(previous.from, WATCHED, signal), after: to.value, gap: true } : none(true);
+  }
+  const window = stableWindow(tags);
+  return window ? trees(window, true) : none(true);
+}
+
+/**
+ * Finds the window of stable releases this source has not covered yet (from `lastFilesTag`; see `planWindow`), and stores one `codex-files` candidate per group of watched files
+ * that changed in it: the feature-flag sources, all protocol types together, and each doc on its own. `added` counts the candidates created, `merged` the existing ones added to,
+ * `gap` says whether the window had to start at the previous minor because the stored tag could not start it.
  * The checkpoint moves only after the snapshot and every candidate are stored: a failed tag or tree request, or a failed store, throws and the next check retries the window
  * (a candidate the earlier attempt already stored is recognised by its `toTag` and left alone). A file that cannot be read is recorded and does not hold the checkpoint back.
  * The candidate is keyed by the minor version, so a patch release adds to the candidate of its minor while that is still `new`: its evidence is kept (matched by `ref`, the lines of a
  * file found by both windows are merged), `window.fromTag` stays at the first window's, and the summary is rebuilt from all of it. Once the user has moved the candidate on, the
  * findings go to a candidate of the full version instead.
- * At most `options.budget` files are read (default 60), flags first, then `codex-rs/config.md`, docs and protocol types (alphabetical within each); a removed file is not read and takes
- * no slot; the rest are recorded unread, and so are all that follow a rate limit. The result is also saved as `<snapshotDir>/codex-files/<from>__<to>.json`, which keeps the added lines
- * of every changed file, candidate or not.
+ * At most `options.budget` files are read (default 60), flags first, then `codex-rs/config.md`, docs and protocol types (alphabetical within each). A removed file and an `index.ts`
+ * are not read and take no slot; both are listed in the snapshot with no added lines. The rest are recorded unread, and so are all that follow a rate limit.
+ * The result is also saved as `<snapshotDir>/codex-files/<from>__<to>.json`, which keeps the added lines of every changed file, candidate or not.
  */
 export async function collectFileChanges(
   store: CandidateStore, github: Pick<GitHubClient, 'stableTags' | 'treePaths' | 'fileAt'>, snapshotDir: string, signal?: AbortSignal, options: { budget?: number } = {},
@@ -298,15 +346,14 @@ export async function collectFileChanges(
   const budget = options.budget ?? DEFAULT_BUDGET;
   check(Number.isInteger(budget) && budget >= 0, `budget must be a non-negative integer, got ${budget}`);
   signal?.throwIfAborted();
-  const window = stableWindow(await github.stableTags(RECENT_STABLE_TAGS, signal), await store.checkpoint(CHECKPOINT));
-  if (!window) return { added: 0, merged: 0 };
-  const [before, after] = await Promise.all([github.treePaths(window.from, WATCHED, signal), github.treePaths(window.to, WATCHED, signal)]);
+  const { window, before, after, gap } = await planWindow(github, await store.checkpoint(CHECKPOINT), signal);
+  if (!window) return { added: 0, merged: 0, gap };
   const changes = changedWatched(before, after);
   const loaded = new Map<string, ChangedFile>();
   let slots = budget, limited = false;
   for (const change of [...changes].sort(byPriority)) {
     signal?.throwIfAborted();
-    if (change.status === 'removed') loaded.set(change.path, { ...change, added: [] });
+    if (change.status === 'removed' || isIndex(change.path)) loaded.set(change.path, { ...change, added: [] }); // nothing to read, or nothing that reaches a candidate
     else if (slots === 0) loaded.set(change.path, { ...change, added: [], error: OVER_BUDGET });
     else {
       slots--;
@@ -339,5 +386,5 @@ export async function collectFileChanges(
     else merged++; // the window's end differs from the one it had, so an existing candidate always changes
   }
   await store.setCheckpoint(CHECKPOINT, window.to);
-  return { window, added, merged };
+  return { window, added, merged, gap };
 }
