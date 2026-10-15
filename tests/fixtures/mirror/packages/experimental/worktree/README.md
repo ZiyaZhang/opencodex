@@ -1,5 +1,5 @@
 ---
-description: "Create and enter a retained Git checkout."
+description: "Create and enter a retained Git worktree under the calling Session file policy."
 kind: "package-reference"
 ---
 

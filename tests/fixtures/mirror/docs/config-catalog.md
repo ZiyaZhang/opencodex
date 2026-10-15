@@ -31,3 +31,14 @@ export interface WorktreeConfig { directory?: string }
 export interface AgentLoopConfig { maxSteps?: number }
 ```
 <!-- END GENERATED config-catalog:@deepseek-ai/dsh-agent-loop -->
+
+## Library packages (no plugin entry)
+
+Imported as libraries by other packages; a `cordis.yml` cannot load them.
+
+<!-- BEGIN GENERATED config-catalog:library -->
+| `package` | `inject` | `source` |
+| --- | --- | --- |
+| `@deepseek-ai/dsh-experimental-worktree` | — | [`packages/experimental/worktree/src/index.ts`](../packages/experimental/worktree/src/index.ts) |
+| `@deepseek-ai/dsh-util-widget` | — | [`packages/util/widget/src/index.ts`](../packages/util/widget/src/index.ts) |
+<!-- END GENERATED config-catalog:library -->
