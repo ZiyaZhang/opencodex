@@ -37,7 +37,8 @@ test('dated product releases become separate actionable features with source dat
   assert.equal(items[0]?.releaseTitle, 'Codex desktop app 26.1011');
   assert.equal(items[0]?.sourceUrl, `${url}#desktop-release`);
   assert.equal(items[2]?.sourceUrl, `${url}#preview-attachments`);
-  assert.ok(items.every(item => item.description.includes('尚未在本机验证')));
+  assert.equal(items[0]?.description, 'Draft recovery: Restore an interrupted composer draft without sending it.');
+  assert.ok(items.every(item => !/来源范围|尚未在本机验证/.test(item.description)));
 });
 
 test('HTML parser preserves real release IDs and ignores scripts/navigation instead of promoting page chrome', () => {
@@ -95,6 +96,6 @@ test('runtime capabilities in CLI and performance notes remain candidates withou
   const source = `2026-10-12\n# Codex CLI 1.2\n### Performance\n- Async compaction: prepare a history summary in the background.\n- Fixed compaction crash.\n- Reduced startup latency.\n### Features\n- Added a shell completion shortcut.\n2026-10-11\n# Codex desktop app 26.1011\n### Performance\n- Background compaction: preserve foreground work.\n- Faster startup.\n`;
   const items = parseChangelog(source, url, { now });
   assert.deepEqual(items.map(item => item.title), ['Async compaction', 'Background compaction']);
-  assert.match(items[0]!.description, /桌面可用性未确认/);
-  assert.match(items[1]!.description, /桌面应用/);
+  assert.equal(items[0]!.description, 'Async compaction: prepare a history summary in the background.');
+  assert.equal(items[1]!.description, 'Background compaction: preserve foreground work.');
 });

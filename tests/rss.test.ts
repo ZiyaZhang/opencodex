@@ -1,0 +1,118 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { CandidateStore } from '../src/core/store.ts';
+import { RSS_URL, collectRss, rssCandidates } from '../src/host/sources/rss.ts';
+
+const PAGE = 'https://developers.openai.com/codex/changelog';
+// The fixture's items are dated Aug-Oct 2026; every call pins the clock so the 120-day window never drifts.
+const NOW = new Date('2026-10-15T00:00:00Z');
+const readFixture = () => readFile(new URL('./fixtures/changelog-rss-sample.xml', import.meta.url), 'utf8');
+
+interface FetchCall { url: string; init: RequestInit | undefined }
+function feed(body: string, calls: FetchCall[] = []): typeof fetch {
+  return async (input: string | URL | Request, init?: RequestInit) => { calls.push({ url: String(input), init }); return new Response(body, { status: 200 }); };
+}
+/** A store whose clock advances one second per read, so any write shows up as a changed `updatedAt`. */
+async function withStore(run: (store: CandidateStore) => Promise<void>): Promise<void> {
+  const dir = await mkdtemp(join(tmpdir(), 'oc-rss-'));
+  try {
+    let seconds = 0;
+    await run(new CandidateStore(dir, () => new Date(Date.UTC(2026, 9, 15, 0, 0, seconds++))));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+}
+
+test('rss keeps product announcements, drops model notices and iOS, lets only runtime bullets through from CLI releases, strips the v1 scope suffix', async () => {
+  const xml = await readFixture();
+  const items = rssCandidates(xml, PAGE, NOW);
+  assert.ok(items.some(i => /Appshots/.test(i.releaseTitle)));
+  assert.ok(items.some(i => /Browser extensions/.test(i.releaseTitle)));
+  assert.ok(!items.some(i => /GPT-5\.5 retirement|GPT-6\.1 Sol Ultrafast|ChatGPT for iOS/.test(i.releaseTitle)));
+  assert.ok(items.every(i => !/来源范围|尚未在本机验证/.test(i.description)));
+  assert.ok(items.every(i => i.sourceUrl.startsWith('https://')));
+  // CLI features belong to the GitHub source: 0.162.1 and 0.161.0 are dropped whole, 0.162.0 keeps only its compaction bullet.
+  const cli = items.filter(i => /^Codex CLI Release:/.test(i.releaseTitle));
+  assert.deepEqual(cli.map(i => i.releaseTitle), ['Codex CLI Release: 0.162.0']);
+  assert.match(cli[0]!.title, /remote compaction/);
+  // Nothing is appended to the source text.
+  const appshots = items.find(i => i.title === 'Share an app window on Windows');
+  assert.ok(appshots?.description.endsWith('choose which chat receives it in settings.'));
+});
+
+test('collectRss stores announcements once, skips an unchanged feed by hash, and only adds new items when the feed changes', async () => {
+  const xml = await readFixture();
+  await withStore(async store => {
+    const signal = new AbortController().signal;
+    const calls: FetchCall[] = [];
+    const first = await collectRss(store, signal, feed(xml, calls), NOW);
+    const stored = await store.list({ source: 'rss' });
+    assert.ok(first > 0);
+    assert.equal(first, rssCandidates(xml, PAGE, NOW).length);
+    assert.equal(stored.length, first);
+    assert.match(await store.checkpoint('rssHash') ?? '', /^[0-9a-f]{64}$/);
+    assert.equal(calls[0]?.url, RSS_URL);
+    assert.equal(calls[0]?.init?.signal, signal);
+    assert.match(new Headers(calls[0]?.init?.headers).get('accept') ?? '', /rss\+xml/);
+    assert.match(new Headers(calls[0]?.init?.headers).get('user-agent') ?? '', /^dsh-opencodex\//);
+    for (const candidate of stored) {
+      assert.equal(candidate.status, 'new');
+      assert.equal(candidate.evidence.length, 1);
+      assert.equal(candidate.evidence[0]?.kind, 'rss');
+      assert.ok(candidate.evidence[0]?.url?.startsWith('https://'));
+      assert.ok(!candidate.summary.includes('来源范围'));
+    }
+
+    // The same body again: fetched, recognised by its hash, nothing written.
+    assert.equal(await collectRss(store, signal, feed(xml, calls), NOW), 0);
+    assert.equal(calls.length, 2);
+    assert.deepEqual(await store.list({ source: 'rss' }), stored);
+
+    // A changed body is processed again; only the unseen item is new.
+    const extra = '<item><title>Codex app themes</title><link>https://developers.openai.com/codex/changelog/#codex-2026-10-12-app</link><guid>https://developers.openai.com/codex/changelog/#codex-2026-10-12-app</guid><description>Codex app themes</description><pubDate>Mon, 12 Oct 2026 00:00:00 GMT</pubDate><content:encoded># Codex app themes\n\nPick a theme for the Codex desktop app in **Settings**.</content:encoded></item>';
+    const changed = xml.replace('<item>', `${extra}<item>`);
+    const hash = await store.checkpoint('rssHash');
+    assert.equal(await collectRss(store, signal, feed(changed), NOW), 1);
+    assert.equal((await store.list({ source: 'rss' })).length, first + 1);
+    assert.notEqual(await store.checkpoint('rssHash'), hash);
+    assert.equal(await collectRss(store, signal, feed(changed), NOW), 0);
+  });
+});
+
+test('collectRss rejects a non-2xx response and leaves no candidates or checkpoint behind', async () => {
+  await withStore(async store => {
+    const unavailable: typeof fetch = async () => new Response('busy', { status: 503 });
+    await assert.rejects(collectRss(store, new AbortController().signal, unavailable, NOW), /RSS HTTP 503/);
+    assert.deepEqual(await store.list({ source: 'rss' }), []);
+    assert.equal(await store.checkpoint('rssHash'), undefined);
+  });
+});
+
+test('collectRss does not remember a 200 body the parser cannot read, so the next good fetch still runs', async () => {
+  const xml = await readFixture();
+  await withStore(async store => {
+    const signal = new AbortController().signal;
+    await assert.rejects(collectRss(store, signal, feed('<html>error page</html>'), NOW), /format was not recognized/);
+    assert.equal(await store.checkpoint('rssHash'), undefined);
+    assert.ok(await collectRss(store, signal, feed(xml), NOW) > 0);
+  });
+});
+
+test('collectRss stops reading a body larger than 4 MB and writes nothing', async () => {
+  await withStore(async store => {
+    const megabyte = new Uint8Array(1024 * 1024).fill(0x20);
+    let pulled = 0, cancelled = false;
+    // Eight megabytes on offer; a reader that honours the cap must quit well before the end.
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) { if (++pulled > 8) controller.close(); else controller.enqueue(megabyte); },
+      cancel() { cancelled = true; },
+    });
+    const oversized: typeof fetch = async () => new Response(body, { status: 200 });
+    await assert.rejects(collectRss(store, new AbortController().signal, oversized, NOW), /RSS body exceeds 4 MB/);
+    assert.equal(cancelled, true);
+    assert.ok(pulled < 8, `pulled ${pulled} chunks`);
+    assert.deepEqual(await store.list({ source: 'rss' }), []);
+    assert.equal(await store.checkpoint('rssHash'), undefined);
+  });
+});

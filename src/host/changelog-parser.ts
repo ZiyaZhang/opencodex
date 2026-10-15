@@ -142,8 +142,7 @@ export function parseChangelog(content: string, sourceUrl: string, options: Chan
       const fingerprint = `codex-feature:${createHash('sha256').update(`${release.date}\n${normalizedTitle}`).digest('hex')}`;
       if (seen.has(fingerprint)) return;
       seen.add(fingerprint);
-      const scope = RUNTIME_SURFACE.test(release.title) ? 'CLI/SDK/API 运行时公告（桌面可用性未确认）' : /desktop|codex app|桌面/i.test(`${release.title} ${body}`) ? '桌面应用' : '通用产品公告（平台需研究确认）';
-      features.push({ title, description: `${body.slice(0, 1000)}\n\n来源范围：${scope}。官方更新记录中的功能线索；尚未在本机验证，也不代表已经完成复刻。`, sourceUrl: release.url ? (anchor ? linkFor(release.url, anchor) : release.url) : linkFor(sourceUrl, anchor ?? release.anchor), fingerprint, publishedAt, releaseTitle: release.title });
+      features.push({ title, description: body.slice(0, 1000), sourceUrl: release.url ? (anchor ? linkFor(release.url, anchor) : release.url) : linkFor(sourceUrl, anchor ?? release.anchor), fingerprint, publishedAt, releaseTitle: release.title });
     };
     let section = '', sectionAnchor: string | undefined, paragraphs: string[] = [], items: string[] = [];
     const flush = () => {
