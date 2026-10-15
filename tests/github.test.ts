@@ -2,18 +2,59 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { GitHubClient, defaultGhRunner, type GhRunner } from '../src/host/github.ts';
 
-test('stable releases filter prereleases and keep order', async () => {
+test('stableTags lists stable releases through gh, newest semver first, honoring the limit', async () => {
   const calls: string[][] = [];
-  const runner: GhRunner = async args => { calls.push(args); return JSON.stringify([
-    { tag_name: 'rust-v0.163.0-alpha.1', prerelease: true, published_at: '2026-10-10T00:00:00Z', body: '' },
-    { tag_name: 'rust-v0.162.1', prerelease: false, published_at: '2026-10-09T19:44:51Z', body: '## Bug Fixes\n- x (#1)' },
-    { tag_name: 'rust-v0.162.0', prerelease: false, published_at: '2026-10-08T18:55:59Z', body: '## New Features\n- y (#2)' },
-  ]); };
+  // Scrambled on purpose, and with the odd names GitHub really has next to the stable tags.
+  const names = ['rust-v0.9.0', 'rust-v0.10.0', 'rust-v0.162.0', 'rust-v0.162.1', 'rust-v0.163.0-alpha.1', 'rust-v0.161.0-rc.1', 'rust-vv0.99.0', 'winget-test-rust-v0.106.0', 'rusty-v8-v152.2.0', 'v0.1.0', 'rust-v0.162.1-hotfix', 'rust-v0.161.0'];
+  const runner: GhRunner = async args => { calls.push(args); return JSON.stringify(names.map(tagName => ({ tagName }))); };
   const client = new GitHubClient({ gh: runner });
-  const releases = await client.stableReleases(10);
-  assert.deepEqual(releases.map(r => r.tag), ['rust-v0.162.1', 'rust-v0.162.0']);
-  assert.match(calls[0]!.join(' '), /repos\/openai\/codex\/releases/);
-  assert.ok(!calls[0]!.includes('--paginate'), 'one page of releases is enough');
+  assert.deepEqual(await client.stableTags(10), ['rust-v0.162.1', 'rust-v0.162.0', 'rust-v0.161.0', 'rust-v0.10.0', 'rust-v0.9.0'], 'numeric semver order (0.10.0 above 0.9.0); alphas and look-alikes dropped');
+  assert.deepEqual(await client.stableTags(2), ['rust-v0.162.1', 'rust-v0.162.0']);
+  assert.deepEqual(calls[0], ['release', 'list', '--repo', 'openai/codex', '--exclude-pre-releases', '--exclude-drafts', '--limit', '100', '--json', 'tagName']);
+});
+
+test('REST stableTags pages through the tags listing and stops at the first short page', async () => {
+  const filler = (count: number, prefix: string) => Array.from({ length: count }, (_, i) => ({ name: `${prefix}${i}` }));
+  const pages = [
+    [{ name: 'rust-v0.9.0' }, { name: 'rust-v0.162.1' }, ...filler(98, 'rust-v0.163.0-alpha.')], // a full page holding two stable tags
+    [{ name: 'rust-v0.10.0' }, { name: 'rust-v0.162.0' }, ...filler(40, 'rust-v0.161.0-alpha.')], // a short page: the listing ends here
+  ];
+  const stub = stubFetch(({ url }) => json(pages[Number(/&page=(\d+)$/.exec(url)![1]) - 1] ?? []));
+  const client = new GitHubClient({ gh: null, fetch: stub.fetch });
+  assert.deepEqual(await client.stableTags(10), ['rust-v0.162.1', 'rust-v0.162.0', 'rust-v0.10.0', 'rust-v0.9.0']);
+  assert.deepEqual(stub.calls.map(c => c.url), [
+    'https://api.github.com/repos/openai/codex/tags?per_page=100&page=1',
+    'https://api.github.com/repos/openai/codex/tags?per_page=100&page=2',
+  ], 'the short second page ends the listing: no third request');
+});
+
+test('REST stableTags stops once it holds enough stable tags, reads at most five pages, and lists a tag once', async () => {
+  const full = (stable: string[], prefix: string) => [...stable.map(name => ({ name })), ...Array.from({ length: 100 - stable.length }, (_, i) => ({ name: `${prefix}${i}` }))];
+  const enough = stubFetch(({ url }) => json(url.endsWith('page=1') ? full(['rust-v0.162.1', 'rust-v0.162.0', 'rust-v0.161.0'], 'rust-v0.163.0-alpha.') : []));
+  assert.deepEqual(await new GitHubClient({ gh: null, fetch: enough.fetch }).stableTags(3), ['rust-v0.162.1', 'rust-v0.162.0', 'rust-v0.161.0']);
+  assert.equal(enough.calls.length, 1, 'three stable tags are in hand after page 1');
+  // every page is full and each holds one new stable tag plus rust-v0.1.0 again: never enough for 50
+  const endless = stubFetch(({ url }) => json(full([`rust-v0.${/&page=(\d+)$/.exec(url)![1]}.0`, 'rust-v0.1.0'], 'rust-v0.200.0-alpha.')));
+  assert.deepEqual(await new GitHubClient({ gh: null, fetch: endless.fetch }).stableTags(50), ['rust-v0.5.0', 'rust-v0.4.0', 'rust-v0.3.0', 'rust-v0.2.0', 'rust-v0.1.0']);
+  assert.equal(endless.calls.length, 5, 'five pages is the cap');
+});
+
+test('release maps the gh json shape and the REST shape, with an empty body for null', async () => {
+  const calls: string[][] = [];
+  const view: GhRunner = async args => { calls.push(args); return JSON.stringify({ tagName: 'rust-v0.162.0', body: '## New Features\n- y (#2)', publishedAt: '2026-10-08T18:55:59Z', isPrerelease: false }); };
+  assert.deepEqual(await new GitHubClient({ gh: view }).release('rust-v0.162.0'), { tag: 'rust-v0.162.0', publishedAt: '2026-10-08T18:55:59Z', body: '## New Features\n- y (#2)', prerelease: false });
+  assert.deepEqual(calls[0], ['release', 'view', 'rust-v0.162.0', '--repo', 'openai/codex', '--json', 'tagName,body,publishedAt,isPrerelease']);
+  const emptyBody: GhRunner = async () => JSON.stringify({ tagName: 'rust-v0.163.0-alpha.1', body: null, publishedAt: '2026-10-10T00:00:00Z', isPrerelease: true });
+  assert.deepEqual(await new GitHubClient({ gh: emptyBody }).release('rust-v0.163.0-alpha.1'), { tag: 'rust-v0.163.0-alpha.1', publishedAt: '2026-10-10T00:00:00Z', body: '', prerelease: true });
+
+  const rest = stubFetch(() => json({ tag_name: 'rust-v0.162.0', body: null, published_at: '2026-10-08T18:55:59Z', prerelease: false, draft: false, assets: [{ name: 'codex-x86_64-apple-darwin.tar.gz' }] }));
+  assert.deepEqual(await new GitHubClient({ gh: null, fetch: rest.fetch }).release('rust-v0.162.0'), { tag: 'rust-v0.162.0', publishedAt: '2026-10-08T18:55:59Z', body: '', prerelease: false });
+  assert.deepEqual(rest.calls.map(c => c.url), ['https://api.github.com/repos/openai/codex/releases/tags/rust-v0.162.0']);
+  const alpha = stubFetch(() => json({ tag_name: 'rust-v0.163.0-alpha.1', body: 'notes', published_at: '2026-10-10T00:00:00Z', prerelease: true }));
+  assert.deepEqual(await new GitHubClient({ gh: null, fetch: alpha.fetch }).release('rust-v0.163.0-alpha.1'), { tag: 'rust-v0.163.0-alpha.1', publishedAt: '2026-10-10T00:00:00Z', body: 'notes', prerelease: true });
+  const odd = stubFetch(() => json({ tag_name: 'a/b c', body: '', published_at: '2026-10-10T00:00:00Z', prerelease: false }));
+  await new GitHubClient({ gh: null, fetch: odd.fetch }).release('a/b c');
+  assert.equal(odd.calls[0]!.url, 'https://api.github.com/repos/openai/codex/releases/tags/a%2Fb%20c', 'the tag is encoded as one path segment');
 });
 
 test('treePaths keeps only watched blobs and rejects truncated trees', async () => {
@@ -57,31 +98,20 @@ const json = (body: unknown, status = 200): Response => new Response(JSON.string
 const missingGh: GhRunner = async () => { throw Object.assign(new Error('spawn gh ENOENT'), { code: 'ENOENT', errno: -2, syscall: 'spawn gh', path: 'gh' }); };
 
 test('without gh the client reads api.github.com and reports HTTP errors', async () => {
-  const ok = stubFetch(() => json([
-    { tag_name: 'rust-v0.163.0-alpha.1', prerelease: true, published_at: '2026-10-10T00:00:00Z', body: '' },
-    { tag_name: 'rust-v0.162.1', prerelease: false, published_at: '2026-10-09T19:44:51Z', body: null },
-    { tag_name: 'rust-v0.162.0', prerelease: false, published_at: '2026-10-08T18:55:59Z', body: 'notes' },
-  ]));
-  const releases = await new GitHubClient({ gh: null, fetch: ok.fetch }).stableReleases(1);
-  assert.deepEqual(releases, [{ tag: 'rust-v0.162.1', publishedAt: '2026-10-09T19:44:51Z', body: '' }], 'limit applies after the prerelease filter, and a null body becomes an empty string');
-  assert.deepEqual(ok.calls.map(c => c.url), ['https://api.github.com/repos/openai/codex/releases?per_page=100']);
+  const ok = stubFetch(() => json([{ name: 'rust-v0.162.1' }, { name: 'rust-v0.163.0-alpha.1' }, { name: 'rust-v0.162.0' }]));
+  assert.deepEqual(await new GitHubClient({ gh: null, fetch: ok.fetch }).stableTags(1), ['rust-v0.162.1']);
+  assert.deepEqual(ok.calls.map(c => c.url), ['https://api.github.com/repos/openai/codex/tags?per_page=100&page=1'], 'one request: the page is short and the limit is met');
   assert.equal(ok.calls[0]!.accept, 'application/vnd.github+json');
   assert.match(ok.calls[0]!.userAgent ?? '', /^dsh-opencodex\//, 'GitHub rejects requests without a User-Agent');
 
   const limited = stubFetch(() => json({ message: 'API rate limit exceeded' }, 403));
-  await assert.rejects(new GitHubClient({ gh: null, fetch: limited.fetch }).stableReleases(5), /GitHub HTTP 403.*rate limit exceeded/);
+  await assert.rejects(new GitHubClient({ gh: null, fetch: limited.fetch }).stableTags(5), /GitHub HTTP 403.*rate limit exceeded/);
   const html = stubFetch(() => new Response('<html>Forbidden</html>', { status: 403 }));
-  await assert.rejects(new GitHubClient({ gh: null, fetch: html.fetch }).stableReleases(5), /GitHub HTTP 403/);
-});
-
-test('stable releases need both a clear prerelease flag and a plain rust-vX.Y.Z tag', async () => {
-  const release = (tag_name: string, prerelease: boolean) => ({ tag_name, prerelease, published_at: '2026-10-09T00:00:00Z', body: '' });
-  const runner: GhRunner = async () => JSON.stringify([release('rust-v0.164.0', true), release('v0.1.0', false), release('rust-v0.163.0-rc.1', false), release('rust-v0.162.1', false)]);
-  assert.deepEqual((await new GitHubClient({ gh: runner }).stableReleases(10)).map(r => r.tag), ['rust-v0.162.1']);
+  await assert.rejects(new GitHubClient({ gh: null, fetch: html.fetch }).stableTags(5), /GitHub HTTP 403/);
 });
 
 test('invalid JSON names the request it came from', async () => {
-  await assert.rejects(new GitHubClient({ gh: async () => '<html>bad gateway</html>' }).stableReleases(1), /invalid JSON for repos\/openai\/codex\/releases/);
+  await assert.rejects(new GitHubClient({ gh: async () => '<html>bad gateway</html>' }).stableTags(1), /invalid JSON for release list/);
   const stub = stubFetch(() => new Response('oops', { status: 200 }));
   await assert.rejects(new GitHubClient({ gh: null, fetch: stub.fetch }).treePaths('rust-v0.162.1', () => true), /invalid JSON for repos\/openai\/codex\/git\/trees\/rust-v0\.162\.1/);
 });
@@ -90,10 +120,10 @@ test('abort signals reach both gh and fetch', async () => {
   const controller = new AbortController();
   let seen: AbortSignal | undefined;
   const runner: GhRunner = async (_args, signal) => { seen = signal; return '[]'; };
-  await new GitHubClient({ gh: runner }).stableReleases(1, controller.signal);
+  await new GitHubClient({ gh: runner }).stableTags(1, controller.signal);
   assert.equal(seen, controller.signal);
   const stub = stubFetch(() => json([]));
-  await new GitHubClient({ gh: null, fetch: stub.fetch }).stableReleases(1, controller.signal);
+  await new GitHubClient({ gh: null, fetch: stub.fetch }).stableTags(1, controller.signal);
   assert.equal(stub.calls[0]!.signal, controller.signal);
 });
 
@@ -189,19 +219,45 @@ test('REST pull request files: an empty page ends the loop, and 30 pages (GitHub
 test('a missing gh binary sends the client to REST, and gh is not tried again', async () => {
   let attempts = 0;
   const runner: GhRunner = async (args, signal) => { attempts++; return missingGh(args, signal); };
-  const stub = stubFetch(() => json([{ tag_name: 'rust-v0.162.1', prerelease: false, published_at: '2026-10-09T19:44:51Z', body: 'x' }]));
+  const stub = stubFetch(() => json([{ name: 'rust-v0.162.1' }]));
   const client = new GitHubClient({ gh: runner, fetch: stub.fetch });
-  assert.deepEqual((await client.stableReleases(1)).map(r => r.tag), ['rust-v0.162.1']);
-  assert.deepEqual((await client.stableReleases(1)).map(r => r.tag), ['rust-v0.162.1']);
+  assert.deepEqual(await client.stableTags(1), ['rust-v0.162.1']);
+  assert.deepEqual(await client.stableTags(1), ['rust-v0.162.1']);
   assert.equal(attempts, 1, 'ENOENT is remembered after the first call');
   assert.equal(stub.calls.length, 2);
 });
 
-test('gh failures other than a missing binary are not hidden behind an anonymous retry', async () => {
-  const failing: GhRunner = async () => { throw Object.assign(new Error('gh: Not Found (HTTP 404)'), { code: 1 }); };
-  const stub = stubFetch(() => json([]));
-  await assert.rejects(new GitHubClient({ gh: failing, fetch: stub.fetch }).stableReleases(1), /Not Found/);
-  assert.equal(stub.calls.length, 0);
+test('a gh that is not signed in is treated like a missing gh: exit code 4, or "not logged into" on stderr', async () => {
+  const exit4 = Object.assign(new Error('Command failed: gh release list --repo openai/codex\nTo get started with GitHub CLI, please run:  gh auth login'), { code: 4, stderr: 'To get started with GitHub CLI, please run:  gh auth login\n' });
+  const notLoggedInto = Object.assign(new Error('Command failed: gh api repos/openai/codex/tags'), { code: 1, stderr: 'You are not logged into any GitHub hosts. To log in, run: gh auth login\n' });
+  const messageOnly = Object.assign(new Error('You are not logged into any GitHub hosts'), { code: 1 });
+  for (const error of [exit4, notLoggedInto, messageOnly]) {
+    let attempts = 0;
+    const runner: GhRunner = async () => { attempts++; throw error; };
+    const stub = stubFetch(() => json([{ name: 'rust-v0.162.1' }]));
+    const client = new GitHubClient({ gh: runner, fetch: stub.fetch });
+    assert.deepEqual(await client.stableTags(1), ['rust-v0.162.1']);
+    assert.deepEqual(await client.stableTags(1), ['rust-v0.162.1']);
+    assert.equal(attempts, 1, 'remembered after the first failure');
+    assert.equal(stub.calls.length, 2);
+  }
+  // the commands that do not go through `gh api` take the same way out
+  const signedOut: GhRunner = async () => { throw exit4; };
+  const stub = stubFetch(({ accept, url }) => accept === 'application/vnd.github.diff' ? new Response('diff --git a/x b/x\n') : url.includes('/releases/tags/') ? json({ tag_name: 'rust-v0.162.0', body: 'b', published_at: '2026-10-08T18:55:59Z', prerelease: false }) : json({}));
+  const client = new GitHubClient({ gh: signedOut, fetch: stub.fetch });
+  assert.equal((await client.release('rust-v0.162.0')).body, 'b');
+  assert.equal(await client.pullRequestDiff(7), 'diff --git a/x b/x\n');
+});
+
+test('gh failures other than a missing binary or a missing login are not hidden behind an anonymous retry', async () => {
+  const notFound = Object.assign(new Error('Command failed: gh release list\ngh: Not Found (HTTP 404)'), { code: 1, stderr: 'gh: Not Found (HTTP 404)\n' });
+  const badToken = Object.assign(new Error('Command failed: gh release list\ngh: Bad credentials (HTTP 401)'), { code: 1, stderr: 'gh: Bad credentials (HTTP 401)\n' });
+  const cancelled = Object.assign(new Error('Command failed: gh release list'), { code: 2, stderr: '' });
+  for (const [error, expected] of [[notFound, /Not Found/], [badToken, /Bad credentials/], [cancelled, /Command failed/]] as const) {
+    const stub = stubFetch(() => json([]));
+    await assert.rejects(new GitHubClient({ gh: async () => { throw error; }, fetch: stub.fetch }).stableTags(1), expected);
+    assert.equal(stub.calls.length, 0);
+  }
 });
 
 test('pull request diff runs gh pr diff, and uses the REST diff media type without gh', async () => {
