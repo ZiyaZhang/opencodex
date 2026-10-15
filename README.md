@@ -1,135 +1,204 @@
 # OpenCodex
 
-> **v2 重写中。** 本分支正在按 [重做方案](docs/plans/2026-10-15-design.md) 重写 OpenCodex：只负责发现 Codex 的新功能、对照 DSH 现状写差距报告，并把选中的报告交给创造模式会话开工。v1 的 token 预算、复刻、验收、截图和自动安装已全部移除，下文仍是 v1 说明，待重写。
+DeepSeek Harness（DSH）的第三方插件：每天收集 Codex 的更新，对照 DSH 源码写差距报告，再把选中的报告交给 DSH 创造模式会话去实现。
 
-在自己的 DSH 中发现、研究 Codex 功能，生成可审阅的 DSH 插件。
-
-OpenCodex 是独立第三方项目，与 OpenAI 无隶属关系。当前为 **0.2 预览版**：提供真实 DSH 研究会话、预算账本、资料库和验收流程；不承诺任意 Codex 功能都能自动复刻。目标应用的访问权限、DSH 扩展点和真实验收结果决定可完成的范围。
-
-## 使用路径
-
-**发现更新 / 主动描述功能 → 选择与预算 → 本机调查 → 行为与视觉规格 → 生成独立插件 → 隔离验收 → 自动安装到当前 DSH 并启用。**
-
-- **研究**：描述要复刻的交互，附参考链接或截图，创建任务后开始。任务有独立 DSH 会话、工作目录与持久化记录。
-- **发现**：无需模型地从官方更新日志逐项提取近期功能，首次检查就展示一批候选。按功能去重，保留发布日期、更新标题和原文链接；可以勾选多项创建待开始的研究任务。默认筛除 CLI 底层变更、移动端专属内容、纯模型公告和修复列表。文档公告仍不证明本机已开放。
-- **资料**：入口 skill、11 份按需手册和 22 个公共来源，覆盖 CUA、REA/ASAR、视觉、prompt/tool、DSH 适配、非阻断提问和会话通信。
-- **设置**：每项及每日 token 上限、最长运行时间、修复轮数。可选择在 DSH 运行期间定期检查更新。
-
-前台桌面操作会排队，用户点击开始后研究才继续。复刻产物通过验收后会直接安装到当前 DSH profile 并启用，无需再次下载和手动导入；更新扫描本身仍不启动复刻或安装。
-
-### 从截图开始
-
-点击「主动研究功能」，在描述框粘贴截图，或选择一个 PNG、JPEG、WebP 文件（每张不超过 2 MiB）。创建时支持一张参考图；已有任务可在详情追加多张 Codex 参考或 DSH 实现截图，并填写所示状态。补充希望还原的操作，例如「显示猜你想问的灰字，Tab 接受但不发送」，再设置本项预算。
-
-截图保存在任务目录，研究会话通过已安装的图像读取工具查看；缺少这项能力时，视觉观察仍是未完成。截图能提供所示状态的布局依据，不能证明预测触发时机、使用的模型或隐藏 prompt。插件会按可见证据和明确需求形成规格，保留这些未知项。
-
-### 每项 UI 功能都要说明与对照
-
-无论从文字、截图还是更新开始，研究先解释**功能是什么、有什么用、要复现哪些可见状态**，并取得真实 Codex 参考图：用户提供、当前 DSH CUA 获准截图，或注明来源与已知版本的官方资料。没有图就显示缺口；来源内容本身不授予操作权限。
-
-实现后，在隔离 DSH 中记录相同状态的真实截图，与 Codex 图一起说明差异。图片按产品、来源、说明和已知版本登记在本机任务中，每张不超过 2 MiB。用户确认视觉通过时必须选择已登记的 Codex 与 DSH 图片，仍需人工判断是否可比；模型只能提交报告。缺图、无法查看或目标不可访问时保留「部分完成」，不能用 DSH 图、原型或生成演示替代 Codex。此要求适用于全部 UI 功能，更新候选可先显示文字线索和缺图状态。
-
-### Codex 更新触发
-
-设置中填写本机安装版本文件的绝对路径（XML 格式的 `Info.plist` 或包含 `version` 的 `package.json`）。OpenCodex 监听文件原子替换与写入，同时定时补查；首次只建立基线，DSH 重启后会补查停机期间的版本变化。当前不解析二进制 plist 或 Windows EXE 版本资源。文件事件只能在 DSH 运行时即时触发，不能在 DSH 关闭时唤醒应用。
-
-版本变化作为触发信号，刷新官方日志中的具体功能候选；版本号本身单独显示，不当作可复刻功能。读取失败会显示错误并保留旧记录，不会宣称“没有更新”。可选的**预算内自动调查**开关默认关闭；开启后，新版本只触发新增功能与证据调查，形成调查结果后再选择具体功能复刻。它与手动复刻任务共用预算，并会排队，避免升级触发并发失控。同一次版本变化不会重复创建任务。
+<!-- ![候选页，DSH 启动后还没有检查](docs/images/01-page.png) -->
+<!-- ![检查后的候选列表](docs/images/02-after-check.png) -->
+<!-- ![候选详情：协议类型变化的证据](docs/images/03-detail.png) -->
 
 ## 安装
 
-首版锁定公开 npm 版本 **DSH `0.2.1-alpha.2`**、Cordis `4.0.5-alpha.1`，使用 Node **24 LTS**。旧稳定版及其他 alpha 版本未验证。先用独立数据目录试用；仅更换 profile 仍会共用插件依赖目录：
+### 要求
+
+| 项 | 要求 |
+| --- | --- |
+| DSH | `dsh` CLI 0.2.1-alpha 系列，验证过 0.2.1-alpha.2（`npm install -g @deepseek-ai/dsh@0.2.1-alpha.2`）；本插件的 `@deepseek-ai/*` 依赖钉在这个版本。DSH 桌面端自带的 CLI 是 0.2.0-rc.2，比它旧，不要用来装 |
+| DSH 源码 | [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 的一份 git 检出，生成报告和开工时必须有 |
+| GitHub | 建议装 `gh` 并登录；没有时走匿名 REST，限额见[时限与上限](#时限与上限) |
+| 桌面端 | 可选：macOS 上的 ChatGPT.app；没装就跳过这个来源 |
+| 网络 | 访问 GitHub 和 developers.openai.com；有 `HTTPS_PROXY` 等环境变量时走它，否则在 macOS 上用系统 HTTPS 代理 |
+| Node | 只在从源码打包时需要：22.19 以上，CI 用 24 |
+
+### 安装包
+
+从 [GitHub Releases](https://github.com/ZiyaZhang/opencodex/releases) 下载 `dsh-opencodex-0.3.0.tgz`，用 `shasum -a 256` 核对 release 里给的 SHA256。也可以从源码打包：
 
 ```sh
-npm install -g @deepseek-ai/dsh@0.2.1-alpha.2
-export DSH_HOME="$HOME/.dsh-opencodex"
-dsh --profile opencodex --from-default-profile web --dump-config
+git clone https://github.com/ZiyaZhang/opencodex.git && cd opencodex
+npm ci && npm run check && npm pack
 ```
 
-从 [GitHub Releases](https://github.com/ZiyaZhang/opencodex/releases) 下载预构建的 `dsh-opencodex-0.2.0.tgz`，再安装：
+### 安装命令
 
 ```sh
-dsh plugin --profile opencodex add /absolute/path/dsh-opencodex-0.2.0.tgz
+# 可选：从内置的 web 模板新建一个试用 profile
+dsh --profile opencodex --from-default-profile web --dump-config
+dsh plugin --profile opencodex add /绝对路径/dsh-opencodex-0.3.0.tgz
 dsh --profile opencodex
 ```
 
-侧栏出现 **OpenCodex**。在 DSH 中配置可用的模型，进入 OpenCodex 的「资料 → 检查环境能力」。研究使用 DSH 当前默认模型；首版不另带模型账号或订阅。
+`dsh plugin add` 会打印 `WARN Issues with peer dependencies found.`。本插件的 peer dependency（`@deepseek-ai/cordis` 和几个 `@deepseek-ai/dsh-*` 包）由 DSH 运行时提供，这条警告是预期的。升级时用新的 tgz 再 `add` 一次并重启 DSH；卸载用 `dsh plugin --profile <profile> remove dsh-opencodex`。
 
-也可从源码构建本地产物：
+### 第一次启动
 
-```sh
-git clone https://github.com/ZiyaZhang/opencodex.git
-cd opencodex
-npm ci
-npm run check
-npm pack
+1. `dsh --profile <profile>` 打印网页地址，打开后侧栏出现 OpenCodex。
+2. 在「设置」里填 DSH 镜像路径（`dshMirrorPath`），保存后马上建索引。
+3. DSH 每次启动后自动检查一次，之后每次检查结束再过 `checkIntervalHours` 小时检查一次；DSH 不运行时不检查。点「检查更新」随时手动检查，计时从这次结束重新算。第一次检查时，发布说明和仓库文件只看最新一个次版本的全部正式版（例如 `rust-v0.161.0 → rust-v0.162.1`），桌面端只记下当前版本作基线，不出候选。
+
+## 设置
+
+在页面的「设置」里改，保存在数据目录的 `settings.json`。手改这个文件要重启 DSH 才生效；内容不合法时插件不启动，错误信息里有文件路径。
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `dshMirrorPath` | 空 | 生成报告和开工必填。`deepseek-harness` 检出的绝对路径；OpenCodex 只读它，不更新它 |
+| `desktopPlistPath` | `/Applications/ChatGPT.app/Contents/Info.plist` | 留空就不检查桌面端 |
+| `desktopLocale` | `zh-CN` | 读桌面端哪个语言的文案包 |
+| `classifyModel` | `deepseek-official` / `deepseek-flash` | 归类用的提供方和模型 id，写法和 DSH profile 里一致 |
+| `reportModel` | `deepseek-official` / `deepseek-v4-pro` | 写报告用的提供方和模型 id |
+| `reportPreset` | 空 | 报告会话的 Agent 预设，空表示 DSH 默认预设 |
+| `startPreset` | `cordis` | 开工会话的 Agent 预设，`cordis` 是创造模式 |
+| `dailyReportLimit` | `10` | 每个 UTC 日最多开几个报告会话，至少 1 |
+| `checkIntervalHours` | `24` | 检查间隔，1 到 168 小时 |
+
+## 工作流
+
+检查 → 候选 → 生成报告 → 看报告 → 开工 → 创造模式会话
+
+### 检查
+
+四个来源依次跑，一个失败不影响其他：
+
+| 来源 | 内容 |
+| --- | --- |
+| Codex 发布说明 | `openai/codex` 正式版（`rust-vX.Y.Z`）的 release notes，New Features 里一条一个候选，附对应的 PR |
+| Codex 仓库文件 | 两个正式版之间受关注路径的变化：功能开关注册表、app-server 协议的 TypeScript 类型、`docs/*.md` 和 `codex-rs/config.md` |
+| Codex 桌面端 | 本机 ChatGPT.app，只读：版本变了才看，收新出现的前端 chunk 和所选语言文案包里新增的 `codex.` key |
+| 官方 RSS | Codex changelog 的 RSS，只收产品公告；CLI 的功能由发布说明这一路收 |
+
+然后从镜像重建 DSH 索引（包 README 的摘要、`docs/config-catalog.md`、`.agents/notes`），再用 `classifyModel` 给新候选归类：分类、和 DSH 的相关度、同一功能的合并提示。页面顶部的「上次检查」一行显示这次的正式版窗口、各来源新增数和错误。
+
+### 候选
+
+列表按来源、分类、相关度、状态筛选，默认不显示已忽略的和相关度低的。状态有四个：新发现、已出报告、已开工、已忽略；忽略的可以恢复，恢复后要先重新生成报告才能开工。候选很多时列表只带一部分，已出报告和已开工的总在其中。
+
+### 报告
+
+「生成报告」做三件事：
+
+1. 取证据，写进 `reports/<id>/evidence/`：Codex 一侧是 PR 正文、diff 或新增行、i18n key 和 chunk、RSS 原文；DSH 一侧是索引命中的包、config 和 notes 摘要；没取到的写在 `INDEX.md` 的「没取到的内容」下。
+2. 开一个分析会话，标题「OpenCodex 报告 · <候选标题>」：工作目录是 `reports/<id>/`，模型切到 `reportModel`（随后把 DSH 的默认模型恢复原样），沙箱 `workspace-write`（能读镜像，不能写），审批策略 `never`。
+3. 会话写出 `report.md`，按模板分六节：
+
+| 节 | 内容 |
+| --- | --- |
+| 结论 | 做、可做或不做，工作量，理由 |
+| Codex 怎么做的 | 每条带 PR 号、`路径:行号`、chunk 名或 i18n key |
+| DSH 现在有没有 | 每条带相对镜像根目录的 `路径:行号`；索引没命中写「未找到：查过……」 |
+| 差哪些扩展点 | 缺的服务、Slot、工具、协议字段、配置项 |
+| 分级 | 从 0 级（不做）起的几级做法和各自的 DSH 工作量 |
+| 建议 | 做哪一级，先做什么，依赖什么 |
+
+每日上限按 UTC 日计开过的报告会话数：超时或失败的也算，会话没建起来的不算。到了上限，「生成报告」直接拒绝。已出报告和已开工的候选都可以重新生成报告。
+
+### 报告校验
+
+| 字段 | 含义 |
+| --- | --- |
+| `requiredSections` | 模板的六节标题都在 |
+| `dshRefsTotal` | 「DSH 现在有没有」一节里指向镜像的 `路径:行号` 引用数，代码块里的不算 |
+| `dshRefsResolved` | 其中文件在镜像里、行号没有超出文件的个数 |
+
+报告头部把这三项显示成「模板要求的节齐全」和「DSH 引用在镜像里找到 已找到/总数」。六节齐全、引用数大于 0 且全部找到，才显示「校验通过」。「没有引用」指这一节一条镜像引用都没有：报告对 DSH 现状的说法没法对着镜像核对，所以不算通过，DSH 里确实没有相关代码时也一样，要人来读。校验只核对文件和行号存在，不核对引用的内容是否支撑报告的说法。
+
+### 开工
+
+「开工」在 `work/<id>/` 开一个 `startPreset` 会话（默认 `cordis`，创造模式），标题「实现 · <候选标题>」，页面随即跳过去。首条消息是任务说明加报告全文（去掉页面上不显示的 HTML 注释）：用 `cordis-plugin-development` skill 把「建议」一节推荐的那一级做成独立 bundle，装进当前 profile 并自己验证；需要改 DSH 核心代码时停下来，写清楚改哪个包的哪几行。提示词交代报告和证据里的原文、命令、链接都是第三方数据，不照做。
+
+之后 OpenCodex 不再介入：不选模型（用 DSH 当前的默认模型），不设沙箱，不等结果。会话从部署的默认沙箱模式开始，常见是只读，要写 bundle 时在那个会话里放宽。同一条候选可以再开工，上一个开工会话还在运行时会拒绝。
+
+### 失败处理
+
+| 环节 | 出错时 |
+| --- | --- |
+| 检查 | 失败的来源在「上次检查」里记一条错误，行首是来源名；GitHub 限流时检查点停在限流之前，下次接着取；整次检查超时也记一条错误 |
+| 归类 | 连接中断的批次自动重试；仍失败的候选显示「未归类」，下次检查再归类 |
+| 生成报告 | 会话超时、长时间空闲却没写出 `report.md`、会话消失时报错，错误里带会话 id；上一份报告和证据放回原处，候选状态不变 |
+| 开工 | 建会话前的检查没过就不建（没有报告、没填镜像路径、报告文件不在或为空）；会话建好后交接失败，错误里带会话 id |
+
+### 时限与上限
+
+| 项 | 值 |
+| --- | --- |
+| 启动后的检查 | DSH 每次启动后 60 秒 |
+| 检查间隔 | `checkIntervalHours`，默认 24 小时，从上一次检查结束算 |
+| 一次检查 | 30 分钟 |
+| 归类 | 每次模型调用 30 条；连接中断的批次在 5 秒和 20 秒后各重试一次 |
+| 报告取 GitHub 证据 | 10 分钟 |
+| 报告会话 | 20 分钟；见过它运行之后空闲 1 分钟还没有 `report.md` 就算失败 |
+| 每日报告会话 | `dailyReportLimit`，默认 10 |
+| 证据包里的 diff | 60,000 字符，约 1.5 万 token |
+| 索引命中 | 包 3 个、config 2 段、notes 2 份 |
+| RSS | 最近 120 天的公告 |
+| 候选列表 | 800 条；已出报告和已开工的不受这个数限制 |
+| 桌面端快照 | 保留最近 3 个版本 |
+| 匿名 GitHub REST | 每小时 60 次请求 |
+
+## 数据目录
+
+```text
+$DSH_HOME/opencodex/          没设 DSH_HOME 时是 ~/.dsh/opencodex/
+├── settings.json             设置
+├── state.json                检查点：各来源上次看到的 tag 和版本、RSS 哈希、索引的提交、每天的报告会话数
+├── candidates/<id>.json      每条候选一个文件
+├── snapshots/                发布说明、仓库文件和桌面端的快照
+├── index/dsh-index.json      DSH 索引
+├── reports/<id>/
+│   ├── evidence/             证据包，入口是 INDEX.md
+│   └── report.md
+└── work/<id>/                开工会话的工作目录
 ```
 
-生成包包含 Host、Client、资源和 skills，安装无需执行构建脚本。更新已安装包后重启 DSH；移除本插件使用 `dsh plugin --profile opencodex remove dsh-opencodex`。
+全是明文 JSON 和 Markdown。目录按 `DSH_HOME` 分，不按 profile 分：同一个 `DSH_HOME` 下装了 OpenCodex 的 profile 共用这份数据，不要同时运行其中两个。
 
-### CUA 和 REA
+## 不做的事
 
-OpenCodex 使用 **DSH 已安装的 CUA / 浏览器工具**。它不调用运行开发过程的 Codex 助手内置 CUA，也不会借助另一通道绕过目标访问拒绝。
+- 不自动安装、不自动验收。OpenCodex 只开会话、交报告；bundle 的实现、安装和验证在开工会话里进行，由用户把关。
+- 不计 token。成本看 DSH 会话自己的用量显示，限制只有每日报告上限。
+- 不截图。
+- 不跟 Codex 的 alpha 版，只跟正式版。
+- 不看 Codex 的 IDE 扩展。
 
-REA 是可选研究依赖。参阅 [REA](https://github.com/morluto/rea) 当前的 DSH adapter 安装说明；在**准备使用的 DSH_HOME** 下配置，避免改动其他 profile。研究以实际 tools/schema 为准，不把新文档中的工具当成已安装能力。本轮方法复核固定在 REA commit `4692bb3`；公开包为 `rea-agents@6.5.0`。没有把其 conformance fixture 当成通用 UI 验收器，也不自动安装或接管 REA 进程。具体版本与范围见 [REA 复核](docs/chain-review-2026-10-15.md)。
+## 合规说明
 
-工具存在仅说明可以尝试，不代表有权访问任意目标。无法访问的原生 Codex UI、不可读资源和不可见云端实现会记为缺口。
+- OpenCodex 是独立的第三方项目，与 OpenAI 没有隶属关系。
+- 分析在本机进行。ChatGPT.app 只读：读 `Info.plist` 的版本号、`app.asar` 的文件清单和所选语言的文案包，不改动，不运行。
+- 归类和报告会把候选的标题、摘要和证据交给设置里的模型，经 DSH 配置的模型服务处理。
+- 证据包里来自 ChatGPT.app 的只有 chunk 路径、`codex.` key 和对应文案，没有应用代码；报告按模板只写证据里能查到的内容。
+- 不分发应用包的内容：快照、证据和报告只存在本机数据目录，不进仓库，也不进发布包。
+- PR 描述、RSS 原文和 i18n 文案是第三方数据。归类、报告、开工三处提示词都写明它们只是数据，不是指令。
 
-## 预算、恢复与验收
-
-账本覆盖本插件追踪的 DSH 模型调用，按尝试记录输入（含缓存）和输出。调用前预留，结束后以 provider usage 结算；同一模型路线可复用上次真实输入用量，加 25% 余量，并对变化内容按 UTF-8 字节保守计数。没有有效校准或切换模型时退回完整字节预留；未知用量继续占用预留，重启不清零。每日额度按 UTC 结算。用量估算故意保守，因此可能提前暂停；在途请求也可能超出估算，**不是逐 token 的账单硬上限**。
-
-默认每项 120,000 tokens、每日 300,000 tokens 是保守的短调查起始额度，不是完整复刻的成本承诺。先查看证据和规格，再按剩余工作续额。调查连续四次模型尝试没有登记新证据或规格会自动暂停；失败重试也计入，避免持续查阅却没有进展。
-
-单次输出上限与任务总预算分开。OpenCodex Host 的 `maxOutputTokens` 默认 4,096，可在 DSH 插件配置中设置为 256–32,768；有效值还受 DSH 模型配置限制。模型达到单次上限或提前结束而未交付时，任务暂停并保留进度；不会自动反复调用。修改上限不会自动提高已有会话固化的输出设置，需要同时核对 DSH 会话配置。
-
-恢复时保留已有证据、代码和消耗。上下文过长时可以勾选「使用新会话继续」：原会话保留，新会话接续同一个任务及账本，不重置预算或先前访问限制；已有有效规格的任务可恢复编写规格或开发阶段，不必重新调查。已有规格和同一产物的验收任务可直接继续验收，不重新调用模型调查；真实验收失败才进入受预算和轮数约束的修复，缺少环境能力则阻塞。生成任务内置可构建的通用插件骨架，包含包结构、浏览器加载器和空 Slot 示例；它帮助开始实现，不代表具体功能已经完成。
-
-研究要求 DSH workspace-write 沙箱。外部模型进程和 API 不属于允许的研究路径；DSH 文件沙箱并不封闭全部网络，所以本插件的账本也不是账号级计费防火墙。必要时另设模型服务商额度。
-
-子 agent 默认关闭；仅在确认 DSH 使用可追踪的进程内子 agent provider 后，由 profile 配置 `allowSubagents: true`。这不把外部 CLI agent 的开销变成可计量。
-
-已由用户确认的后台浏览器工具可通过 `backgroundToolNames` 配置精确工具名；其余识别到的桌面/浏览器控制会要求前台批准。同一时刻只有一个任务持有前台许可，暂停、取消和重启会撤销许可。
-
-证据区分已观察、推断、未知。Host 在独立 DSH_HOME 内运行真实安装、禁用、再启用、重启和卸载检查；这不等同功能通过。行为、视觉和功能状态恢复由独立的 `opencodexFeatureVerifier` 适配器逐项验收，也可由用户登记实际隔离结果。**当前未内置通用 CUA 功能验收器**；未配置适配器且缺少人工验收时，任务停在具体缺口，不自动安装。模型提交的自测报告不能替代独立验收。视觉通过还要求已登记的 Codex 参考图与 DSH 结果图；文件有效不代表画面等价。只有当前产物、证据摘要及三个维度的验收都符合要求，才完成验收，并立即调用 DSH 的公开 `pluginManager.installBundle` 接口安装和启用；无需再确认安装。生成了 tarball 但尚未验收的任务会保留实验包，不冒充可用成果。
-
-任务列表显示真实参考缩略图和产物状态。已登记的包在详情提供「下载实验包」；三项验收通过后会自动安装，并保留「下载插件包」供备份。下载按分片传输并验证完整 SHA-256；自动安装由 Host 独立执行，关闭页面也不取消安装。人工补交的包单独记录协助说明，保留原暂停状态和预算；不会因有文件就变成验收通过。
-
-每项功能有独立的包名、版本、入口和 `cordis.patch.yml`，运行时不依赖 OpenCodex。安装结果显示具体版本、已应用或需要重启；「在插件管理中查看」打开 DSH 原生详情，可独立启用、禁用和卸载。失败保留错误与日志，可重试；中断后不盲目重装，不覆盖同名外部插件。已校验包会留存在 Host 的 `installed-packages/<sha256>/plugin.tgz`，供原生 profile 的 `file:` 依赖后续重装使用。
-
-数据默认位于 `$DSH_HOME/opencodex`（未设置时为 `~/.dsh/opencodex`）。任务目录、截图、解包材料与模型记录留在本机；插件不会上传到此 GitHub 仓库。移除插件不删除研究数据。用户选用的 DSH 模型和工具仍按其自身配置处理输入。
-
-## 初始用例
-
-| 用例 | 要验证的能力 |
-| --- | --- |
-| 猜你想问 / Tab 接受 | 灰字与真实草稿分离、过期请求、IME、预测预算 |
-| 会话引用 chip | 识别 DSH 已有能力、同名会话、预览与草稿保留 |
-| 不占输入框的 ask-user | 提问/普通输入分离，迟到回答、附件与恢复 |
-| 平级 session 通信 chip | 目标身份、消息关联、回执、重试去重与循环抑制 |
-| 预算耗尽、取消与重启 | 停止新增调用、保存证据、恢复不重复副作用 |
-
-这些是研究与验收场景，**不代表预装了上述功能**。当前生成实验仍未完成行为、视觉与生命周期的完整验收；本体构建、模板打包或工具接线通过不能替代它。详细步骤见 [用例合同](docs/use-cases.md)。
-
-仓库另附 [提问时保留普通输入框的实验插件](examples/async-questions/README.md)，提供独立安装包。它来自真实 DSH 研究会话，经过人工指导和一处编译修复，构建及组件契约测试已通过，真实界面验收仍待完成。它用于复现生成实验，尚未标记为可用于日常环境。
-
-## 开发与验证
+## 开发
 
 ```sh
-npm run typecheck
+npm install
+npm run check    # 类型检查、全部测试、构建
 npm test
 npm run build
 ```
 
-- [架构与边界](docs/architecture.md)
-- [验收标准](docs/validation.md)
-- [本轮链路复核与真实运行](docs/chain-review-2026-10-15.md)
-- [早期实测与失败记录](docs/validation-2026-10-14.md)
-- [REA 对照与调用效率改进](docs/rea-learning.md)
-- [研究入口 skill](skills/opencodex/SKILL.md)
-- [公共来源索引](resources/sources.json)
+2026-10-15 的 `npm run check` 跑了 454 个测试，全部通过，构建成功。
 
-状态核心独立于 DSH，Host 通过公开 session/tool/LLM 和 authenticated Remote 接口接入，Client 使用 DSH 原生侧栏与主面板扩展点。源码不依赖 Harness 内部仓库路径。
+不启动 DSH 跑一次采集，结果写进 `--home` 指定的目录：
 
-## 致谢与许可
+```sh
+npx tsx scripts/collect.ts --home <空目录> --mirror <deepseek-harness 检出>
+```
 
-MIT。打包图标的许可见 [第三方声明](THIRD_PARTY_NOTICES.md)。研究方法借鉴 [REA](https://github.com/morluto/rea) 的按需指南、证据链和版本化调查思路，以及 [Eigent 的 REA 介绍](https://www.eigent.ai/zh-CN/blog/rea-reverse-engineer-anything)。本仓库的代码与资料说明为独立实现；不分发 Codex 解包代码、私有 prompt、聊天数据或素材。
+它打印检查结果的 JSON 和候选列表；`errors` 不为空时退出码是 1，参数有问题时是 2。`--plist ''` 跳过桌面端，不给 `--mirror` 就不建索引。
+
+文档：[设计](docs/plans/2026-10-15-design.md)、[实施计划](docs/plans/2026-10-15-redo.md)、[第一期验收](docs/plans/phase1-acceptance.md)、[第三期试用记录](docs/plans/phase3-trial.md)。
+
+## 许可证
+
+MIT，见 [LICENSE](LICENSE)。客户端打包了 `@phosphor-icons/react`（MIT）、`marked`（MIT）和 DOMPurify（按 Apache-2.0 使用），许可证全文见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
