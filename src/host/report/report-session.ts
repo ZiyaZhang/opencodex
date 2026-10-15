@@ -44,12 +44,16 @@ function refPattern(mirror: string): RegExp {
   return new RegExp(`(?<![\\w./-])(?:${root}/|\\./)?((?:packages|apps|docs|\\.agents)/[\\w./-]+):(\\d+)(?:[-–](\\d+))?`, 'g');
 }
 
-/** The markdown with every fenced code block blanked, fence lines included, keeping the line count. A fence left open runs to the end. */
+/**
+ * The markdown with every fenced code block blanked, fence lines included, keeping the line count. A fence left open runs to the end.
+ * A line that starts with three backticks and has another backtick after them is inline code, not a fence.
+ */
 function withoutFences(markdown: string): string {
   let fence: string | undefined;
   return markdown.split('\n').map(line => {
     if (fence === undefined) {
-      fence = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
+      const open = /^ {0,3}(?:(`{3,})[^`]*|(~{3,}).*)$/.exec(line);
+      fence = open?.[1] ?? open?.[2];
       return fence === undefined ? line : '';
     }
     const close = /^ {0,3}(`{3,}|~{3,})\s*$/.exec(line)?.[1];
@@ -97,8 +101,17 @@ export async function checkReport(markdown: string, mirror: string): Promise<Rep
   return { requiredSections: SECTIONS.every(title => headingOf(title).test(text)), dshRefsTotal: refs.length, dshRefsResolved: resolved };
 }
 
-/** The part of DSH's live Agent that a report needs. */
+/** The part of DSH's live Agent that setup needs. */
 interface ReportAgent { readonly session: Session }
+/** A message waiting in an agent's inbox; a prompt sent through the controller has `source.rpcId`, its request id. */
+interface PendingMessage { readonly source: object }
+/** The parts of a live DSH Agent (`ctx.agents.get`) that the wait and the cancel use; every part but `status` may be missing. */
+interface LiveAgent {
+  readonly status: string;
+  whenIdle?(): Promise<void>;
+  readonly inbox?: { readonly nextTurn: readonly PendingMessage[]; readonly nextStep: readonly PendingMessage[]; clear(): void };
+  cancel?(cause: { readonly kind: 'user' }): void;
+}
 
 /**
  * What `generateReport` needs from the Host context, structurally, so tests can pass plain objects. The request types are DSH's own, so
@@ -122,11 +135,16 @@ export interface ReportHost {
     cancel?(request: SessionCancelRequest): unknown;
   };
   /** `ctx.agents`; DSH's `Agent.status` is `'idle' | 'running'`. */
-  agents: { get(sessionId: SessionId): { readonly status: string; whenIdle?(): Promise<void> } | undefined };
+  agents: { get(sessionId: SessionId): LiveAgent | undefined };
   /** `ctx.agentDefaultModel`. When present, the default model `selectModel` overwrites is saved back; when absent, it is left as `selectModel` leaves it. */
   agentDefaultModel?: { currentSelection(): ModelSelection; saveSelection(selection: ModelSelection): Promise<unknown> };
   /** `ctx.approval` (`@deepseek-ai/dsh-user-approval`). When present, the session gets approval policy `never`, so no ask waits for a person. */
   approval?: { setPolicy(agent: ReportAgent, policy: 'never'): void };
+  /**
+   * `ctx.subagents` (`@deepseek-ai/dsh-subagent`). When present, an idle parent's progressing children are joined before the poll counts
+   * as idle; `true` means work was joined and the parent is looked at again.
+   */
+  subagents?: { waitForChildren(parent: LiveAgent): Promise<boolean> };
 }
 
 export interface GenerateReportInput {
@@ -195,24 +213,25 @@ function promptFor(candidate: Candidate, mirror: string): string {
 }
 
 /**
- * The last model switch per default-model service. DSH's `selectModel` saves its choice as the user's default model; it submits that save
+ * The last default-model switch in this process. DSH's `selectModel` saves its choice as the user's default model; it submits that save
  * before it returns, and saves commit in submission order, so the default read before the switch is saved back right after it. Switches
- * are chained, so that a concurrent report cannot take another report's passing default for the one to restore.
+ * are chained, so that a concurrent report cannot take another report's passing default for the one to restore. The chain is one per
+ * process, not one per service object: every read of a Cordis service through `ctx` returns a new proxy.
  */
-const modelSwitches = new WeakMap<object, Promise<unknown>>();
+let modelSwitch: Promise<unknown> = Promise.resolve();
 
 async function selectReportModel(host: ReportHost, sessionId: SessionId, model: ModelRoute): Promise<void> {
   const select = () => host.sessionController.selectModel({ sessionId, provider: model.provider, model: model.model });
   const defaults = host.agentDefaultModel;
   if (!defaults) { await select(); return; }
-  const switched = (modelSwitches.get(defaults) ?? Promise.resolve()).then(async () => {
+  const switched = modelSwitch.then(async () => {
     const previous = defaults.currentSelection();
     await select();
     try { await defaults.saveSelection(previous); } catch (error) {
       throw new Error(`没能把默认模型恢复为 ${previous.provider}/${previous.model}：${messageOf(error)}`, { cause: error });
     }
   });
-  modelSwitches.set(defaults, switched.catch(() => undefined));
+  modelSwitch = switched.catch(() => undefined);
   await switched;
 }
 
@@ -224,38 +243,73 @@ async function setAside(reportPath: string, backupPath: string): Promise<boolean
   }
 }
 
+const exists = (path: string) => stat(path).then(() => true, () => false);
+/** A report.prev.md without a report.md is what a run that stopped between setting the report aside and putting it back leaves. */
+async function recoverEarlier(reportPath: string, backupPath: string): Promise<void> {
+  if (!(await exists(reportPath)) && await exists(backupPath)) await rename(backupPath, reportPath);
+}
+
+/** The value of `work`, or `fallback` once `ms` pass; rejects when `signal` aborts first. The timer does not outlive the call. */
+async function within<T>(work: Promise<T>, ms: number, fallback: T, signal?: AbortSignal): Promise<T> {
+  const done = new AbortController();
+  const timer = sleep(Math.max(0, ms), fallback, { signal: signal ? AbortSignal.any([signal, done.signal]) : done.signal, ref: false });
+  try { return await Promise.race([work, timer]); } finally { done.abort(); }
+}
+
+/** Whether our prompt still waits in the agent's inbox; undefined when the agent does not show its inbox. */
+function queued(agent: LiveAgent, requestId: SessionRequestId): boolean | undefined {
+  if (!agent.inbox) return undefined;
+  const ours = (message: PendingMessage) => 'rpcId' in message.source && message.source.rpcId === requestId;
+  return agent.inbox.nextTurn.some(ours) || agent.inbox.nextStep.some(ours);
+}
+
 /**
  * Polls until report.md exists and the agent is idle or gone, and returns the report. Any report.md counts: the earlier one was moved aside
  * before the prompt. The file is the signal, not the status: a queued prompt starts its turn asynchronously and may wait behind
- * maintenance, so an agent that has not been seen running yet is waited for until the timeout. Once it has been seen running, `idlePolls`
- * idle polls in a row without report.md end the run (`idle`), and so does the agent's disappearance (`vanished`). A turn shorter than one
- * poll is never seen running, so such a run ends at the timeout.
+ * maintenance, so the run counts as started only once the agent is seen running or our prompt has left its inbox (a turn too short to be
+ * seen running, such as a request rejected at once). Once started, `idlePolls` idle polls in a row without report.md end the run (`idle`),
+ * and so does the agent's disappearance (`vanished`). An idle agent's progressing children are joined first (`subagents`): while they work,
+ * the parent only looks idle. The join is cut short by the abort and by the deadline.
  */
-async function waitForReport(host: ReportHost, sessionId: SessionId, reportPath: string, input: GenerateReportInput): Promise<string> {
+async function waitForReport(host: ReportHost, sessionId: SessionId, requestId: SessionRequestId, reportPath: string, input: GenerateReportInput): Promise<string> {
+  const { signal } = input;
   const deadline = Date.now() + (input.timeoutMs ?? TIMEOUT_MS);
   const idlePolls = input.idlePolls ?? IDLE_POLLS;
-  let ran = false, idleInARow = 0;
+  let started = false, idleInARow = 0;
   for (;;) {
     // Not referenced, so a Host that shuts down without aborting is not kept alive by the wait.
-    await sleep(input.pollMs ?? POLL_MS, undefined, { signal: input.signal, ref: false });
+    await sleep(input.pollMs ?? POLL_MS, undefined, { signal, ref: false });
     const agent = host.agents.get(sessionId);
-    if (agent?.status === 'running') { ran = true; idleInARow = 0; } else {
+    if (agent?.status === 'running') { started = true; idleInARow = 0; } else if (agent && host.subagents
+      && await within(host.subagents.waitForChildren(agent).catch(() => false), deadline - Date.now(), false, signal)) {
+      idleInARow = 0;
+    } else {
+      if (agent && queued(agent, requestId) === false) started = true;
       const report = await textOf(reportPath);
       if (report !== undefined) return report;
-      if (ran && !agent) throw new ReportSessionError('vanished', sessionId);
-      if (ran && ++idleInARow >= idlePolls) throw new ReportSessionError('idle', sessionId);
+      if (started && !agent) throw new ReportSessionError('vanished', sessionId);
+      if (started && ++idleInARow >= idlePolls) throw new ReportSessionError('idle', sessionId);
     }
     if (Date.now() >= deadline) throw new ReportSessionError('timeout', sessionId);
   }
 }
 
-/** Asks DSH to stop the session's turn and gives the agent a moment to settle; a session that is gone or idle is fine. */
-async function cancelQuietly(host: ReportHost, sessionId: SessionId): Promise<void> {
-  const { sessionController } = host;
-  if (!sessionController.cancel) return;
-  try { await sessionController.cancel({ sessionId }); } catch { return; }
-  const idle = host.agents.get(sessionId)?.whenIdle?.();
-  if (idle) await Promise.race([idle.catch(() => undefined), sleep(SETTLE_MS, undefined, { ref: false })]);
+/**
+ * Stops the session's work and gives the agent a moment to settle. Through the live agent when it shows one: `cancel` aborts the active
+ * turn and clearing the inbox drops a prompt still waiting for its turn (with no active turn `cancel` alone does nothing), so that it cannot
+ * run later and write over the report put back. Otherwise through the controller, which aborts the active turn only. Errors are ignored:
+ * a session that is gone or idle is fine.
+ */
+async function cancelRun(host: ReportHost, sessionId: SessionId): Promise<void> {
+  const agent = host.agents.get(sessionId);
+  if (agent?.cancel && agent.inbox) {
+    try { agent.cancel({ kind: 'user' }); } catch { /* best effort */ }
+    try { agent.inbox.clear(); } catch { /* best effort */ }
+  } else if (host.sessionController.cancel) {
+    try { await host.sessionController.cancel({ sessionId }); } catch { return; }
+  } else return;
+  const idle = agent?.whenIdle?.();
+  if (idle) await within(idle.catch(() => undefined), SETTLE_MS, undefined);
 }
 
 /**
@@ -264,13 +318,16 @@ async function cancelQuietly(host: ReportHost, sessionId: SessionId): Promise<vo
  * mode and approval policy `never`. An earlier `report.md` is moved to `report.prev.md`, one prompt is queued, and `report.md` is read and
  * checked once it exists and the agent is idle; `report.prev.md` is then removed.
  * Every failure once the session exists rejects with a `ReportSessionError` that names it. A timeout, an abort or an idle agent also has its
- * turn cancelled; the session itself is left for the Host. A failed run puts the earlier report back. A signal that is already aborted
- * rejects before any session is created.
+ * turn cancelled, a prompt still queued included; the session itself is left for the Host. A failed run puts the earlier report back, and
+ * a run that finds a report.prev.md without a report.md (one that stopped midway) puts it back before anything else. A signal that is
+ * already aborted rejects before any session is created.
  */
 export async function generateReport(host: ReportHost, input: GenerateReportInput): Promise<ReportRecord> {
   const { candidate, reportDir, mirror, signal } = input;
   check(isAbsolute(reportDir) && basename(reportDir) === candidate.id && basename(dirname(reportDir)) === 'reports', `reportDir must be an absolute <data>/reports/${candidate.id}`);
   check(isAbsolute(mirror), 'mirror must be an absolute path');
+  const reportPath = join(reportDir, 'report.md'), backupPath = join(reportDir, 'report.prev.md');
+  try { await recoverEarlier(reportPath, backupPath); } catch (error) { throw new ReportSessionError('setup', undefined, { cause: error }); }
   if (signal.aborted) throw new ReportSessionError('aborted', undefined, { cause: signal.reason });
   let sessionId: SessionId;
   try {
@@ -278,7 +335,7 @@ export async function generateReport(host: ReportHost, input: GenerateReportInpu
   } catch (error) {
     throw signal.aborted ? new ReportSessionError('aborted', undefined, { cause: signal.reason }) : new ReportSessionError('setup', undefined, { cause: error });
   }
-  const reportPath = join(reportDir, 'report.md'), backupPath = join(reportDir, 'report.prev.md');
+  const requestId = randomUUID() as SessionRequestId;
   let setAsideEarlier = false;
   try {
     await host.sessionController.rename({ sessionId, title: `OpenCodex 报告 · ${[...oneLine(candidate.title)].slice(0, TITLE_LIMIT).join('')}` });
@@ -289,8 +346,8 @@ export async function generateReport(host: ReportHost, input: GenerateReportInpu
     host.approval?.setPolicy(activation.agent, 'never');
     signal.throwIfAborted();
     setAsideEarlier = await setAside(reportPath, backupPath);
-    await host.sessionController.prompt({ sessionId, requestId: randomUUID() as SessionRequestId, mode: 'queue', content: [{ type: 'text', text: promptFor(candidate, mirror) }] }, signal);
-    const markdown = await waitForReport(host, sessionId, reportPath, input);
+    await host.sessionController.prompt({ sessionId, requestId, mode: 'queue', content: [{ type: 'text', text: promptFor(candidate, mirror) }] }, signal);
+    const markdown = await waitForReport(host, sessionId, requestId, reportPath, input);
     const checks = await checkReport(markdown, mirror);
     await rm(backupPath, { force: true }).catch(() => undefined);
     // ReportRecord.path is relative to the data directory, and reportDir is <data>/reports/<id>.
@@ -299,7 +356,7 @@ export async function generateReport(host: ReportHost, input: GenerateReportInpu
     const failure = error instanceof ReportSessionError ? error
       : signal.aborted ? new ReportSessionError('aborted', sessionId, { cause: signal.reason })
       : new ReportSessionError('setup', sessionId, { cause: error });
-    if (failure.reason === 'timeout' || failure.reason === 'aborted' || failure.reason === 'idle') await cancelQuietly(host, sessionId);
+    if (failure.reason === 'timeout' || failure.reason === 'aborted' || failure.reason === 'idle') await cancelRun(host, sessionId);
     // Put the earlier report back over whatever the run left; if that fails, it stays in report.prev.md.
     if (setAsideEarlier) await rename(backupPath, reportPath).catch(() => undefined);
     throw failure;

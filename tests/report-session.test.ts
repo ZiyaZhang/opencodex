@@ -72,11 +72,31 @@ function fakeDefaults(initial: ModelSelection, behaviour: { delayFor?: (next: Mo
   };
 }
 
+/** A live agent as `ctx.agents.get` returns it: a status, an inbox our prompt waits in, and `cancel`. */
+function liveAgent() {
+  const live = {
+    status: 'idle',
+    cancelled: [] as Array<{ kind: string }>,
+    cleared: 0,
+    inbox: {
+      nextTurn: [] as Array<{ source: { kind: string; rpcId?: string } }>,
+      nextStep: [] as Array<{ source: { kind: string; rpcId?: string } }>,
+      clear() { live.cleared++; live.inbox.nextTurn.length = 0; live.inbox.nextStep.length = 0; },
+    },
+    cancel(cause: { kind: string }) { live.cancelled.push(cause); },
+  };
+  return live;
+}
+
 interface FakeOptions {
   /** What `agents.get` reports, one entry per call: a status, or `gone` for no agent; `idle` once they run out. */
   statuses?: string[];
+  /** `live`: `agents.get` returns a live agent with an inbox (the prompt is queued in it) and `cancel`; by default only a status. */
+  agent?: 'bare' | 'live';
   activation?: { error: Error };
   defaults?: ReturnType<typeof fakeDefaults>;
+  /** `subagents.waitForChildren`; no `subagents` without it. */
+  children?: (parent: unknown) => Promise<boolean>;
   /** Runs inside `selectModel`. */
   onSelectModel?: () => void;
   /** Runs inside `prompt`, after the request is recorded: the agent's work. */
@@ -86,6 +106,7 @@ interface FakeOptions {
 function fakeHost(options: FakeOptions = {}) {
   const calls: string[] = [];
   const agent = { session: agentSession };
+  const live = liveAgent();
   const seen: {
     create?: SessionCreateRequest; rename?: SessionRenameRequest; selectModel?: SessionSelectModelRequest; resolveAgent?: string;
     prompt?: SessionPromptRequest; promptSignal?: AbortSignal; polledIds: string[]; cancelled: string[]; policies: Array<[unknown, string]>;
@@ -102,20 +123,36 @@ function fakeHost(options: FakeOptions = {}) {
         return { selected: request };
       },
       async resolveAgent(sessionId) { calls.push('resolveAgent'); seen.resolveAgent = sessionId; return options.activation ?? { agent }; },
-      async prompt(request, signal) { calls.push('prompt'); seen.prompt = request; seen.promptSignal = signal; await options.onPrompt?.(); return { accepted: true }; },
+      async prompt(request, signal) {
+        calls.push('prompt'); seen.prompt = request; seen.promptSignal = signal;
+        if (options.agent === 'live') live.inbox.nextTurn.push({ source: { kind: 'user', rpcId: request.requestId } });
+        await options.onPrompt?.();
+        return { accepted: true };
+      },
       cancel(request) { calls.push('cancel'); seen.cancelled.push(request.sessionId); return { accepted: true }; },
     },
     agents: {
       get(sessionId) {
         seen.polledIds.push(sessionId);
         const status = statuses.shift() ?? 'idle';
-        return status === 'gone' ? undefined : { status };
+        if (status === 'gone') return undefined;
+        if (options.agent !== 'live') return { status };
+        live.status = status;
+        return live;
       },
     },
     approval: { setPolicy(target, policy) { calls.push('setPolicy'); seen.policies.push([target, policy]); } },
-    ...(options.defaults ? { agentDefaultModel: options.defaults } : {}),
+    ...(options.children ? { subagents: { waitForChildren: options.children } } : {}),
   };
-  return { host, calls, seen, agent };
+  const { defaults } = options;
+  // As through a Cordis context, every read of the service gives a new object.
+  if (defaults) {
+    Object.defineProperty(host, 'agentDefaultModel', {
+      enumerable: true,
+      get: () => ({ currentSelection: () => defaults.currentSelection(), saveSelection: (next: ModelSelection) => defaults.saveSelection(next) }),
+    });
+  }
+  return { host, calls, seen, agent, live };
 }
 const inputFor = (dirs: Dirs, extra: Partial<GenerateReportInput> = {}): GenerateReportInput =>
   ({ candidate, reportDir: dirs.reportDir, mirror: dirs.mirror, model, signal: new AbortController().signal, pollMs: 5, sandbox: () => {}, ...extra });
@@ -178,6 +215,9 @@ test('checkReport leaves fenced code blocks out of headings and references', asy
     // A heading that is only inside a fence does not count, and a fence left open runs to the end.
     assert.equal((await checkReport(reportWith('- x').replace('## 建议\n做 1\n', '~~~markdown\n## 建议\n~~~\n'), mirror)).requiredSections, false);
     assert.equal((await checkReport(reportWith('- `packages/x/src/a.ts:1`\n```\n- `packages/x/src/a.ts:2`'), mirror)).dshRefsTotal, 1);
+    // Three backticks with another backtick on the line are inline code, not the start of a block.
+    const inline = reportWith('- `packages/x/src/a.ts:1` 有\n```rg -n x packages/x/src/a.ts:2``` 是行内代码\n- `packages/x/src/a.ts:3` 有');
+    assert.deepEqual(await checkReport(inline, mirror), { requiredSections: true, dshRefsTotal: 3, dshRefsResolved: 3 });
   });
 });
 
@@ -384,6 +424,65 @@ test('generateReport switches the default model for one report at a time', async
     await Promise.all([firstRun, secondRun]);
     assert.deepEqual(defaults.current, flash);
     assert.deepEqual(defaults.saved, [model, flash, model, flash]);
+  });
+});
+
+test('generateReport cancels through the live agent and clears a prompt still waiting in its inbox', async () => {
+  await withDirs(async dirs => {
+    // The prompt stays queued (behind maintenance, say): the run is not counted as started, so it ends at the timeout, not as idle.
+    const { host, seen, live } = fakeHost({ agent: 'live' });
+    await assert.rejects(generateReport(host, inputFor(dirs, { timeoutMs: 50, idlePolls: 2 })), (error: unknown) => isReportSessionError(error) && error.reason === 'timeout');
+    assert.deepEqual(live.cancelled, [{ kind: 'user' }]);
+    assert.equal(live.cleared, 1);
+    assert.deepEqual(live.inbox.nextTurn, [], 'the queued prompt cannot run later');
+    assert.deepEqual(seen.cancelled, [], 'the controller, which keeps the inbox, is not used');
+  });
+});
+
+test('generateReport counts a turn too short to be seen running once its prompt has left the inbox', async () => {
+  await withDirs(async dirs => {
+    // The turn starts and fails between two polls (a request rejected at once): the agent is never seen running.
+    const fast = fakeHost({ agent: 'live', onPrompt: async () => { setTimeout(() => { fast.live.inbox.nextTurn.length = 0; }, 12); } });
+    await assert.rejects(generateReport(fast.host, inputFor(dirs, { idlePolls: 2, timeoutMs: 10_000 })), (error: unknown) => {
+      assert.ok(isReportSessionError(error));
+      assert.equal(error.reason, 'idle');
+      return true;
+    });
+  });
+});
+
+test('generateReport joins child work before it counts the parent idle, and stops joining at the abort and the deadline', async () => {
+  await withDirs(async dirs => {
+    let joins = 0;
+    const parents: unknown[] = [];
+    const busy = fakeHost({ statuses: ['running'], children: async parent => { parents.push(parent); return ++joins <= 2; } });
+    await assert.rejects(generateReport(busy.host, inputFor(dirs, { idlePolls: 2, timeoutMs: 10_000 })), (error: unknown) => isReportSessionError(error) && error.reason === 'idle');
+    assert.equal(joins, 4, 'two polls joined child work and did not count; the two after them did');
+    assert.deepEqual(parents, Array(4).fill({ status: 'idle' }));
+
+    const stuck = new AbortController();
+    const aborted = fakeHost({ statuses: ['running'], children: () => new Promise<boolean>(() => {}), onPrompt: async () => { setTimeout(() => stuck.abort(), 30); } });
+    await assert.rejects(generateReport(aborted.host, inputFor(dirs, { signal: stuck.signal, timeoutMs: 10_000 })), (error: unknown) => isReportSessionError(error) && error.reason === 'aborted');
+
+    const late = fakeHost({ statuses: ['running'], children: () => new Promise<boolean>(() => {}) });
+    await assert.rejects(generateReport(late.host, inputFor(dirs, { timeoutMs: 50 })), (error: unknown) => isReportSessionError(error) && error.reason === 'timeout');
+  });
+});
+
+test('generateReport first puts back a report.prev.md that a stopped run left without report.md', async () => {
+  await withDirs(async dirs => {
+    const reportPath = join(dirs.reportDir, 'report.md'), backupPath = join(dirs.reportDir, 'report.prev.md');
+    const refused = fakeHost();
+    refused.host.sessionController.create = async () => { throw new Error('agent-preset/not-found'); };
+    await writeFile(backupPath, '# 上一次的报告\n');
+    await assert.rejects(generateReport(refused.host, inputFor(dirs)), (error: unknown) => isReportSessionError(error) && error.reason === 'setup');
+    assert.equal(await readFile(reportPath, 'utf8'), '# 上一次的报告\n', 'put back before the session was even asked for');
+    await assert.rejects(stat(backupPath), { code: 'ENOENT' });
+    // With report.md there as well, neither file is touched before the run.
+    await writeFile(backupPath, '# 更早的报告\n');
+    await assert.rejects(generateReport(refused.host, inputFor(dirs)), (error: unknown) => isReportSessionError(error) && error.reason === 'setup');
+    assert.equal(await readFile(reportPath, 'utf8'), '# 上一次的报告\n');
+    assert.equal(await readFile(backupPath, 'utf8'), '# 更早的报告\n');
   });
 });
 
