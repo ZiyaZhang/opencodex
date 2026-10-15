@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, readdir, readFile, stat, utimes, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { CandidateStore, writeJsonAtomic, type UpsertInput } from '../src/core/store.ts';
@@ -53,8 +54,8 @@ test('a state.json that is not a JSON object is rejected and left untouched, not
     const store = new CandidateStore(dir);
     for (const body of ['null', '[]', '"x"']) {
       await writeFile(join(dir, 'state.json'), body);
-      await assert.rejects(store.checkpoint('lastStableTag'), { name: 'ValidationError', message: /state\.json/ });
-      await assert.rejects(store.setCheckpoint('lastStableTag', 'rust-v0.162.1'), { name: 'ValidationError', message: /state\.json/ });
+      await assert.rejects(store.checkpoint('lastStableTag'), { name: 'Error', message: /state\.json/ });
+      await assert.rejects(store.setCheckpoint('lastStableTag', 'rust-v0.162.1'), { name: 'Error', message: /state\.json/ });
       assert.equal(await readFile(join(dir, 'state.json'), 'utf8'), body);
     }
   } finally { await rm(dir, { recursive: true, force: true }); }
@@ -65,10 +66,17 @@ test('a failed atomic write keeps the previous file and leaves no temp file behi
   try {
     const path = join(dir, 'doc.json');
     await writeJsonAtomic(path, { n: 1 });
-    // JSON.stringify throws on a BigInt, after the temp file has already been opened.
+    // A value JSON cannot hold is refused before anything touches the disk: BigInt makes JSON.stringify throw, undefined has no JSON text at all.
     await assert.rejects(writeJsonAtomic(path, { n: 1n }), TypeError);
+    await assert.rejects(writeJsonAtomic(path, undefined), TypeError);
+    await assert.rejects(writeJsonAtomic(join(dir, 'new-dir', 'doc.json'), undefined), TypeError);
     assert.deepEqual(await readdir(dir), ['doc.json']);
     assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), { n: 1 });
+    // Once the temp file exists, a failing rename must remove it again: a directory at the target path gives EISDIR.
+    const blocked = join(dir, 'blocked.json');
+    await mkdir(blocked);
+    await assert.rejects(writeJsonAtomic(blocked, { n: 2 }), { code: 'EISDIR' });
+    assert.deepEqual((await readdir(dir)).sort(), ['blocked.json', 'doc.json']);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -135,28 +143,46 @@ test('a damaged file is reported by its absolute path', async () => {
   await inTempDir(async dir => {
     const store = new CandidateStore(dir);
     const { candidate } = await store.upsert(seed('pr:30'));
+    const candidateFile = join(dir, 'candidates', `${candidate.id}.json`);
+    const stateFile = join(dir, 'state.json');
+    const failsWith = (message: string) => ({ name: 'Error', message });
     const corruptIn = (file: string) => (error: unknown) => {
-      assert.ok(error instanceof Error && error.message.startsWith(`Corrupt JSON in ${file}: `), String(error));
+      assert.ok(error instanceof Error && error.name === 'Error' && error.message.startsWith(`Corrupt JSON in ${file}: `), String(error));
       assert.ok(error.cause instanceof SyntaxError);
       return true;
     };
+    // upsert scans every file for the fingerprint, so it has to refuse a damaged one just like list() and get().
+    const expectRefused = async (content: string, expected: object | ((error: unknown) => boolean)) => {
+      await writeFile(candidateFile, content);
+      await assert.rejects(store.list(), expected);
+      await assert.rejects(store.get(candidate.id), expected);
+      await assert.rejects(store.upsert(seed('pr:31')), expected);
+    };
 
-    const candidateFile = join(dir, 'candidates', `${candidate.id}.json`);
-    await writeFile(candidateFile, '{"id": ');
-    await assert.rejects(store.list(), corruptIn(candidateFile));
-    await assert.rejects(store.get(candidate.id), corruptIn(candidateFile));
-    await assert.rejects(store.upsert(seed('pr:31')), corruptIn(candidateFile));
-    await writeFile(candidateFile, 'null');
-    await assert.rejects(store.list(), { name: 'ValidationError', message: `${candidateFile} must hold a JSON object` });
+    await expectRefused('{"id": ', corruptIn(candidateFile));
+    await expectRefused('null', failsWith(`${candidateFile} must hold a JSON object`));
+    await expectRefused('[]', failsWith(`${candidateFile} must hold a JSON object`));
+    await expectRefused('{}', failsWith(`${candidateFile} is not a candidate: id must be a string`));
+    for (const field of ['id', 'fingerprint', 'status', 'updatedAt']) {
+      await expectRefused(JSON.stringify({ ...candidate, [field]: 5 }), failsWith(`${candidateFile} is not a candidate: ${field} must be a string`));
+    }
+    const other = '22222222-2222-4222-8222-222222222222';
+    await expectRefused(JSON.stringify({ ...candidate, id: other }), failsWith(`${candidateFile} is not a candidate: id "${other}" does not match the file name`));
+    // A valid candidate filed under another name is just as wrong.
+    const stray = join(dir, 'candidates', 'stray.json');
+    await writeFile(candidateFile, JSON.stringify(candidate));
+    await writeFile(stray, JSON.stringify(candidate));
+    await assert.rejects(store.list(), failsWith(`${stray} is not a candidate: id "${candidate.id}" does not match the file name`));
+    await rm(stray);
+    assert.deepEqual((await store.list()).map(c => c.id), [candidate.id]);
 
-    const stateFile = join(dir, 'state.json');
     await writeFile(stateFile, '{"lastStableTag": ');
     await assert.rejects(store.checkpoint('lastStableTag'), corruptIn(stateFile));
     await assert.rejects(store.setCheckpoint('lastStableTag', 'rust-v0.162.1'), corruptIn(stateFile));
     // A store opened on a relative directory still names an absolute path.
     await assert.rejects(new CandidateStore(relative(process.cwd(), dir)).checkpoint('lastStableTag'), corruptIn(stateFile));
     await writeFile(stateFile, '[]');
-    await assert.rejects(store.checkpoint('lastStableTag'), { name: 'ValidationError', message: `${stateFile} must hold a JSON object` });
+    await assert.rejects(store.checkpoint('lastStableTag'), failsWith(`${stateFile} must hold a JSON object`));
   });
 });
 
@@ -177,7 +203,7 @@ test('checkpoint names and values are validated, and a normal one round-trips', 
       await assert.rejects(store.setCheckpoint(name, 'v'), { name: 'ValidationError', message: /^Invalid checkpoint name/ });
       await assert.rejects(store.checkpoint(name), { name: 'ValidationError', message: /^Invalid checkpoint name/ });
     }
-    for (const value of ['', 'two\nlines', 'cr\rhere', 'tab\there', 'nul\u0000byte', 'nel\u0085here', 'sep here', 'x'.repeat(513), undefined as unknown as string, 5 as unknown as string]) {
+    for (const value of ['', 'two\nlines', 'cr\rhere', 'tab\there', 'nul\u0000byte', 'nel\u0085here', 'sep\u2028here', 'x'.repeat(513), undefined as unknown as string, 5 as unknown as string]) {
       await assert.rejects(store.setCheckpoint('lastStableTag', value), { name: 'ValidationError', message: /^Invalid value for checkpoint lastStableTag/ });
     }
     assert.deepEqual(await store.checkpoints(), saved);
@@ -194,7 +220,7 @@ function steppedClock() {
   const iso = () => new Date(Date.UTC(2026, 9, 15, hours)).toISOString();
   return { now: () => new Date(iso()), advance: () => { hours += 1; return iso(); } };
 }
-const feedItem: UpsertInput = { source: 'rss', key: 'item-1', title: 'T', summary: 'S', evidence: [{ kind: 'rss', ref: 'Release', excerpt: 'E' }], window: { version: '1.2.3' } };
+const feedItem: UpsertInput = { source: 'rss', key: 'item-1', title: 'T', summary: 'S', evidence: [{ kind: 'rss', ref: 'Release', excerpt: 'E' }], window: { fromTag: 'rust-v0.161.0', toTag: 'rust-v0.162.1' } };
 
 test('an upsert that changes nothing writes nothing and leaves updatedAt alone', async () => {
   await inTempDir(async dir => {
@@ -227,7 +253,7 @@ test('an upsert that changes nothing writes nothing and leaves updatedAt alone',
   });
 });
 
-test('a changed title, summary, evidence or window refreshes the candidate; an omitted window or an undefined optional field does not', async () => {
+test('a changed title, summary, evidence or window refreshes the candidate; an omitted window, an undefined optional field or a different key order does not', async () => {
   await inTempDir(async dir => {
     const clock = steppedClock();
     const store = new CandidateStore(dir, clock.now);
@@ -237,7 +263,7 @@ test('a changed title, summary, evidence or window refreshes the candidate; an o
       ['summary', { ...feedItem, summary: 'S2' }],
       ['evidence', { ...feedItem, evidence: [{ kind: 'rss', ref: 'Release', excerpt: 'E2' }] }],
       ['evidence', { ...feedItem, evidence: [] }],
-      ['window', { ...feedItem, window: { version: '2.0.0' } }],
+      ['window', { ...feedItem, window: { fromTag: 'rust-v0.162.1', toTag: 'rust-v0.163.0' } }],
     ];
     for (const [field, changed] of changes) {
       clock.advance();
@@ -256,6 +282,7 @@ test('a changed title, summary, evidence or window refreshes the candidate; an o
     const unchanged: Array<[string, UpsertInput]> = [
       ['omitted window', { ...feedItem, window: undefined }],
       ['undefined optional evidence field', { ...feedItem, evidence: [{ kind: 'rss', ref: 'Release', url: undefined, excerpt: 'E' }] }],
+      ['reordered keys', { ...feedItem, evidence: [{ excerpt: 'E', ref: 'Release', kind: 'rss' }], window: { toTag: 'rust-v0.162.1', fromTag: 'rust-v0.161.0' } }],
     ];
     for (const [label, input] of unchanged) {
       clock.advance();
@@ -284,5 +311,80 @@ test('upsert never touches status, classification, report or started, whether it
     await store.transition(candidate.id, 'ignored');
     assert.equal((await store.upsert({ ...feedItem, title: 'T2' })).candidate.status, 'ignored'); // a changed feed does not bring an ignored item back
     assert.deepEqual(owned(await store.get(candidate.id)), { ...before, status: 'ignored' });
+  });
+});
+
+test('the write queue serializes concurrent upserts, read-modify-writes and checkpoint writes', async () => {
+  await inTempDir(async dir => {
+    const store = new CandidateStore(dir);
+    const results = await Promise.all([store.upsert(seed('pr:40')), store.upsert(seed('pr:40')), store.upsert(seed('pr:40'))]);
+    assert.deepEqual(results.map(r => r.created), [true, false, false]);
+    assert.equal((await readdir(join(dir, 'candidates'))).length, 1);
+
+    const id = results[0].candidate.id;
+    await Promise.all([
+      store.upsert({ ...seed('pr:40'), title: 'new title' }),
+      store.transition(id, 'ignored'),
+      store.patch(id, c => ({ ...c, summary: 'p' })),
+    ]);
+    const final = await store.get(id);
+    assert.equal(final.title, 'new title');
+    assert.equal(final.status, 'ignored');
+    assert.equal(final.summary, 'p');
+
+    await Promise.all([store.setCheckpoint('a', '1'), store.setCheckpoint('b', '2'), store.setCheckpoint('c', '3')]);
+    assert.deepEqual(await store.checkpoints(), { a: '1', b: '2', c: '3' });
+  });
+});
+
+test('list sorts by updatedAt, newest first, and filters by source and status', async () => {
+  await inTempDir(async dir => {
+    const clock = steppedClock();
+    const store = new CandidateStore(dir, clock.now);
+    const add = async (source: UpsertInput['source'], key: string, title = key) => { clock.advance(); return (await store.upsert({ source, key, title, summary: '', evidence: [] })).candidate.id; };
+    const a = await add('codex-release', 'a');
+    const b = await add('rss', 'b');
+    const c = await add('desktop', 'c');
+    const d = await add('rss', 'd');
+    assert.deepEqual((await store.list()).map(x => x.id), [d, c, b, a]);
+    assert.deepEqual((await store.list({ source: 'rss' })).map(x => x.id), [d, b]);
+
+    await add('codex-release', 'a', 'a, edited'); // a refresh moves a candidate to the top
+    assert.deepEqual((await store.list()).map(x => x.id), [a, d, c, b]);
+    await store.transition(b, 'ignored');
+    assert.deepEqual((await store.list({ source: 'rss', status: 'ignored' })).map(x => x.id), [b]);
+    assert.deepEqual((await store.list({ source: 'desktop', status: 'ignored' })).map(x => x.id), []);
+  });
+});
+
+test('list reads every file across its read batches and keeps the newest-first order', async () => {
+  await inTempDir(async dir => {
+    const directory = join(dir, 'candidates');
+    await mkdir(directory, { recursive: true });
+    const ids: string[] = [];
+    for (let i = 0; i < 129; i++) { // two full batches of 64 and a tail of one
+      const id = randomUUID();
+      ids.push(id);
+      const candidate: Candidate = { id, fingerprint: `rss:${i}`, source: 'rss', title: `Item ${i}`, summary: '', status: 'new', createdAt: '2026-10-15T00:00:00.000Z', updatedAt: new Date(Date.UTC(2026, 9, 15, 0, 0, i)).toISOString(), evidence: [] };
+      await writeFile(join(directory, `${id}.json`), JSON.stringify(candidate));
+    }
+    assert.deepEqual((await new CandidateStore(dir).list()).map(c => c.id), ids.reverse());
+  });
+});
+
+test('patch refuses a callback that does not return a candidate', async () => {
+  await inTempDir(async dir => {
+    const store = new CandidateStore(dir);
+    const { candidate } = await store.upsert(seed('pr:50'));
+    const wrong: Array<[string, (c: Candidate) => Candidate]> = [
+      ['undefined', () => undefined as unknown as Candidate],
+      ['null', () => null as unknown as Candidate],
+      ['an array', () => [] as unknown as Candidate],
+      ['a promise', (async (c: Candidate) => c) as unknown as (c: Candidate) => Candidate],
+    ];
+    for (const [label, update] of wrong) {
+      await assert.rejects(store.patch(candidate.id, update), { name: 'ValidationError', message: 'patch callback must return the updated candidate synchronously' }, label);
+    }
+    assert.deepEqual(await store.get(candidate.id), candidate);
   });
 });

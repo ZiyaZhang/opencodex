@@ -1,6 +1,6 @@
 import { mkdir, open, readFile, readdir, rename, unlink } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { canTransition, fingerprintOf, transition, type Candidate, type Evidence, type Source, type Status } from './candidate.js';
 import { ValidationError, check } from './check.js';
 
@@ -8,26 +8,45 @@ export interface UpsertInput { source: Source; key: string; title: string; summa
 export type Checkpoints = Record<string, string | undefined>;
 
 export async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
+  // Serialize first, so a value that cannot be written leaves no directory or temp file behind. JSON.stringify returns undefined, not text, for undefined, functions and symbols.
+  const text: string | undefined = JSON.stringify(value, null, 2);
+  if (text === undefined) throw new TypeError(`Cannot write ${resolve(path)}: the value has no JSON form`);
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temp = `${path}.${randomUUID()}.tmp`;
   try {
     const handle = await open(temp, 'wx', 0o600);
-    try { await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, 'utf8'); await handle.sync(); } finally { await handle.close(); }
+    try { await handle.writeFile(`${text}\n`, 'utf8'); await handle.sync(); } finally { await handle.close(); }
     await rename(temp, path);
   } catch (error) { await unlink(temp).catch(() => undefined); throw error; }
 }
 
-/** Reads one JSON object. A damaged file is named by its absolute path so it can be found and repaired by hand. */
+/** Reads one JSON object. A damaged file is named by its absolute path so it can be found and repaired by hand; the errors are plain Errors, not ValidationErrors, because no caller supplied the bad data. */
 async function readJson<T extends object>(path: string): Promise<T> {
   const text = await readFile(path, 'utf8');
   let value: unknown;
   try { value = JSON.parse(text); } catch (error) { throw new Error(`Corrupt JSON in ${resolve(path)}: ${(error as Error).message}`, { cause: error }); }
-  check(typeof value === 'object' && value !== null && !Array.isArray(value), `${resolve(path)} must hold a JSON object`);
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error(`${resolve(path)} must hold a JSON object`);
   return value as T;
 }
 
-/** JSON text is what ends up on disk, so comparing it treats an `undefined` optional field the same as an absent one. */
-const sameJson = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+/** Reads a candidate file and checks what the store itself relies on: sorting needs `updatedAt`, lookups need `fingerprint`, and `id` must be the file name or a later save would write a second file. */
+async function readCandidate(path: string): Promise<Candidate> {
+  const value = await readJson<Record<string, unknown>>(path);
+  for (const field of ['id', 'fingerprint', 'status', 'updatedAt']) {
+    if (typeof value[field] !== 'string') throw new Error(`${resolve(path)} is not a candidate: ${field} must be a string`);
+  }
+  if (value.id !== basename(path, '.json')) throw new Error(`${resolve(path)} is not a candidate: id ${JSON.stringify(value.id)} does not match the file name`);
+  return value as unknown as Candidate;
+}
+
+/**
+ * The JSON text of a value with every object's keys sorted: what would be written to disk, minus the key order.
+ * `undefined` fields drop out as they do when writing, so an optional field that is `undefined` equals an absent one,
+ * and the same data with its keys in another order is the same data.
+ */
+const canonical = (value: unknown): string | undefined => JSON.stringify(value, (_key, v: unknown) =>
+  v !== null && typeof v === 'object' && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : v);
+const sameJson = (a: unknown, b: unknown): boolean => canonical(a) === canonical(b);
 
 /** Checkpoint names become keys in state.json and values are tags, versions or hashes, so both are held to a plain single-line shape. */
 const CHECKPOINT_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
@@ -39,7 +58,10 @@ function checkCheckpointValue(name: string, value: string): void {
     `Invalid value for checkpoint ${name}: expected a non-empty single line of at most 512 characters without control characters`);
 }
 
-/** One directory, one JSON file per candidate, one state.json for checkpoints. No locks: one Host owns the directory. */
+/** Candidate files are read this many at a time, so a big directory cannot run into the open-file limit. */
+const READ_BATCH = 64;
+
+/** One directory, one JSON file per candidate, one state.json for checkpoints. No locks: one Host owns the directory, and the write queue lives in the instance, so open one instance per directory per process (two instances do not serialize against each other). */
 export class CandidateStore {
   private queue: Promise<unknown> = Promise.resolve();
   constructor(readonly directory: string, private readonly now: () => Date = () => new Date()) {}
@@ -52,14 +74,17 @@ export class CandidateStore {
   async list(filter: { status?: Status; source?: Source } = {}): Promise<Candidate[]> {
     await mkdir(this.candidatesDir, { recursive: true, mode: 0o700 });
     const files = (await readdir(this.candidatesDir)).filter(name => name.endsWith('.json'));
-    const items = await Promise.all(files.map(name => readJson<Candidate>(join(this.candidatesDir, name))));
+    const items: Candidate[] = [];
+    for (let start = 0; start < files.length; start += READ_BATCH) {
+      items.push(...await Promise.all(files.slice(start, start + READ_BATCH).map(name => readCandidate(join(this.candidatesDir, name)))));
+    }
     return items.filter(c => (!filter.status || c.status === filter.status) && (!filter.source || c.source === filter.source))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
   /** Throws a ValidationError for a malformed or unknown id, and an Error naming the file when that file is damaged. */
   async get(id: string): Promise<Candidate> {
     check(/^[0-9a-f-]{36}$/.test(id), 'candidate id must be a UUID');
-    try { return await readJson<Candidate>(join(this.candidatesDir, `${id}.json`)); }
+    try { return await readCandidate(join(this.candidatesDir, `${id}.json`)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new ValidationError(`Unknown candidate ${id}`); throw error; }
   }
   async findByFingerprint(fingerprint: string): Promise<Candidate | undefined> {
@@ -90,7 +115,9 @@ export class CandidateStore {
     return this.serial(async () => {
       const current = await this.get(id);
       // The callback gets a copy, so mutating its argument in place cannot hide a change from the comparisons below.
-      const next = { ...update(structuredClone(current)), updatedAt: this.now().toISOString() };
+      const updated: unknown = update(structuredClone(current));
+      check(typeof updated === 'object' && updated !== null && !Array.isArray(updated) && typeof (updated as { then?: unknown }).then !== 'function', 'patch callback must return the updated candidate synchronously');
+      const next = { ...(updated as Candidate), updatedAt: this.now().toISOString() };
       for (const field of ['id', 'fingerprint', 'source', 'createdAt'] as const) check(next[field] === current[field], `patch must not change the candidate ${field}`);
       if (next.status !== current.status) check(canTransition(current.status, next.status), `Invalid transition ${current.status} -> ${next.status}`);
       await this.save(next);
