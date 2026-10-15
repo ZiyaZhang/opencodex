@@ -26,6 +26,9 @@ async function readJson<T extends object>(path: string): Promise<T> {
   return value as T;
 }
 
+/** JSON text is what ends up on disk, so comparing it treats an `undefined` optional field the same as an absent one. */
+const sameJson = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+
 /** Checkpoint names become keys in state.json and values are tags, versions or hashes, so both are held to a plain single-line shape. */
 const CHECKPOINT_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 function checkCheckpointName(name: string): void {
@@ -62,13 +65,16 @@ export class CandidateStore {
   async findByFingerprint(fingerprint: string): Promise<Candidate | undefined> {
     return (await this.list()).find(c => c.fingerprint === fingerprint);
   }
-  /** Insert or refresh by fingerprint; `created` lets collectors count genuinely new candidates. */
+  /** Insert or refresh by fingerprint; `created` lets collectors count genuinely new candidates. A refresh that would change nothing is skipped, so `updatedAt` moves only when the content does. */
   upsert(input: UpsertInput): Promise<{ candidate: Candidate; created: boolean }> {
     return this.serial(async () => {
       const fingerprint = fingerprintOf(input.source, input.key);
-      const at = this.now().toISOString();
       const existing = await this.findByFingerprint(fingerprint);
       const releaseWindow = input.window ?? existing?.window;
+      if (existing && existing.title === input.title && existing.summary === input.summary && sameJson(existing.evidence, input.evidence) && sameJson(existing.window, releaseWindow)) {
+        return { candidate: existing, created: false };
+      }
+      const at = this.now().toISOString();
       const candidate: Candidate = existing
         ? { ...existing, title: input.title, summary: input.summary, evidence: input.evidence, ...(releaseWindow && { window: releaseWindow }), updatedAt: at }
         : { id: randomUUID(), fingerprint, source: input.source, title: input.title, summary: input.summary, evidence: input.evidence, ...(releaseWindow && { window: releaseWindow }), status: 'new', createdAt: at, updatedAt: at };
