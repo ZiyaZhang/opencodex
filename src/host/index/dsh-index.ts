@@ -22,6 +22,8 @@ const TEXT_LIMIT = 1_500;
 const NOTE_STATUSES = ['implemented', 'proposed'];
 const TITLE_WEIGHT = 3;
 const TEXT_WEIGHT = 1;
+/** Every note title opens with this; left in, it would make `agent` and `note` match all of them. */
+const NOTE_PREFIX = /^Agent Note:\s*/i;
 const CATALOG_PATH = 'docs/config-catalog.md';
 const PACKAGE_NAME = /^@[\w.-]+\/[\w.-]+$/;
 
@@ -179,7 +181,8 @@ export async function buildDshIndex(mirror: string): Promise<DshIndex> {
       if (markdown === undefined) continue;
       const doc = parseMarkdown(markdown);
       const path = relPath(file);
-      entries.push({ kind: 'note', id: path, title: titleOf(doc, path), path, text: clip(textBetween(doc, doc.start, doc.lines.length), TEXT_LIMIT) });
+      const title = titleOf(doc, path);
+      entries.push({ kind: 'note', id: path, title: title.replace(NOTE_PREFIX, '') || title, path, text: clip(textBetween(doc, doc.start, doc.lines.length), TEXT_LIMIT) });
     }
   }
 
@@ -240,19 +243,25 @@ function fieldsOf(entry: IndexEntry) {
 const hasTerm = (field: Field, term: string) => (CJK.test(term) ? field.cjk.some(run => run.includes(term)) : field.words.has(term));
 
 /**
- * Each query word scores 3 when it is a whole word of the entry title and 1 when it is a whole word of the text.
- * `kind` limits the search to one kind before ranking. Best `limit` entries first; equal scores order by path, then id.
+ * A query word is worth more the fewer entries of the whole index hold it: its weight is ln(1 + entries / holders), so `tools`, a word of
+ * 33 package titles, counts for less than `worktree`, a word of five entries. The word then scores 3 times its weight as a whole word of
+ * the entry title and 1 times it as a whole word of the text. The weights come from the whole index whatever `kind` limits the ranking
+ * to, so the filter never reorders what it keeps. Best `limit` entries first; equal scores order by path, then id.
  */
 export function searchIndex(index: DshIndex, query: string, limit = 5, kind?: IndexEntry['kind']): IndexEntry[] {
   const terms = termsOf(query);
   if (terms.length === 0 || !(limit >= 1)) return [];
-  const hits: { entry: IndexEntry; score: number }[] = [];
-  for (const entry of index.entries) {
-    if (kind && entry.kind !== kind) continue;
+  const points = index.entries.map(entry => {
     const { title, text } = fieldsOf(entry);
-    const score = terms.reduce((sum, term) => sum + (hasTerm(title, term) ? TITLE_WEIGHT : 0) + (hasTerm(text, term) ? TEXT_WEIGHT : 0), 0);
+    return terms.map(term => (hasTerm(title, term) ? TITLE_WEIGHT : 0) + (hasTerm(text, term) ? TEXT_WEIGHT : 0));
+  });
+  const weights = terms.map((_, i) => Math.log(1 + index.entries.length / Math.max(1, points.filter(row => row[i]! > 0).length)));
+  const hits: { entry: IndexEntry; score: number }[] = [];
+  index.entries.forEach((entry, i) => {
+    if (kind && entry.kind !== kind) return;
+    const score = points[i]!.reduce((sum, earned, j) => sum + earned * weights[j]!, 0);
     if (score > 0) hits.push({ entry, score });
-  }
+  });
   hits.sort((a, b) => b.score - a.score || compare(a.entry.path, b.entry.path) || compare(a.entry.id, b.entry.id));
   return hits.slice(0, limit).map(hit => hit.entry);
 }

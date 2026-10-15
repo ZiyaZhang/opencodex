@@ -87,7 +87,7 @@ test('package text is its description plus Summary; config and note text drop th
   assert.doesNotMatch(config.text, /<!--|<a id|dsh-agent-loop/); // the next section's BEGIN marker trails this one in the file
   assert.match(config.text, /^- `inject`: `fs` · `sandbox` - `source`: \[`packages\/experimental\/worktree\/src\/index\.ts:30`\]/);
   const sample = find('note', '.agents/notes/implemented/feature/2026-01-01-sample.md');
-  assert.equal(sample.title, 'Agent Note: Sample decision record'); // implemented or proposed is in the path, not in the title
+  assert.equal(sample.title, 'Sample decision record'); // neither the "Agent Note:" prefix nor implemented/proposed is part of the title
   assert.equal(sample.text, '## Problem A sample note for the index tests.');
 });
 
@@ -255,10 +255,49 @@ test('query words match whole words only; stopwords, numbers and the package sco
   assert.deepEqual(searchIndex(dated, '2026 release').map(e => e.id), ['n']);
 });
 
-test('managed worktree tools ranks the worktree package first among the packages', async () => {
-  const index = await buildDshIndex(mirror);
-  // The title says worktree and the description repeats it, which lifts the package above the one whose title merely says tools.
-  assert.deepEqual(searchIndex(index, 'managed worktree tools', 5, 'package').map(e => e.id), ['packages/experimental/worktree', 'packages/core/tools', 'packages/subagent/subagent-codex']);
+test('a word found in many titles does not outrank a rare word: managed worktree tools puts the worktree package first among the packages', async () => {
+  // Like the real mirror, where 33 package titles say "tool": here 12 of 14 packages do, and each also repeats it in its text and says "managed".
+  const common = Object.fromEntries(Array.from({ length: 12 }, (_, i) => [
+    `packages/shell/tool-${i}/README.md`,
+    `---\ndescription: "Run command ${i} as a tool."\n---\n\n# @deepseek-ai/dsh-tool-${i}\n\n## Summary\n\nRuns one managed command per call.\n`,
+  ]));
+  await withMirror({
+    ...common,
+    'packages/core/tools/README.md': '# @deepseek-ai/dsh-tools\n\n## Summary\n\nDeclares every capability once.\n',
+    'packages/experimental/worktree/README.md': '---\ndescription: "Create and enter a retained Git worktree."\n---\n\n# @deepseek-ai/dsh-experimental-worktree\n\n## Summary\n\nCreate an isolated checkout from a local commit.\n',
+  }, async dir => {
+    const ids = searchIndex(await buildDshIndex(dir), 'managed worktree tools', 20, 'package').map(e => e.id);
+    // Counting hits alone, each tool package scores 5 (title 3, "tool" in the text 1, "managed" 1) against the worktree package's 4.
+    assert.equal(ids[0], 'packages/experimental/worktree');
+    assert.equal(ids.length, 14);
+    assert.equal(ids.at(-1), 'packages/core/tools'); // a title hit and nothing else
+  });
+});
+
+test('rarity is counted over the whole index, so the kind filter keeps the order the full ranking gives', () => {
+  const index = indexOf(
+    entry('package', 'packages/a/p1', 'Alpha', '', 'packages/a/p1/README.md'),
+    entry('package', 'packages/b/p2', 'Beta', '', 'packages/b/p2/README.md'),
+    ...[1, 2, 3, 4, 5].map(i => note(`n${i}`, 'Filler', 'alpha')), // alpha is common in the index as a whole, beta is not
+  );
+  // Among the two packages alone alpha and beta would weigh the same and the path would decide (p1 first).
+  assert.deepEqual(searchIndex(index, 'alpha beta', 10, 'package').map(e => e.id), ['packages/b/p2', 'packages/a/p1']);
+  assert.deepEqual(searchIndex(index, 'alpha beta', 10).filter(e => e.kind === 'package').map(e => e.id), ['packages/b/p2', 'packages/a/p1']);
+});
+
+test('the "Agent Note:" every note title opens with is not part of the title', async () => {
+  await withMirror({
+    '.agents/notes/implemented/feature/a.md': '# Agent Note: Strip me\n',
+    '.agents/notes/implemented/feature/b.md': '# agent note:   lower case\n',
+    '.agents/notes/implemented/feature/c.md': '# Agent Note:\n',
+    '.agents/notes/implemented/feature/d.md': '# Agent Notes on retries\n',
+    '.agents/notes/implemented/feature/e.md': '# Not an Agent Note: really\n',
+  }, async dir => {
+    const index = await buildDshIndex(dir);
+    assert.deepEqual(index.entries.map(e => e.title), ['Strip me', 'lower case', 'Agent Note:', 'Agent Notes on retries', 'Not an Agent Note: really']);
+    // Only the titles that still say it match, not every note.
+    assert.deepEqual(searchIndex(index, 'note', 10).map(e => e.title), ['Agent Note:', 'Agent Notes on retries', 'Not an Agent Note: really']);
+  });
 });
 
 test('mixed-script queries split at script boundaries, punctuation and CamelCase, and entries are indexed both whole and split', () => {
@@ -281,9 +320,11 @@ test('mixed-script queries split at script boundaries, punctuation and CamelCase
 });
 
 test('a title hit weighs 3 and a text hit 1; ties break by path, then id, whatever the insertion order', () => {
-  const byTitle = note('title', 'Alpha', 'unrelated');
-  const byText = note('text', 'Unrelated', 'alpha beta'); // two text hits (2) still lose to one title hit (3)
-  assert.deepEqual(searchIndex(indexOf(byText, byTitle), 'alpha beta').map(e => e.id), ['title', 'text']);
+  // alpha and beta are each held by two of the three entries, so they weigh the same and only the 3:1 ratio decides.
+  const alphaTitle = note('a', 'Alpha', 'filler');
+  const betaTitle = note('b', 'Beta', 'filler');
+  const bothInText = note('c', 'Other', 'alpha beta'); // two text hits (2) still lose to one title hit (3)
+  assert.deepEqual(searchIndex(indexOf(bothInText, betaTitle, alphaTitle), 'alpha beta').map(e => e.id), ['a', 'b', 'c']);
   const tied = [note('a', 'Tie', '', 'b.md'), note('z', 'Tie', '', 'a.md'), note('y2', 'Tie', '', 'c.md'), note('y1', 'Tie', '', 'c.md')];
   assert.deepEqual(searchIndex(indexOf(...tied), 'tie').map(e => e.id), ['z', 'a', 'y1', 'y2']); // path first (z is at a.md), id only within one path
   assert.deepEqual(searchIndex(indexOf(...[...tied].reverse()), 'tie').map(e => e.id), ['z', 'a', 'y1', 'y2']);
