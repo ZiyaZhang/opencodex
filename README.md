@@ -2,9 +2,9 @@
 
 DeepSeek Harness（DSH）的第三方插件：每天收集 Codex 的更新，对照 DSH 源码写差距报告，再把选中的报告交给 DSH 创造模式会话去实现。
 
-<!-- ![候选页，DSH 启动后还没有检查](docs/images/01-page.png) -->
-<!-- ![检查后的候选列表](docs/images/02-after-check.png) -->
-<!-- ![候选详情：协议类型变化的证据](docs/images/03-detail.png) -->
+![候选页，DSH 启动后还没有检查](docs/images/01-page.png)
+![检查后的候选列表](docs/images/02-after-check.png)
+![候选详情：协议类型变化的证据](docs/images/03-detail.png)
 
 ## 安装
 
