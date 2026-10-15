@@ -2,14 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { Candidate } from '../src/core/candidate.ts';
+import type { Candidate, Evidence } from '../src/core/candidate.ts';
+import { ValidationError } from '../src/core/check.ts';
 import { GitHubError } from '../src/host/github.ts';
-import { buildDshIndex, type DshIndex, type IndexEntry } from '../src/host/index/dsh-index.ts';
+import { buildDshIndex, searchIndex, type DshIndex, type IndexEntry } from '../src/host/index/dsh-index.ts';
 import { buildEvidencePack, diffsFor, dshHitsFor, queryForCandidate, rankDiffFiles, type DiffFile } from '../src/host/report/evidence-pack.ts';
 
 const mirror = fileURLToPath(new URL('./fixtures/mirror/', import.meta.url));
+const GAP = String.fromCharCode(0x3000);
 const candidateOf = (fields: Partial<Candidate>): Candidate => ({
   id: 'c', fingerprint: 'codex-release:x', source: 'codex-release', title: 'T', summary: 'S', status: 'new',
   createdAt: '2026-10-15T00:00:00.000Z', updatedAt: '2026-10-15T00:00:00.000Z', evidence: [], ...fields,
@@ -19,6 +21,17 @@ const offline = { pullRequestDiff: async (): Promise<string> => { throw new Erro
 async function withTempDir(run: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), 'oc-pack-'));
   try { await run(dir); } finally { await rm(dir, { recursive: true, force: true }); }
+}
+/** One `diff --git` section that adds `lines` to `path`. */
+const section = (path: string, ...lines: string[]) =>
+  [`diff --git a/${path} b/${path}`, 'index 1111111..2222222 100644', `--- a/${path}`, `+++ b/${path}`, `@@ -1 +1,${lines.length + 1} @@`, ' context', ...lines.map(line => `+${line}`), ''].join('\n');
+/** The `- ` lines of one INDEX.md section, up to the next heading. */
+function listOf(index: string, heading: string): string[] {
+  const start = index.indexOf(`\n${heading}\n`);
+  if (start < 0) return [];
+  const body = index.slice(start + heading.length + 2);
+  const end = body.search(/^## /m);
+  return (end < 0 ? body : body.slice(0, end)).split('\n').filter(line => line.startsWith('- '));
 }
 
 test('rankDiffFiles prefers source over tests and caps total size', () => {
@@ -39,6 +52,37 @@ test('buildEvidencePack writes INDEX.md, sources and dsh hits', async () => {
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test('rankDiffFiles passes over a file that does not fit and keeps trying, smaller files first within a weight', () => {
+  const file = (path: string, size: number): DiffFile => ({ path, diff: 'x'.repeat(size) });
+  const { kept, dropped } = rankDiffFiles([file('a.rs', 50), file('b.rs', 30), file('c.rs', 80), file('d.md', 15), file('e.md', 40)], 100);
+  assert.deepEqual(kept.map(f => f.path), ['b.rs', 'a.rs', 'd.md']); // c.rs does not fit after b.rs and a.rs; d.md still does
+  assert.deepEqual(dropped.map(f => f.path), ['c.rs', 'e.md']);
+});
+
+test('rankDiffFiles never keeps tests: test directories, Rust test modules, __tests__, spec files and snapshots', () => {
+  const tests = [
+    'codex-rs/tui/src/app/tests.rs', 'codex-rs/core/src/exec_test.rs', 'codex-rs/core/src/exec_tests.rs', 'codex-rs/core/tests/suite/exec.rs',
+    'codex-cli/src/__tests__/cli.ts', 'sdk/typescript/src/thread.spec.ts', 'sdk/typescript/src/thread.test.ts',
+    'codex-rs/tui/src/snapshots/codex_tui__app.snap', 'codex-rs/tui/src/chat.snap',
+  ];
+  const sources = ['codex-rs/tui/src/managed_worktree_tools.rs', 'codex-rs/core/src/contests.rs'];
+  const { kept, dropped } = rankDiffFiles([...tests, ...sources].map(path => ({ path, diff: '+x' })), 1_000);
+  assert.deepEqual(kept.map(f => f.path), sources);
+  assert.deepEqual(dropped.map(f => f.path), tests);
+  // PRs #50434 and #50209 change the sibling test module app/tests.rs: it must not take the place of the source next to it.
+  assert.deepEqual(rankDiffFiles([{ path: tests[0]!, diff: 'a'.repeat(10) }, { path: sources[0]!, diff: 'b'.repeat(20) }], 25).kept.map(f => f.path), [sources[0]]);
+});
+
+test('rankDiffFiles cuts a line list that does not fit at a line boundary, and drops it when not even its first line fits', () => {
+  const list: DiffFile = { path: 'codex-rs/features/src/lib.rs', diff: ['+one', '+two', '+three'].join('\n') };
+  const { kept, cut, dropped } = rankDiffFiles([list], 10, { cutLines: true });
+  assert.deepEqual(kept, [{ ...list, diff: '+one\n+two' }]);
+  assert.deepEqual(cut, [list]);
+  assert.deepEqual(dropped, []);
+  assert.deepEqual(rankDiffFiles([list], 3, { cutLines: true }).dropped, [list]);
+  assert.deepEqual(rankDiffFiles([list], 10).dropped, [list]); // a diff is never cut
+});
+
 test('queryForCandidate takes title, summary and every evidence ref except pull request numbers', () => {
   const query = queryForCandidate(candidateOf({
     title: 'Quick chat window', summary: 'codex.quickChat.open: 打开快速聊天',
@@ -48,11 +92,19 @@ test('queryForCandidate takes title, summary and every evidence ref except pull 
       { kind: 'doc', ref: 'docs/quick-chat.md', excerpt: 'Quick chat opens with Ctrl+K' },
     ],
   }));
-  assert.match(query, /^Quick chat window codex\.quickChat\.open/);
-  assert.doesNotMatch(query, /50148/);
-  assert.match(query, / codex\.quickChat\.open docs\/quick-chat\.md$/);
-  assert.doesNotMatch(query, /\p{Script=Han}/u); // the index is English: Chinese text cannot match and would only take room under the cap
+  assert.equal(query, 'Quick chat window quickChat.open: quickChat.open docs/quick-chat.md'); // no #50148, no Chinese the English index cannot match
   assert.equal(queryForCandidate(candidateOf({ title: 'Quick chat', summary: 'Quick chat' })), 'Quick chat'); // a release title is its summary
+});
+
+test('queryForCandidate leaves out the word codex, so the DSH hits follow the feature and not the Codex adapters', async () => {
+  const query = queryForCandidate(candidateOf({
+    title: 'Codex adds managed worktrees', summary: 'CodexThread and openCodexApp keep CODEX_HOME in codex_core',
+    evidence: [{ kind: 'i18n', ref: 'codex.quickChat.open' }, { kind: 'doc', ref: 'codex-rs/tui/src/managed_worktree_tools.rs' }],
+  }));
+  assert.equal(query, 'adds managed worktrees Thread and openApp keep _HOME in _core quickChat.open tui/src/managed_worktree_tools.rs');
+  const index = await buildDshIndex(mirror);
+  assert.equal(searchIndex(index, 'Codex adds managed worktrees', 1, 'package')[0]?.path, 'packages/subagent/subagent-codex/README.md'); // what the word did
+  assert.equal(dshHitsFor(index, candidateOf({ title: 'Codex adds managed worktrees' }))[0]?.path, 'packages/experimental/worktree/README.md');
 });
 
 test('queryForCandidate stops at 2,000 characters on a word boundary', () => {
@@ -110,7 +162,7 @@ const QUICK_CHAT_DIFF = [
   '',
 ].join('\n');
 
-test('diffsFor splits each pull request diff into files and reports a pull request whose diff fails', async () => {
+test('diffsFor splits each pull request diff into files tagged with the pull request, asks each once and reports one that fails', async () => {
   const asked: number[] = [];
   const github = {
     async pullRequestDiff(number: number): Promise<string> {
@@ -120,30 +172,81 @@ test('diffsFor splits each pull request diff into files and reports a pull reque
     },
   };
   const errors: string[] = [];
-  const candidate = candidateOf({ evidence: [{ kind: 'pr', ref: '#1', excerpt: 'Quick chat' }, { kind: 'pr', ref: '#2' }] });
+  const candidate = candidateOf({ evidence: [{ kind: 'pr', ref: '#1', excerpt: 'Quick chat' }, { kind: 'pr', ref: '#2' }, { kind: 'pr', ref: '#1' }] });
   const files = await diffsFor(candidate, { github, snapshotDir: '/nonexistent', onError: message => errors.push(message) });
   assert.deepEqual(asked, [1, 2]);
-  assert.deepEqual(files.map(f => f.path), ['codex-rs/tui/src/quick_chat.rs', 'docs/config.md']);
+  assert.deepEqual(files.map(f => [f.path, f.source]), [['codex-rs/tui/src/quick_chat.rs', '#1'], ['docs/config.md', '#1']]);
   assert.ok(files[0]!.diff.startsWith('diff --git a/codex-rs/tui/src/quick_chat.rs '));
   assert.match(files[0]!.diff, /^\+pub fn open_quick_chat/m);
   assert.match(files[1]!.diff, /^\+quick_chat = true$/m);
   assert.equal(files.map(f => f.diff).join(''), QUICK_CHAT_DIFF); // whole sections: nothing lost, nothing repeated
-  assert.equal(errors.length, 1);
-  assert.match(errors[0]!, /#2.*404/);
+  assert.deepEqual(errors, ['no diff for #2: GitHub HTTP 404 for repos/openai/codex/pulls/2: Not Found']);
 });
 
-test('diffsFor names a renamed file by its new path and keeps a path with spaces whole', async () => {
+test('diffsFor reports a pull request whose answer holds no diff', async () => {
+  const errors: string[] = [];
+  const files = await diffsFor(candidateOf({ evidence: [{ kind: 'pr', ref: '#5' }] }), { github: { pullRequestDiff: async () => '' }, snapshotDir: '/nonexistent', onError: message => errors.push(message) });
+  assert.deepEqual(files, []);
+  assert.deepEqual(errors, ['no diff for #5: the response holds no "diff --git" header']);
+});
+
+test('diffsFor asks no more pull requests after a rate limit and reports each one left', async () => {
+  const asked: number[] = [];
+  const github = {
+    async pullRequestDiff(number: number): Promise<string> {
+      asked.push(number);
+      if (number === 2) throw new GitHubError('GitHub HTTP 403 for repos/openai/codex/pulls/2: API rate limit exceeded', 'repos/openai/codex/pulls/2', { status: 403, rateLimited: true });
+      return section(`docs/${number}.md`, 'x');
+    },
+  };
+  const errors: string[] = [];
+  const candidate = candidateOf({ evidence: [1, 2, 3, 4].map(n => ({ kind: 'pr' as const, ref: `#${n}` })) });
+  const files = await diffsFor(candidate, { github, snapshotDir: '/nonexistent', onError: message => errors.push(message) });
+  assert.deepEqual(asked, [1, 2]);
+  assert.deepEqual(files.map(f => f.path), ['docs/1.md']);
+  assert.deepEqual(errors, [
+    'no diff for #2: GitHub HTTP 403 for repos/openai/codex/pulls/2: API rate limit exceeded',
+    'no diff for #3: not asked after the GitHub rate limit',
+    'no diff for #4: not asked after the GitHub rate limit',
+  ]);
+});
+
+test('diffsFor rethrows an abort instead of reporting it', async () => {
+  const controller = new AbortController();
+  const errors: string[] = [];
+  const github = {
+    async pullRequestDiff(_number: number, signal?: AbortSignal): Promise<string> {
+      controller.abort();
+      signal?.throwIfAborted();
+      return '';
+    },
+  };
+  const candidate = candidateOf({ evidence: [{ kind: 'pr', ref: '#1' }, { kind: 'pr', ref: '#2' }] });
+  await assert.rejects(diffsFor(candidate, { github, snapshotDir: '/nonexistent', onError: message => errors.push(message) }, controller.signal), { name: 'AbortError' });
+  assert.deepEqual(errors, []);
+});
+
+test('diffsFor takes a renamed file from its rename line and reads git-quoted paths', async () => {
   const diff = [
-    'diff --git a/codex-rs/core/src/old_name.rs b/codex-rs/core/src/new_name.rs',
-    'similarity index 92%',
-    'rename from codex-rs/core/src/old_name.rs',
-    'rename to codex-rs/core/src/new_name.rs',
+    'diff --git a/docs/a b/x.md b/docs/new.md', // the old path holds " b/", so the header alone splits wrong
+    'similarity index 90%',
+    'rename from docs/a b/x.md',
+    'rename to docs/new.md',
+    'diff --git "a/docs/\\344\\270\\255.md" "b/docs/\\344\\270\\255.md"',
     'index 1111111..2222222 100644',
-    '--- a/codex-rs/core/src/old_name.rs',
-    '+++ b/codex-rs/core/src/new_name.rs',
+    '--- "a/docs/\\344\\270\\255.md"',
+    '+++ "b/docs/\\344\\270\\255.md"',
     '@@ -1 +1 @@',
-    '-old',
-    '+new',
+    '-a',
+    '+b',
+    'diff --git "a/docs/\\346\\226\\207.md" b/docs/plain.md',
+    'similarity index 100%',
+    'rename from "docs/\\346\\226\\207.md"',
+    'rename to docs/plain.md',
+    'diff --git a/docs/plain.md "b/docs/\\346\\226\\207 \\"2\\".md"',
+    'similarity index 100%',
+    'rename from docs/plain.md',
+    'rename to "docs/\\346\\226\\207 \\"2\\".md"',
     'diff --git a/docs/a b/c.md b/docs/a b/c.md',
     'index 3333333..4444444 100644',
     '--- a/docs/a b/c.md',
@@ -154,7 +257,7 @@ test('diffsFor names a renamed file by its new path and keeps a path with spaces
     '',
   ].join('\n');
   const files = await diffsFor(candidateOf({ evidence: [{ kind: 'pr', ref: '#3' }] }), { github: { pullRequestDiff: async () => diff }, snapshotDir: '/nonexistent' });
-  assert.deepEqual(files.map(f => f.path), ['codex-rs/core/src/new_name.rs', 'docs/a b/c.md']);
+  assert.deepEqual(files.map(f => f.path), ['docs/new.md', 'docs/中.md', 'docs/plain.md', 'docs/文 "2".md', 'docs/a b/c.md']);
 });
 
 const LIB = 'codex-rs/features/src/lib.rs', LEGACY = 'codex-rs/features/src/legacy.rs';
@@ -166,7 +269,7 @@ const filesCandidate = (fields: Partial<Candidate>) => candidateOf({
   source: 'codex-files', fingerprint: 'codex-files:feature-flags:0.161', evidence: [LIB, LEGACY, 'codex-rs/features/src/old.rs'].map(ref => ({ kind: 'feature-flag' as const, ref })), ...fields,
 });
 
-test('diffsFor gives a codex-files candidate the added lines of its own files and reports a file whose content is unknown', async () => {
+test('diffsFor gives a codex-files candidate the added lines of its own files, tagged with their window, and reports what it could not read', async () => {
   await withTempDir(async dir => {
     await writeSnapshot(dir, 'rust-v0.160.0', 'rust-v0.161.0', [
       { path: LIB, status: 'modified', added: ['    QuickChat,', '    ManagedWorktrees,'] },
@@ -177,34 +280,57 @@ test('diffsFor gives a codex-files candidate the added lines of its own files an
     const candidate = filesCandidate({ window: { fromTag: 'rust-v0.160.0', toTag: 'rust-v0.161.0' } });
     const errors: string[] = [];
     const deps = { github: offline, snapshotDir: dir, onError: (message: string) => errors.push(message) };
-    assert.deepEqual(await diffsFor(candidate, deps), [{ path: LIB, diff: '+    QuickChat,\n+    ManagedWorktrees,' }]);
-    assert.deepEqual(errors, [`unknown content: ${LEGACY}`]); // unread is unknown, not empty
+    assert.deepEqual(await diffsFor(candidate, deps), [{ path: LIB, diff: '+    QuickChat,\n+    ManagedWorktrees,', source: 'rust-v0.160.0__rust-v0.161.0' }]);
+    // unread is unknown, not empty: the reason goes with it
+    assert.deepEqual(errors, [`unknown content: ${LEGACY} in rust-v0.160.0__rust-v0.161.0: GitHub HTTP 500 for repos/openai/codex/contents/codex-rs/features/src/legacy.rs`]);
     errors.length = 0;
-    assert.deepEqual(await diffsFor(candidate, { ...deps, snapshotDir: join(dir, 'missing') }), []); // no snapshot directory yet
-    assert.deepEqual(errors, []);
+    assert.deepEqual(await diffsFor(candidate, { ...deps, snapshotDir: join(dir, 'missing') }), []);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0]!, /^no added lines for c: no snapshot directory /);
   });
 });
 
-test('diffsFor merges the snapshots of every window in the candidate range in version order, each line once', async () => {
+test('diffsFor merges the snapshots of the windows in the candidate range by version, not by name, each line once', async () => {
   await withTempDir(async dir => {
-    await writeSnapshot(dir, 'rust-v0.161.1', 'rust-v0.161.2', [{ path: LIB, status: 'modified', added: ['Before,'] }]); // ends where the candidate starts
-    await writeSnapshot(dir, 'rust-v0.161.2', 'rust-v0.161.9', [
+    await writeSnapshot(dir, 'rust-v0.161.8', 'rust-v0.161.9', [{ path: LIB, status: 'modified', added: ['Before,'] }]); // ends where the candidate starts
+    await writeSnapshot(dir, 'rust-v0.161.9', 'rust-v0.161.10', [
       { path: LIB, status: 'modified', added: ['A,', 'B,'] },
       { path: LEGACY, status: 'modified', added: [], error: 'GitHub HTTP 500' },
     ]);
-    await writeSnapshot(dir, 'rust-v0.161.9', 'rust-v0.161.10', [{ path: LIB, status: 'modified', added: ['B,', 'C,'] }, { path: LEGACY, status: 'modified', added: ['L,'] }]);
-    await writeSnapshot(dir, 'rust-v0.161.10', 'rust-v0.162.0', [{ path: LIB, status: 'modified', added: ['Next,'] }]);
+    await writeSnapshot(dir, 'rust-v0.161.10', 'rust-v0.161.11', [{ path: LIB, status: 'modified', added: ['B,', 'C,'] }, { path: LEGACY, status: 'modified', added: ['L,'] }]);
+    await writeSnapshot(dir, 'rust-v0.161.11', 'rust-v0.162.0', [{ path: LIB, status: 'modified', added: ['Next,'] }]);
     await writeFile(join(dir, 'codex-files', 'notes.json'), '{}'); // not a snapshot name
+    assert.ok('rust-v0.161.10__rust-v0.161.11.json' < 'rust-v0.161.9__rust-v0.161.10.json'); // by name the later window comes first
     const errors: string[] = [];
     const deps = { github: offline, snapshotDir: dir, onError: (message: string) => errors.push(message) };
-    // 0.161.10 sorts before 0.161.9 as text; by version it is the later window.
-    const candidate = filesCandidate({ window: { fromTag: 'rust-v0.161.2', toTag: 'rust-v0.161.10' } });
-    assert.deepEqual(await diffsFor(candidate, deps), [{ path: LIB, diff: '+A,\n+B,\n+C,' }, { path: LEGACY, diff: '+L,' }]);
-    assert.deepEqual(errors, [`unknown content: ${LEGACY}`]);
-    // Without a window the fingerprint's minor version picks the snapshots: every window that ends in 0.161.
+    const candidate = filesCandidate({ window: { fromTag: 'rust-v0.161.9', toTag: 'rust-v0.161.11' } });
+    assert.deepEqual(await diffsFor(candidate, deps), [
+      { path: LIB, diff: '+A,\n+B,\n+C,', source: 'rust-v0.161.9__rust-v0.161.11' },
+      { path: LEGACY, diff: '+L,', source: 'rust-v0.161.10__rust-v0.161.11' },
+    ]);
+    assert.deepEqual(errors, [`unknown content: ${LEGACY} in rust-v0.161.9__rust-v0.161.10: GitHub HTTP 500`]);
+    // Without a window the version that ends the fingerprint picks: a minor every window ending in it, a full version the one window ending at it.
+    const linesOf = (files: DiffFile[]) => files.map(f => [f.path, f.diff]);
+    assert.deepEqual(linesOf(await diffsFor({ ...candidate, window: undefined }, deps)), [[LIB, '+Before,\n+A,\n+B,\n+C,'], [LEGACY, '+L,']]);
+    assert.deepEqual(linesOf(await diffsFor({ ...candidate, window: undefined, fingerprint: 'codex-files:feature-flags:0.161.11' }, deps)), [[LIB, '+B,\n+C,'], [LEGACY, '+L,']]);
+  });
+});
+
+test('diffsFor reports a damaged snapshot, a candidate it cannot place and a range no snapshot covers', async () => {
+  await withTempDir(async dir => {
+    await writeSnapshot(dir, 'rust-v0.160.0', 'rust-v0.161.0', [{ path: LIB, status: 'modified', added: ['A,'] }]);
+    await writeFile(join(dir, 'codex-files', 'rust-v0.161.0__rust-v0.161.1.json'), '{ not json');
+    const errors: string[] = [];
+    const deps = { github: offline, snapshotDir: dir, onError: (message: string) => errors.push(message) };
+    assert.deepEqual((await diffsFor(filesCandidate({ window: { fromTag: 'rust-v0.160.0', toTag: 'rust-v0.161.1' } }), deps)).map(f => f.path), [LIB]);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0]!, /^damaged codex-files snapshot rust-v0\.161\.0__rust-v0\.161\.1\.json: /);
     errors.length = 0;
-    assert.deepEqual(await diffsFor({ ...candidate, window: undefined }, deps), [{ path: LIB, diff: '+Before,\n+A,\n+B,\n+C,' }, { path: LEGACY, diff: '+L,' }]);
-    assert.deepEqual(errors, [`unknown content: ${LEGACY}`]);
+    assert.deepEqual(await diffsFor(filesCandidate({ fingerprint: 'codex-files:feature-flags' }), deps), []);
+    assert.deepEqual(await diffsFor(filesCandidate({ window: { fromTag: 'rust-v0.162.0', toTag: 'rust-v0.162.1' } }), deps), []);
+    assert.equal(errors.length, 2);
+    assert.match(errors[0]!, /^no added lines for c: it has neither a tag window nor a version/);
+    assert.match(errors[1]!, /^no added lines for c: no snapshot of the windows after rust-v0\.162\.0 up to rust-v0\.162\.1$/);
   });
 });
 
@@ -216,10 +342,10 @@ test('diffsFor gives desktop and RSS candidates no diff', async () => {
 
 test('buildEvidencePack names each note status, keeps colliding evidence names apart and writes private files', async () => {
   await withTempDir(async dir => {
-    const candidate = candidateOf({ source: 'desktop', title: '桌面端新文案组 quickChat', evidence: [
-      { kind: 'i18n', ref: 'quick/chat', excerpt: '快速聊天' },
-      { kind: 'i18n', ref: 'quick-chat', excerpt: '快速聊天窗口' },
-      { kind: 'i18n', ref: 'Quick-Chat' },
+    const candidate = candidateOf({ source: 'rss', title: 'Quick chat', evidence: [
+      { kind: 'rss', ref: '2026-10-01 Quick/chat', excerpt: '2026-10-01\nQuick chat arrives.' },
+      { kind: 'rss', ref: '2026-10-01 Quick chat', excerpt: '2026-10-01\nQuick chat window.' },
+      { kind: 'rss', ref: '2026-10-01 quick-chat' },
     ] });
     const proposed = '.agents/notes/proposed/2026-09-10-quick-chat.md', implemented = '.agents/notes/implemented/feature/2026-01-01-sample.md';
     const config = '@deepseek-ai/dsh-experimental-worktree';
@@ -229,47 +355,148 @@ test('buildEvidencePack names each note status, keeps colliding evidence names a
       { kind: 'config', id: config, title: config, path: 'docs/config-catalog.md', text: 'Where retained checkouts are created.' },
     ] });
     assert.equal(root, join(dir, 'evidence'));
-    assert.deepEqual((await readdir(join(root, 'sources'))).sort(), ['i18n-Quick-Chat-3.md', 'i18n-quick-chat-2.md', 'i18n-quick-chat.md']);
-    assert.match(await readFile(join(root, 'sources', 'i18n-quick-chat-2.md'), 'utf8'), /快速聊天窗口/);
+    // The default macOS file system ignores case, so Quick-chat and quick-chat are one name there.
+    assert.deepEqual((await readdir(join(root, 'sources'))).sort(), ['rss-2026-10-01-Quick-chat-2.md', 'rss-2026-10-01-Quick-chat.md', 'rss-2026-10-01-quick-chat-3.md']);
+    assert.match(await readFile(join(root, 'sources', 'rss-2026-10-01-Quick-chat-2.md'), 'utf8'), /Quick chat window\./);
     assert.match(await readFile(join(root, 'dsh', '01-agents-notes-proposed-2026-09-10-quick-chat.md'), 'utf8'), /状态：proposed（DSH 尚未实现）/);
     assert.match(await readFile(join(root, 'dsh', '02-agents-notes-implemented-feature-2026-01-01-sample.md'), 'utf8'), /状态：implemented（DSH 已有）/);
     assert.match(await readFile(join(root, 'dsh', '03-docs-config-catalog-deepseek-ai-dsh-experimental-worktree.md'), 'utf8'), /docs\/config-catalog\.md/);
     const index = await readFile(join(root, 'INDEX.md'), 'utf8');
     assert.match(index, /DSH 镜像根目录：\/srv\/deepseek-harness/);
-    assert.ok(index.includes(`\n- dsh/01-agents-notes-proposed-2026-09-10-quick-chat.md ← ${proposed}\u3000状态：proposed（DSH 尚未实现）\n`), index);
-    assert.ok(index.includes(`\n- dsh/02-agents-notes-implemented-feature-2026-01-01-sample.md ← ${implemented}\u3000状态：implemented（DSH 已有）\n`), index);
-    assert.ok(index.includes(`\n- dsh/03-docs-config-catalog-deepseek-ai-dsh-experimental-worktree.md ← docs/config-catalog.md\u3000条目：${config}\n`), index);
-    for (const name of ['i18n-quick-chat.md', 'i18n-quick-chat-2.md', 'i18n-Quick-Chat-3.md']) assert.ok(index.includes(`\n- sources/${name} ← `), name);
+    assert.deepEqual(listOf(index, '## dsh/（官方镜像索引命中，路径相对镜像根目录）'), [
+      `- dsh/01-agents-notes-proposed-2026-09-10-quick-chat.md ← ${proposed}${GAP}状态：proposed（DSH 尚未实现）`,
+      `- dsh/02-agents-notes-implemented-feature-2026-01-01-sample.md ← ${implemented}${GAP}状态：implemented（DSH 已有）`,
+      `- dsh/03-docs-config-catalog-deepseek-ai-dsh-experimental-worktree.md ← docs/config-catalog.md${GAP}条目：${config}`,
+    ]);
+    for (const name of ['rss-2026-10-01-Quick-chat.md', 'rss-2026-10-01-Quick-chat-2.md', 'rss-2026-10-01-quick-chat-3.md']) assert.ok(index.includes(`\n- sources/${name} ← `), name);
     for (const path of ['.', 'sources', 'dsh']) assert.equal((await stat(join(root, path))).mode & 0o777, 0o700, path);
-    for (const path of ['INDEX.md', 'candidate.json', 'sources/i18n-quick-chat.md', 'dsh/01-agents-notes-proposed-2026-09-10-quick-chat.md']) assert.equal((await stat(join(root, path))).mode & 0o777, 0o600, path);
+    for (const path of ['INDEX.md', 'candidate.json', 'sources/rss-2026-10-01-Quick-chat.md', 'dsh/01-agents-notes-proposed-2026-09-10-quick-chat.md']) {
+      assert.equal((await stat(join(root, path))).mode & 0o777, 0o600, path);
+    }
   });
 });
 
-test('a diff larger than the whole budget is dropped whole and listed under 未读文件', async () => {
-  const huge: DiffFile = { path: 'codex-rs/core/src/huge.rs', diff: `+${'x'.repeat(60_000)}` };
-  const small: DiffFile = { path: 'codex-rs/core/src/small.rs', diff: '+y' };
-  const testFile: DiffFile = { path: 'codex-rs/core/tests/suite/quick_chat.rs', diff: '+t' };
+test('buildEvidencePack writes codex-files line lists as added-*.txt under 新增行, points the evidence at them and cuts one that does not fit', async () => {
+  await withTempDir(async dir => {
+    const evidence: Evidence[] = [
+      { kind: 'feature-flag', ref: LIB, url: 'https://github.com/openai/codex/compare/rust-v0.161.9...rust-v0.161.11', excerpt: '    QuickChat,' },
+      { kind: 'feature-flag', ref: LEGACY, excerpt: '（内容未读取：GitHub HTTP 500）' },
+    ];
+    const lib: DiffFile = { path: LIB, diff: ['+    QuickChat,', '+    ManagedWorktrees,', '+    Overflow,'].join('\n'), source: 'rust-v0.161.9__rust-v0.161.11' };
+    const root = await buildEvidencePack({ directory: dir, candidate: filesCandidate({ evidence }), diffs: [lib], dshHits: [], budget: 40 });
+    const added = 'added-0.161.9__0.161.11-codex-rs-features-src-lib.rs.txt';
+    assert.deepEqual((await readdir(join(root, 'sources'))).sort(), [added, 'feature-flag-codex-rs-features-src-legacy.rs.md', 'feature-flag-codex-rs-features-src-lib.rs.md']);
+    const text = await readFile(join(root, 'sources', added), 'utf8');
+    assert.equal(text.split('\n')[0], `# ${LIB}${GAP}rust-v0.161.9 → rust-v0.161.11 新增的行`);
+    assert.match(text, /只放了前 2 行，共 3 行/);
+    assert.ok(text.includes('\n+    QuickChat,\n+    ManagedWorktrees,\n') && !text.includes('Overflow'), text); // cut at a line boundary
+    const libEvidence = await readFile(join(root, 'sources', 'feature-flag-codex-rs-features-src-lib.rs.md'), 'utf8');
+    assert.ok(libEvidence.includes(`sources/${added}`), libEvidence);
+    assert.doesNotMatch(libEvidence, /QuickChat/); // the lines are in the .txt, not repeated
+    assert.match(await readFile(join(root, 'sources', 'feature-flag-codex-rs-features-src-legacy.rs.md'), 'utf8'), /内容未读取/);
+    const index = await readFile(join(root, 'INDEX.md'), 'utf8');
+    assert.deepEqual(listOf(index, '## 新增行（sources/，不是 diff）'), [`- sources/${added} ← ${LIB}（rust-v0.161.9 → rust-v0.161.11，只放了前 2 行，共 3 行）`]);
+    assert.deepEqual(listOf(index, '## 未读文件'), []);
+  });
+});
+
+test('a diff larger than the whole budget is dropped whole and listed under 未读文件, test files only counted', async () => {
+  const huge: DiffFile = { path: 'codex-rs/core/src/huge.rs', diff: `+${'x'.repeat(60_000)}`, source: '#50148' };
+  const small: DiffFile = { path: 'codex-rs/core/src/small.rs', diff: '+y', source: '#50148' };
+  const tests: DiffFile[] = ['codex-rs/core/tests/suite/quick_chat.rs', 'codex-rs/tui/src/app/tests.rs'].map(path => ({ path, diff: '+t', source: '#50148' }));
   const { kept, dropped } = rankDiffFiles([huge, small], 60_000);
   assert.deepEqual(kept, [small]);
   assert.deepEqual(dropped, [huge]); // whole: a diff is never cut to fit
   await withTempDir(async dir => {
-    const excerpt = 'Add quick chat\ncodex-rs/core/src/huge.rs\ncodex-rs/core/src/small.rs';
+    const excerpt = 'Add quick chat\n\nOpens a quick chat window.\n\ncodex-rs/core/src/huge.rs\ncodex-rs/core/src/small.rs';
     const candidate = candidateOf({ evidence: [{ kind: 'pr', ref: '#50148', url: 'https://github.com/openai/codex/pull/50148', excerpt }] });
     const gaps = ['no diff for #50150: GitHub HTTP 404 for repos/openai/codex/pulls/50150: Not Found'];
-    const root = await buildEvidencePack({ directory: dir, candidate, diffs: [huge, small, testFile], dshHits: [], gaps });
-    assert.deepEqual((await readdir(join(root, 'sources'))).sort(), ['diff-codex-rs-core-src-small.rs.diff', 'pr-50148.md']);
-    assert.ok((await readFile(join(root, 'sources', 'pr-50148.md'), 'utf8')).includes(excerpt)); // the title and file list as they are
-    assert.equal(await readFile(join(root, 'sources', 'diff-codex-rs-core-src-small.rs.diff'), 'utf8'), '+y');
+    const root = await buildEvidencePack({ directory: dir, candidate, diffs: [huge, small, ...tests], dshHits: [], gaps });
+    assert.deepEqual((await readdir(join(root, 'sources'))).sort(), ['diff-50148-codex-rs-core-src-small.rs.diff', 'pr-50148.md']);
+    const pr = await readFile(join(root, 'sources', 'pr-50148.md'), 'utf8');
+    assert.ok(pr.includes(excerpt) && pr.includes('PR 标题、正文摘要和改动文件清单'), pr); // title, body summary and file list as they are
+    assert.equal(await readFile(join(root, 'sources', 'diff-50148-codex-rs-core-src-small.rs.diff'), 'utf8'), '+y');
     const index = await readFile(join(root, 'INDEX.md'), 'utf8');
-    assert.ok(index.includes(`\n## 没取到的内容\n\n- ${gaps[0]}\n`), index);
-    const [listed = '', unread = ''] = index.split('\n## 未读文件');
-    assert.match(unread, /^- codex-rs\/core\/src\/huge\.rs（/m);
-    assert.match(unread, /^- codex-rs\/core\/tests\/suite\/quick_chat\.rs（/m);
-    assert.doesNotMatch(listed, /huge|suite/);
+    assert.match(index, /本文件里的路径都相对 `evidence\/` 目录/);
+    assert.deepEqual(listOf(index, '## diff（sources/）'), ['- sources/diff-50148-codex-rs-core-src-small.rs.diff ← codex-rs/core/src/small.rs（#50148）']);
+    assert.deepEqual(listOf(index, '## 未读文件'), ['- codex-rs/core/src/huge.rs（#50148）', '- 测试文件 2 个未读']);
+    assert.deepEqual(listOf(index, '## 没取到的内容'), [`- ${gaps[0]}`]);
   });
 });
 
-test('buildEvidencePack rebuilds the directory from scratch on a rerun', async () => {
+test('buildEvidencePack applies the budget it is given and keeps the end of a long path in the file name', async () => {
+  await withTempDir(async dir => {
+    const long = 'codex-rs/app-server-protocol/schema/typescript/v2/ThreadStartParamsWithAVeryLongGeneratedTypeName.ts';
+    const root = await buildEvidencePack({ directory: dir, candidate: candidateOf({}), dshHits: [], budget: 10, diffs: [
+      { path: long, diff: '+short', source: '#7' },
+      { path: 'codex-rs/core/src/eleven.rs', diff: '+0123456789', source: '#7' },
+    ] });
+    const names = await readdir(join(root, 'sources'));
+    assert.equal(names.length, 1);
+    assert.match(names[0]!, /^diff-7-.*-v2-ThreadStartParamsWithAVeryLongGeneratedTypeName\.ts\.diff$/);
+    assert.deepEqual(listOf(await readFile(join(root, 'INDEX.md'), 'utf8'), '## 未读文件'), ['- codex-rs/core/src/eleven.rs（#7）']);
+  });
+});
+
+test('INDEX.md stays under 8,000 characters for a 619-key i18n candidate and a 280-file pull request', async () => {
+  await withTempDir(async dir => {
+    const keys = Array.from({ length: 619 }, (_, i): Evidence => ({ kind: 'i18n', ref: `codex.app.quickChat.key${i}`, excerpt: `快速聊天文案 ${i}` }));
+    const strings = candidateOf({ source: 'desktop', fingerprint: 'desktop:i18n:codex.app.quickChat:26.1009.1', title: '桌面端新文案组 codex.app.quickChat', evidence: keys });
+    const root = await buildEvidencePack({ directory: join(dir, 'i18n'), candidate: strings, diffs: [], dshHits: [] });
+    assert.deepEqual(await readdir(join(root, 'sources')), ['i18n-codex.app.quickChat.md']);
+    const text = await readFile(join(root, 'sources', 'i18n-codex.app.quickChat.md'), 'utf8');
+    assert.equal(text.split('\n').filter(line => line.startsWith('codex.app.quickChat.')).length, 619);
+    assert.match(text, /^codex\.app\.quickChat\.key0: 快速聊天文案 0$/m);
+    const index = await readFile(join(root, 'INDEX.md'), 'utf8');
+    assert.ok(index.length < 8_000, String(index.length));
+    assert.deepEqual(listOf(index, '## 证据（sources/）'), ['- sources/i18n-codex.app.quickChat.md ← 619 个 i18n key']);
+
+    const paths = [
+      ...Array.from({ length: 200 }, (_, i) => `codex-rs/app-server/src/handlers/thread_start_handler_${i}.rs`),
+      ...Array.from({ length: 50 }, (_, i) => `codex-rs/app-server/tests/suite/v2/thread_start_${i}.rs`),
+      ...Array.from({ length: 30 }, (_, i) => `docs/guides/thread-start-${i}.md`),
+    ];
+    const diff = paths.map(path => section(path, 'x'.repeat(600))).join('');
+    const pr = candidateOf({ evidence: [{ kind: 'pr', ref: '#50434', excerpt: `Thread start\n\nBody.\n\n${paths.slice(0, 20).join('\n')}\n…另有 260 个文件` }] });
+    const diffs = await diffsFor(pr, { github: { pullRequestDiff: async () => diff }, snapshotDir: '/nonexistent' });
+    assert.equal(diffs.length, 280);
+    const prRoot = await buildEvidencePack({ directory: join(dir, 'pr'), candidate: pr, diffs, dshHits: [] });
+    const prIndex = await readFile(join(prRoot, 'INDEX.md'), 'utf8');
+    assert.ok(prIndex.length < 8_000, String(prIndex.length));
+    for (const heading of ['## diff（sources/）', '## 未读文件']) {
+      const lines = listOf(prIndex, heading);
+      assert.ok(lines.filter(line => !line.startsWith('- 其余') && !line.startsWith('- 测试文件')).length <= 40, heading);
+      assert.ok(lines.some(line => /^- 其余 \d+ 个/.test(line)), heading);
+    }
+    assert.ok(listOf(prIndex, '## 未读文件').includes('- 测试文件 50 个未读'));
+    assert.ok((await readdir(join(prRoot, 'sources'))).length > 40); // every kept diff is there; INDEX.md lists some
+  });
+});
+
+test('buildEvidencePack gives at most 40 evidence entries a file each and puts the rest in more-evidence.md', async () => {
+  await withTempDir(async dir => {
+    const types = Array.from({ length: 100 }, (_, i) => `codex-rs/app-server-protocol/schema/typescript/v2/Type${i}.ts`);
+    const evidence = types.map((ref): Evidence => ({ kind: 'schema', ref, excerpt: `export type ${ref.split('/').at(-1)} = {};` }));
+    const diffs = types.slice(0, 50).map((path): DiffFile => ({ path, diff: '+export type T = { field: string };', source: 'rust-v0.160.0__rust-v0.161.0' }));
+    const root = await buildEvidencePack({ directory: dir, candidate: filesCandidate({ fingerprint: 'codex-files:schema:0.161', evidence }), diffs, dshHits: [] });
+    const names = await readdir(join(root, 'sources'));
+    assert.equal(names.filter(name => name.startsWith('schema-')).length, 40);
+    assert.equal(names.filter(name => name.startsWith('added-')).length, 50);
+    assert.ok(names.includes('more-evidence.md'));
+    const more = await readFile(join(root, 'sources', 'more-evidence.md'), 'utf8');
+    assert.equal(more.split('\n').filter(line => line.startsWith('## schema ')).length, 60);
+    assert.ok(more.includes('export type Type70.ts = {};')); // no .txt of its own: the excerpt stays
+    assert.ok(!more.includes('export type Type45.ts = {};')); // its lines are in a .txt
+    const index = await readFile(join(root, 'INDEX.md'), 'utf8');
+    assert.ok(index.length < 8_000, String(index.length));
+    for (const heading of ['## 证据（sources/）', '## 新增行（sources/，不是 diff）']) {
+      assert.ok(listOf(index, heading).filter(line => !line.startsWith('- 其余')).length <= 40, heading);
+    }
+    assert.ok(listOf(index, '## 证据（sources/）').some(line => /^- 其余 \d+ 个（完整清单见 candidate\.json）$/.test(line)));
+  });
+});
+
+test('buildEvidencePack replaces an earlier pack whole, and a failure midway leaves the earlier pack and no temp directory', async () => {
   await withTempDir(async dir => {
     const first = candidateOf({ evidence: [{ kind: 'pr', ref: '#1' }] });
     await buildEvidencePack({ directory: dir, candidate: first, diffs: [{ path: 'a.rs', diff: '+a' }], dshHits: [{ kind: 'package', id: 'packages/g/x', title: 'X', path: 'packages/g/x/README.md', text: 'x' }] });
@@ -279,5 +506,19 @@ test('buildEvidencePack rebuilds the directory from scratch on a rerun', async (
     const index = await readFile(join(root, 'INDEX.md'), 'utf8');
     assert.doesNotMatch(index, /pr-1|a\.rs|packages\/g\/x/);
     assert.match(index, /索引没有命中/);
+    const broken = { kind: 'package', id: 'p', title: 'P', path: 'packages/p/README.md', get text(): string { throw new Error('index entry unreadable'); } } as IndexEntry;
+    await assert.rejects(buildEvidencePack({ directory: dir, candidate: first, diffs: [], dshHits: [broken] }), /index entry unreadable/);
+    assert.equal(await readFile(join(root, 'INDEX.md'), 'utf8'), index);
+    assert.deepEqual(await readdir(dir), ['evidence']);
+  });
+});
+
+test('buildEvidencePack wants an absolute directory and a positive whole budget', async () => {
+  const input = { candidate: candidateOf({}), diffs: [], dshHits: [] };
+  await withTempDir(async dir => {
+    // A relative path that leads into the temp directory, so that a broken check cannot write into the working directory.
+    await assert.rejects(buildEvidencePack({ ...input, directory: relative(process.cwd(), join(dir, 'c')) }), ValidationError);
+    for (const budget of [0, -1, 1.5, Number.NaN]) await assert.rejects(buildEvidencePack({ ...input, directory: dir, budget }), ValidationError, String(budget));
+    assert.deepEqual(await readdir(dir), []); // nothing was written
   });
 });
