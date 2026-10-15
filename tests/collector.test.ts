@@ -46,9 +46,9 @@ const ghExit = (stderr: string) => Object.assign(new Error('Command failed: gh')
 
 /**
  * A gh runner that answers like openai/codex with two stable tags: the 0.162.0 notes, a two-file pull request for every number,
- * and trees in which only the feature registry differs. Every call is recorded; `failTrees`, `failPr`, `failRelease` and `failContents` each break one kind of request.
+ * and trees in which only the feature registry differs. Every call is recorded; `failTrees`, `failPr`, `limitPr`, `failRelease` and `failContents` each break one kind of request.
  */
-function codex(body: string, options: { failTrees?: boolean; failPr?: number; failRelease?: string; failContents?: string } = {}): { gh: GhRunner; calls: string[][] } {
+function codex(body: string, options: { failTrees?: boolean; failPr?: number; limitPr?: number; failRelease?: string; failContents?: string } = {}): { gh: GhRunner; calls: string[][] } {
   const calls: string[][] = [];
   const gh: GhRunner = async args => {
     calls.push(args);
@@ -59,6 +59,7 @@ function codex(body: string, options: { failTrees?: boolean; failPr?: number; fa
     }
     if (args[0] === 'pr' && args[1] === 'view') {
       if (Number(target) === options.failPr) throw ghExit(`GraphQL: Could not resolve to a PullRequest with the number of ${target}. (repository.pullRequest)`);
+      if (Number(target) === options.limitPr) throw ghExit('GraphQL: API rate limit exceeded for user ID 1.');
       return JSON.stringify({
         number: Number(target), title: `PR ${target}`, body: '', url: `https://github.com/openai/codex/pull/${target}`, additions: 3, deletions: 1, changedFiles: 2,
         files: [{ path: 'codex-rs/core/src/lib.rs', additions: 2, deletions: 1 }, { path: 'docs/config.md', additions: 1, deletions: 0 }],
@@ -196,7 +197,7 @@ test('gaps since the stored tags and failed PR lookups are reported, and the win
     assert.deepEqual(result.files.window, { from: 'rust-v0.161.0', to: 'rust-v0.162.0', releases: ['rust-v0.162.0'] });
     assert.equal(result.errors.length, 3);
     assert.match(result.errors[0]!, /^releases: .*rust-v0\.150\.0.*rust-v0\.161\.0/);
-    assert.match(result.errors[1]!, /^releases: 1 PR lookups failed \(GitHub HTTP 404 for repos\/openai\/codex\/pulls\/50148: .*\); those candidates carry bare evidence until the next run$/);
+    assert.match(result.errors[1]!, /^releases: 1 PR lookups failed \(GitHub HTTP 404 for repos\/openai\/codex\/pulls\/50148: .*\); those candidates carry bare evidence$/);
     assert.equal(result.errors[2], 'files: the stored tag could not be used as the window start; the window restarted at rust-v0.161.0');
   });
 });
@@ -219,6 +220,12 @@ test('a rate limit and release notes of an unknown shape are reported without fa
     assert.equal(limited.releases.rateLimited, true);
     assert.deepEqual(limited.errors, ['releases: GitHub rate limit hit; the checkpoint stopped before rust-v0.162.0']);
     assert.equal(await store.checkpoint('lastStableTag'), undefined);
+
+    // A pull request lookup refused by the rate limit cuts the release short; what it cut off is read again by the next run.
+    const cutShort = await quietCheck(home, store, codex(await readRelease(), { limitPr: 50148 }).gh);
+    assert.equal(cutShort.errors[0], 'releases: GitHub rate limit hit; the checkpoint stopped before rust-v0.162.0');
+    assert.match(cutShort.errors[1]!, /^releases: 1 PR lookups failed \(.*API rate limit exceeded.*\); those candidates carry bare evidence until the next run$/);
+    assert.equal(cutShort.errors.length, 2);
 
     const odd = await quietCheck(home, store, codex('Highlights\n\n- Faster startup (#51600)\n').gh);
     assert.deepEqual(odd.releases.unrecognized, ['rust-v0.162.0']);

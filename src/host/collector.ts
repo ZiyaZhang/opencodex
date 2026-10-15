@@ -137,7 +137,8 @@ async function collect(options: CheckOptions): Promise<CheckResult> {
       const cut = releases.window && (cutRelease(releases.window, await store.checkpoint('lastStableTag'), releases.unreleased) ?? 'the affected release');
       addError('releases', `GitHub rate limit hit${resetNote(result.releases.rateLimitResetAt)}${cut ? `; the checkpoint stopped before ${cut}` : ''}`);
     }
-    if (releases.prLookupFailures) addError('releases', `${releases.prLookupFailures} PR lookups failed (${releases.firstLookupError ?? 'no detail'}); those candidates carry bare evidence until the next run`);
+    // What a rate limit cut off is read again by the next run; a permanent failure (a 404) is not.
+    if (releases.prLookupFailures) addError('releases', `${releases.prLookupFailures} PR lookups failed (${releases.firstLookupError ?? 'no detail'}); those candidates carry bare evidence${releases.rateLimited ? ' until the next run' : ''}`);
     if (releases.unrecognized.length) addError('releases', `release notes format not recognized for ${releases.unrecognized.join(', ')}`);
   });
   // Source 2 works out its own window from the tags and keeps its own checkpoint, so it runs whether or not source 1 got through.
