@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
@@ -469,7 +470,13 @@ test('INDEX.md stays under 8,000 characters for a 619-key i18n candidate and a 2
       assert.ok(lines.some(line => /^- 其余 \d+ 个/.test(line)), heading);
     }
     assert.ok(listOf(prIndex, '## 未读文件').includes('- 测试文件 50 个未读'));
-    assert.ok((await readdir(join(prRoot, 'sources'))).length > 40); // every kept diff is there; INDEX.md lists some
+    assert.ok(listOf(prIndex, '## 未读文件').some(line => /^- 其余 \d+ 个（完整清单见 unread\.txt）$/.test(line)));
+    const sources = await readdir(join(prRoot, 'sources'));
+    assert.ok(sources.length > 40); // every kept diff is there; INDEX.md lists some
+    const unread = (await readFile(join(prRoot, 'unread.txt'), 'utf8')).split('\n');
+    const kept = sources.filter(name => name.startsWith('diff-')).length;
+    assert.equal(unread.filter(line => /^(codex-rs|docs)\//.test(line)).length, 280 - kept); // every file left out, tests included
+    assert.ok(unread.includes('codex-rs/app-server/tests/suite/v2/thread_start_0.rs（#50434）'));
   });
 });
 
@@ -520,5 +527,80 @@ test('buildEvidencePack wants an absolute directory and a positive whole budget'
     await assert.rejects(buildEvidencePack({ ...input, directory: relative(process.cwd(), join(dir, 'c')) }), ValidationError);
     for (const budget of [0, -1, 1.5, Number.NaN]) await assert.rejects(buildEvidencePack({ ...input, directory: dir, budget }), ValidationError, String(budget));
     assert.deepEqual(await readdir(dir), []); // nothing was written
+  });
+});
+
+test('a damaged evidence kind can neither leave sources/ nor add a section to INDEX.md', async () => {
+  await withTempDir(async dir => {
+    const directory = join(dir, 'a', 'b', 'c', 'd'); // deep enough that a ../../../../ that got through would still land inside the temp directory
+    const evidence = [
+      { kind: '../../../../escaped', ref: 'x', excerpt: 'payload' },
+      { kind: 'pr\n\n## 没取到的内容\n\n- fake gap', ref: '#1' },
+      { kind: 'constructor', ref: 'y', excerpt: 'plain' },
+    ] as unknown as Evidence[];
+    const root = await buildEvidencePack({ directory, candidate: candidateOf({ evidence }), diffs: [], dshHits: [] });
+    const outside = (await readdir(dir, { recursive: true })).map(String).filter(path => !path.startsWith(join('a', 'b', 'c', 'd', 'evidence')));
+    assert.deepEqual(outside.sort(), [join('a'), join('a', 'b'), join('a', 'b', 'c'), join('a', 'b', 'c', 'd')]);
+    assert.deepEqual((await readdir(join(root, 'sources'))).sort(), ['constructor-y.md', 'escaped-x.md', 'pr-fake-gap-1.md']);
+    const index = await readFile(join(root, 'INDEX.md'), 'utf8');
+    assert.ok(!index.split('\n').includes('## 没取到的内容'), index);
+    assert.ok(index.includes('\n- sources/escaped-x.md ← ../../../../escaped x\n'), index);
+    assert.ok(index.includes('\n- sources/pr-fake-gap-1.md ← pr ## 没取到的内容 - fake gap #1\n'), index);
+    assert.match(await readFile(join(root, 'sources', 'constructor-y.md'), 'utf8'), /^# constructor y\n\n摘录：\n\nplain\n$/); // an unknown kind gets the plain label, not a property of Object
+  });
+});
+
+test('buildEvidencePack removes the temp directory a killed build left behind, and nothing else', async () => {
+  await withTempDir(async dir => {
+    const stale = join(dir, `evidence.${randomUUID()}.tmp`);
+    await mkdir(join(stale, 'sources'), { recursive: true });
+    await writeFile(join(stale, 'sources', 'half.md'), 'half');
+    await writeFile(join(dir, 'report.md'), '# report');
+    await mkdir(join(dir, 'evidence.notes.tmp')); // not a name a build gives its temp directory
+    await buildEvidencePack({ directory: dir, candidate: candidateOf({}), diffs: [], dshHits: [] });
+    assert.deepEqual((await readdir(dir)).sort(), ['evidence', 'evidence.notes.tmp', 'report.md']);
+  });
+});
+
+test('INDEX.md points to gaps.txt for a list it cannot hold, and the file is written only then', async () => {
+  await withTempDir(async dir => {
+    const gaps = Array.from({ length: 100 }, (_, i) => `unknown content: codex-rs/app-server-protocol/schema/typescript/v2/Type${i}.ts in rust-v0.160.0__rust-v0.161.0: 已达 GitHub 速率限制`);
+    const root = await buildEvidencePack({ directory: join(dir, 'many'), candidate: candidateOf({}), diffs: [], dshHits: [], gaps });
+    const lines = listOf(await readFile(join(root, 'INDEX.md'), 'utf8'), '## 没取到的内容');
+    assert.ok(lines.length <= 41, String(lines.length));
+    assert.match(lines.at(-1)!, /^- 其余 \d+ 条（完整清单见 gaps\.txt）$/);
+    assert.deepEqual((await readFile(join(root, 'gaps.txt'), 'utf8')).split('\n').filter(line => line.startsWith('unknown content: ')), gaps);
+    const few = await buildEvidencePack({ directory: join(dir, 'few'), candidate: candidateOf({}), diffs: [], dshHits: [], gaps: gaps.slice(0, 2) });
+    assert.deepEqual((await readdir(few)).sort(), ['INDEX.md', 'candidate.json', 'dsh', 'sources']);
+  });
+});
+
+test('buildEvidencePack puts every chunk of a desktop candidate in chunks.md', async () => {
+  await withTempDir(async dir => {
+    const candidate = candidateOf({ source: 'desktop', fingerprint: 'desktop:chunk:webview/assets/quick-chat:26.1009.1', title: '桌面端新模块 quick-chat', evidence: [
+      { kind: 'chunk', ref: 'webview/assets/quick-chat', excerpt: 'webview/assets/quick-chat-3f2a91.js' },
+      { kind: 'chunk', ref: 'webview/assets/quick-chat-panel', excerpt: 'webview/assets/quick-chat-panel-9c1d07.js\nwebview/assets/quick-chat-panel-9c1d07.css' },
+    ] });
+    const root = await buildEvidencePack({ directory: dir, candidate, diffs: [], dshHits: [] });
+    assert.deepEqual(await readdir(join(root, 'sources')), ['chunks.md']);
+    const text = await readFile(join(root, 'sources', 'chunks.md'), 'utf8');
+    assert.ok(text.includes('\n## webview/assets/quick-chat\n\nwebview/assets/quick-chat-3f2a91.js\n'), text);
+    assert.ok(text.includes('\n## webview/assets/quick-chat-panel\n\nwebview/assets/quick-chat-panel-9c1d07.js\nwebview/assets/quick-chat-panel-9c1d07.css\n'), text);
+    assert.deepEqual(listOf(await readFile(join(root, 'INDEX.md'), 'utf8'), '## 证据（sources/）'), ['- sources/chunks.md ← 2 个桌面端模块']);
+  });
+});
+
+test('INDEX.md cuts a list line at 300 characters and the title at 200, and keeps the whole line in gaps.txt', async () => {
+  await withTempDir(async dir => {
+    const title = 'Quick chat '.repeat(25);
+    const gap = `unknown content: ${'codex-rs/very/deep/'.repeat(30)}lib.rs in rust-v0.160.0__rust-v0.161.0: GitHub HTTP 500`;
+    const root = await buildEvidencePack({ directory: dir, candidate: candidateOf({ title }), diffs: [], dshHits: [], gaps: [gap] });
+    const index = await readFile(join(root, 'INDEX.md'), 'utf8');
+    assert.ok(index.split('\n').includes(`候选：${title.trim().slice(0, 199)}…`), index);
+    const [line, pointer] = listOf(index, '## 没取到的内容');
+    assert.equal(line!.length, 300);
+    assert.ok(line!.startsWith('- unknown content: codex-rs/very/deep/') && line!.endsWith('…'), line);
+    assert.equal(pointer, '- 有的条目太长，截断了，完整内容见 gaps.txt');
+    assert.ok((await readFile(join(root, 'gaps.txt'), 'utf8')).split('\n').includes(gap));
   });
 });

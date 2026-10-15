@@ -5,7 +5,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
-import type { Candidate, Evidence, EvidenceKind } from '../../core/candidate.js';
+import { EVIDENCE_KINDS, type Candidate, type Evidence, type EvidenceKind } from '../../core/candidate.js';
 import { check } from '../../core/check.js';
 import { GitHubError, type GitHubClient } from '../github.js';
 import { searchIndex, type DshIndex, type IndexEntry } from '../index/dsh-index.js';
@@ -57,12 +57,20 @@ const HIT_LIMITS = [['package', 3], ['config', 2], ['note', 2]] as const;
 const DIR_MODE = 0o700, FILE_MODE = 0o600;
 const STABLE_TAG = /^rust-v(\d+)\.(\d+)\.(\d+)$/;
 const DIFF_HEADER = 'diff --git ';
+/** The name a build gives its temp directory (`evidence.<uuid>.tmp`); one that a killed build left behind is removed by the next build. */
+const TEMP_NAME = /^evidence\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
 /** Separates a path from what is said about it on one line, as the report template separates its header fields: an ideographic space. */
 const SEPARATOR = String.fromCharCode(0x3000);
 
 const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const isMissing = (error: unknown) => ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException | undefined)?.code ?? '');
 const oneLine = (text: string) => text.replace(/\s+/g, ' ').trim();
+/** A field read from a candidate file as one line of text: a damaged file can hold anything there, a newline included. */
+const textOf = (value: unknown) => oneLine(typeof value === 'string' ? value : String(value ?? ''));
+const KNOWN_KINDS: readonly string[] = EVIDENCE_KINDS;
+/** A kind the sources write. Any other value (a damaged candidate file) is plain evidence: it gets no kind's label, and only its slug goes into a file name. */
+const isKnownKind = (kind: unknown): kind is EvidenceKind => typeof kind === 'string' && KNOWN_KINDS.includes(kind);
+const kindText = (entry: Evidence) => textOf(entry.kind) || 'other';
 /** At most `limit` characters; a longer text ends in an ellipsis, and the cut never falls between the halves of a surrogate pair. */
 function cutLine(text: string, limit: number): string {
   if (text.length <= limit) return text;
@@ -332,10 +340,12 @@ function namer(): (base: string, ext: string) => string {
   };
 }
 /** `diff-<source>-<path>` or `added-<source>-<path>`: `#50148` becomes `50148`, a window `0.161.9__0.161.11`. */
-const changeName = (prefix: string, file: DiffFile) => [prefix, file.source ? slug(file.source.replace(/rust-v/g, '')) : '', slug(file.path)].filter(Boolean).join('-');
+const changeName = (prefix: string, file: DiffFile) => [prefix, slug(textOf(file.source).replace(/rust-v/g, '')), slug(file.path)].filter(Boolean).join('-');
+/** `<kind>-<ref>`, both slugged: a kind from a damaged candidate file (`../../x`, a newline) can name no other directory. */
+const evidenceName = (entry: Evidence) => [slug(kindText(entry)) || 'other', slug(textOf(entry.ref))].filter(Boolean).join('-');
 const lineCount = (text: string) => (text ? text.split('\n').length : 0);
 /** The windows of a line list as INDEX.md and its file show them: `rust-v0.161.9 → rust-v0.161.11`. */
-const windowText = (source: string | undefined) => (source ?? '').split('__').join(' → ');
+const windowText = (source: unknown) => textOf(source).split('__').join(' → ');
 const cutNote = (kept: DiffFile, whole: DiffFile) => `只放了前 ${lineCount(kept.diff)} 行，共 ${lineCount(whole.diff)} 行`;
 
 /** What the excerpt of each evidence kind holds, as the sources write it. */
@@ -346,24 +356,24 @@ const EXCERPT_LABEL: Record<EvidenceKind, string> = {
 };
 /** The link and excerpt of one evidence entry; when its file's added lines are in a `.txt` of their own, a pointer there instead of the same lines again. */
 function evidenceBody(entry: Evidence, linesFile: string | undefined): string[] {
-  const lines = entry.url ? [`链接：${entry.url}`, ''] : [];
+  const lines = entry.url ? [`链接：${textOf(entry.url)}`, ''] : [];
   if (linesFile) return [...lines, `新增行在 ${linesFile}，这里不重复。`];
-  if (entry.excerpt) return [...lines, EXCERPT_LABEL[entry.kind] ?? '摘录：', '', entry.excerpt];
+  if (entry.excerpt) return [...lines, isKnownKind(entry.kind) ? EXCERPT_LABEL[entry.kind] : '摘录：', '', String(entry.excerpt)];
   return [...lines, entry.kind === 'pr' ? '（没有取到这个 PR 的标题和文件，只有编号。）' : '（没有摘录。）'];
 }
-const evidenceText = (entry: Evidence, linesFile: string | undefined) => [`# ${entry.kind} ${oneLine(entry.ref)}`, '', ...evidenceBody(entry, linesFile), ''].join('\n');
+const evidenceText = (entry: Evidence, linesFile: string | undefined) => [`# ${kindText(entry)} ${textOf(entry.ref)}`, '', ...evidenceBody(entry, linesFile), ''].join('\n');
 function moreEvidenceText(entries: Evidence[], linesFiles: Map<string, string>): string {
-  const sections = entries.flatMap(entry => ['', `## ${entry.kind} ${oneLine(entry.ref)}`, '', ...evidenceBody(entry, linesFiles.get(entry.ref))]);
+  const sections = entries.flatMap(entry => ['', `## ${kindText(entry)} ${textOf(entry.ref)}`, '', ...evidenceBody(entry, linesFiles.get(entry.ref))]);
   return ['# 其余证据', '', `前 ${EVIDENCE_FILES} 条证据各有一个文件，这里是其余 ${entries.length} 条。`, ...sections, ''].join('\n');
 }
 /** The key group of a desktop i18n candidate, from its fingerprint `desktop:i18n:<group>:<version>`. */
 const i18nGroup = (candidate: Candidate) => /^desktop:i18n:(.+):[^:]+$/.exec(candidate.fingerprint)?.[1] ?? 'keys';
 function i18nText(group: string, keys: Evidence[]): string {
-  const lines = keys.map(entry => (entry.excerpt ? `${oneLine(entry.ref)}: ${oneLine(entry.excerpt)}` : oneLine(entry.ref)));
+  const lines = keys.map(entry => (entry.excerpt ? `${textOf(entry.ref)}: ${textOf(entry.excerpt)}` : textOf(entry.ref)));
   return [`# i18n ${group}`, '', `${keys.length} 个新 key，每行 \`key: 文案\`；没取到文案的只有 key。`, '', ...lines, ''].join('\n');
 }
 function chunksText(chunks: Evidence[]): string {
-  const sections = chunks.flatMap(entry => ['', `## ${oneLine(entry.ref)}`, '', entry.excerpt || '（没有摘录。）']);
+  const sections = chunks.flatMap(entry => ['', `## ${textOf(entry.ref)}`, '', entry.excerpt ? String(entry.excerpt) : '（没有摘录。）']);
   return ['# 桌面端新模块', '', '每个模块一节：标题是去掉哈希的模块名，下面是本版本归档里的实际路径。', ...sections, ''].join('\n');
 }
 function addedText(file: DiffFile, whole: DiffFile | undefined): string {
@@ -384,14 +394,17 @@ function noteStatus(path: string): string {
   return '状态：未知（不在 implemented/ 或 proposed/ 下）';
 }
 /** What a hit's file and its INDEX.md line add to the path: a note's status, a config entry's section (every config entry has the same path). */
-const hitDetail = (hit: IndexEntry): string | undefined => (hit.kind === 'note' ? noteStatus(hit.path) : hit.kind === 'config' ? `条目：${hit.id}` : undefined);
+const hitDetail = (hit: IndexEntry): string | undefined => (hit.kind === 'note' ? noteStatus(hit.path) : hit.kind === 'config' ? `条目：${textOf(hit.id)}` : undefined);
 function hitText(hit: IndexEntry): string {
   const detail = hitDetail(hit);
-  return [`# ${oneLine(hit.title)}`, '', `类型：${KIND_LABEL[hit.kind] ?? hit.kind}`, `路径：${oneLine(hit.path)}（相对 DSH 镜像根目录）`, ...(detail ? [detail] : []), '', hit.text, ''].join('\n');
+  return [`# ${oneLine(hit.title)}`, '', `类型：${Object.hasOwn(KIND_LABEL, hit.kind) ? KIND_LABEL[hit.kind] : textOf(hit.kind)}`, `路径：${oneLine(hit.path)}（相对 DSH 镜像根目录）`, ...(detail ? [detail] : []), '', hit.text, ''].join('\n');
 }
 
-/** One list of INDEX.md: its heading, a line before the list, the list itself (cut to fit), a line after it that always shows, and the line that counts what is cut. */
-interface Section { heading: string; intro?: string; items: string[]; tail?: string; rest: (count: number) => string }
+/**
+ * One list of INDEX.md: its heading, a line before the list, the list itself (cut to fit), a line after it that always shows, and the line that counts what is
+ * cut. `whole` is a file of the pack that gets the full list when INDEX.md cannot hold it (lines left out or cut short), for a list that is nowhere else.
+ */
+interface Section { heading: string; intro?: string; items: string[]; tail?: string; rest: (count: number) => string; whole?: { file: string; text: () => string } }
 /** Shares `total` characters among lists that need `needs`: smallest first, each gets what it needs up to an equal share of what is left, so that what a short list leaves goes to the long ones. */
 function shares(needs: number[], total: number): number[] {
   const rooms = needs.map(() => 0);
@@ -403,8 +416,8 @@ function shares(needs: number[], total: number): number[] {
   }
   return rooms;
 }
-/** The lines of a list that fit in `room` characters, at most 40, followed by the line that counts the rest. */
-function fit(items: string[], room: number, rest: (count: number) => string): string[] {
+/** The first lines of a list that fit in `room` characters, at most 40. */
+function fit(items: string[], room: number): string[] {
   const out: string[] = [];
   let used = 0;
   for (const item of items) {
@@ -412,22 +425,31 @@ function fit(items: string[], room: number, rest: (count: number) => string): st
     out.push(item);
     used += item.length + 1;
   }
-  return out.length < items.length ? [...out, rest(items.length - out.length)] : out;
+  return out;
 }
-/** INDEX.md within 8,000 characters: the head and every section's frame in full, the lists sharing what is left (see `shares`), each cut by `fit`. */
-function renderIndex(head: string[], sections: Section[]): string {
+/**
+ * INDEX.md within 8,000 characters: the head and every section's frame in full, the lists sharing what is left (see `shares`), each cut by `fit` and followed
+ * by the line that counts what it left out. Also the files that get the full lists INDEX.md could not hold.
+ */
+function renderIndex(head: string[], sections: Section[]): { text: string; wholes: Array<{ file: string; text: string }> } {
   const frame = (section: Section) => ['', section.heading, '', ...(section.intro ? [section.intro, ''] : []), ...(section.tail ? [section.tail] : [])];
   const fixed = [...head, ...sections.flatMap(frame)].join('\n').length + 1 + sections.length * REST_ROOM;
   const lists = sections.map(section => section.items.map(item => cutLine(item, ITEM_LIMIT)));
   const rooms = shares(lists.map(items => items.reduce((sum, item) => sum + item.length + 1, 0)), INDEX_LIMIT - fixed);
-  const lines = [...head];
+  const lines = [...head], wholes: Array<{ file: string; text: string }> = [];
   sections.forEach((section, i) => {
     lines.push('', section.heading, '');
     if (section.intro) lines.push(section.intro, '');
-    lines.push(...fit(lists[i]!, rooms[i]!, section.rest));
+    const shown = fit(lists[i]!, rooms[i]!);
+    const hidden = section.items.length - shown.length;
+    const shortened = shown.some((line, j) => line !== section.items[j]);
+    lines.push(...shown);
+    if (hidden > 0) lines.push(section.rest(hidden));
+    else if (shortened && section.whole) lines.push(`- 有的条目太长，截断了，完整内容见 ${section.whole.file}`);
+    if ((hidden > 0 || shortened) && section.whole) wholes.push({ file: section.whole.file, text: section.whole.text() });
     if (section.tail) lines.push(section.tail);
   });
-  return `${lines.join('\n')}\n`;
+  return { text: `${lines.join('\n')}\n`, wholes };
 }
 
 /** Writes every file of the pack into `dir`, which holds empty `sources/` and `dsh/`. */
@@ -447,9 +469,9 @@ async function writePack(dir: string, input: EvidencePackInput, budget: number):
   const evidenceItems: string[] = [];
   const own = candidate.evidence.filter(entry => entry.kind !== 'i18n' && entry.kind !== 'chunk');
   for (const entry of own.slice(0, EVIDENCE_FILES)) {
-    const path = `sources/${name(`${entry.kind}-${slug(entry.ref)}`, '.md')}`;
+    const path = `sources/${name(evidenceName(entry), '.md')}`;
     await write(path, evidenceText(entry, linesFiles.get(entry.ref)));
-    evidenceItems.push(`- ${path} ← ${entry.kind} ${oneLine(entry.ref)}`);
+    evidenceItems.push(`- ${path} ← ${kindText(entry)} ${textOf(entry.ref)}`);
   }
   const more = own.slice(EVIDENCE_FILES);
   if (more.length) {
@@ -475,7 +497,7 @@ async function writePack(dir: string, input: EvidencePackInput, budget: number):
   for (const { file, path } of changes) {
     const full = whole.get(file.path);
     await write(path, lists ? addedText(file, full) : file.diff);
-    const notes = [lists ? windowText(file.source) : file.source ?? '', full ? cutNote(file, full) : ''].filter(Boolean);
+    const notes = [lists ? windowText(file.source) : textOf(file.source), full ? cutNote(file, full) : ''].filter(Boolean);
     changeItems.push(`- ${path} ← ${oneLine(file.path)}${notes.length ? `（${notes.join('，')}）` : ''}`);
   }
 
@@ -489,15 +511,16 @@ async function writePack(dir: string, input: EvidencePackInput, budget: number):
   }
 
   const tests = dropped.filter(isTest), others = dropped.filter(file => !isTest(file));
-  const gaps = (input.gaps ?? []).map(gap => `- ${oneLine(gap)}`);
+  const unreadLine = (file: DiffFile) => `${oneLine(file.path)}${textOf(file.source) ? `（${textOf(file.source)}）` : ''}`;
+  const gapLines = (input.gaps ?? []).map(textOf);
   const holds = [
     own.length ? `每条证据一个 \`.md\`${more.length ? `，第 ${EVIDENCE_FILES} 条以后的在 \`more-evidence.md\`` : ''}` : '',
     keys.length ? 'i18n key 和文案在一个 `i18n-<组>.md` 里' : '',
     chunks.length ? '桌面端模块在 `chunks.md` 里' : '',
     changes.length ? (lists ? '新增行清单每个文件一个 `.txt`' : '选读的 diff 每个文件一个 `.diff`') : '',
   ].filter(Boolean);
-  const head = ['# 证据目录', '', `候选：${cutLine(oneLine(candidate.title), TITLE_LIMIT)}`, `来源：${candidate.source}`];
-  if (input.mirror) head.push(`DSH 镜像根目录：${input.mirror}（只读）`);
+  const head = ['# 证据目录', '', `候选：${cutLine(textOf(candidate.title), TITLE_LIMIT)}`, `来源：${textOf(candidate.source)}`];
+  if (input.mirror) head.push(`DSH 镜像根目录：${textOf(input.mirror)}（只读）`);
   head.push(
     '', '本文件里的路径都相对 `evidence/` 目录。', '',
     '- `candidate.json`：候选的完整记录，含全部证据条目。',
@@ -505,7 +528,7 @@ async function writePack(dir: string, input: EvidencePackInput, budget: number):
     '- `dsh/`：DSH 官方镜像索引的命中摘要。文件里写的路径相对镜像根目录；note 的状态 implemented 表示 DSH 已有，proposed 表示 DSH 尚未实现。摘要没有行号，引用前到镜像里打开原文核对。',
   );
   if (dropped.length) head.push('- 未读文件：没有放进 `sources/` 的文件。');
-  if (gaps.length) head.push('- 没取到的内容：取证据时失败的条目，内容未知。');
+  if (gapLines.length) head.push('- 没取到的内容：取证据时失败的条目，内容未知。');
 
   const sections: Section[] = [{ heading: '## 证据（sources/）', items: evidenceItems.length ? evidenceItems : ['- （无）'], rest: m => `- 其余 ${m} 个（完整清单见 candidate.json）` }];
   if (input.diffs.length) {
@@ -516,25 +539,42 @@ async function writePack(dir: string, input: EvidencePackInput, budget: number):
     sections.push({
       heading: '## 未读文件',
       intro: others.length ? `下面的${lists ? '新增行清单' : ' diff '}放不进 ${budget} 字符的预算，没有放进来。` : undefined,
-      items: others.map(file => `- ${oneLine(file.path)}${file.source ? `（${file.source}）` : ''}`),
+      items: others.map(file => `- ${unreadLine(file)}`),
       tail: tests.length ? `- 测试文件 ${tests.length} 个未读` : undefined,
-      rest: m => `- 其余 ${m} 个未列出`,
+      rest: m => `- 其余 ${m} 个（完整清单见 unread.txt）`,
+      whole: {
+        file: 'unread.txt',
+        text: () => [
+          '未读文件的完整清单（INDEX.md 里放不下）。', '',
+          ...(others.length ? [`放不进 ${budget} 字符预算的${lists ? '新增行清单' : ' diff'}，共 ${others.length} 个：`, ...others.map(unreadLine), ''] : []),
+          ...(tests.length ? [`测试文件，共 ${tests.length} 个：`, ...tests.map(unreadLine), ''] : []),
+        ].join('\n'),
+      },
     });
   }
-  if (gaps.length) sections.push({ heading: '## 没取到的内容', intro: '这些内容没有取到：不知道它们改了什么，不等于没有改动。', items: gaps, rest: m => `- 其余 ${m} 条未列出` });
-  await write('INDEX.md', renderIndex(head, sections));
+  if (gapLines.length) {
+    sections.push({
+      heading: '## 没取到的内容', intro: '这些内容没有取到：不知道它们改了什么，不等于没有改动。', items: gapLines.map(line => `- ${line}`),
+      rest: m => `- 其余 ${m} 条（完整清单见 gaps.txt）`,
+      whole: { file: 'gaps.txt', text: () => ['没取到的内容的完整清单（INDEX.md 里放不下）。这些内容未知，不等于没有改动。', '', ...gapLines, ''].join('\n') },
+    });
+  }
+  const index = renderIndex(head, sections);
+  for (const whole of index.wholes) await write(whole.file, whole.text);
+  await write('INDEX.md', index.text);
 }
 
 /**
  * Writes `<directory>/evidence/` and returns its path. The pack is built in a sibling `evidence.<uuid>.tmp` and renamed into place after the earlier pack is
- * removed, so that a failure midway leaves the earlier pack (or none), never a partial one, and a rerun leaves no stale file.
+ * removed, so that a failure midway leaves the earlier pack (or none), never a partial one, and a rerun leaves no stale file. A temp directory that a killed
+ * build left behind is removed first.
  * - `candidate.json`: the candidate as stored.
  * - `sources/`: one `.md` per evidence entry, the first 40 of them (the rest in `more-evidence.md`), all i18n keys in one `i18n-<group>.md` and all chunks in
  *   `chunks.md`; one `.diff` per diff or one `added-*.txt` per codex-files line list that `rankDiffFiles` keeps within `budget`. Names that come out the same
- *   are told apart by `-2`, `-3`.
+ *   are told apart by `-2`, `-3`. An evidence kind is slugged like the ref, so that a damaged candidate file cannot name a path outside `sources/`.
  * - `dsh/`: one file per index hit, numbered in the order given, with its path relative to the mirror root and, for a note, its status.
  * - `INDEX.md`: what each directory holds, the files above, the files left out under 未读文件 and the `gaps` under 没取到的内容, each list at most 40 lines, the
- *   whole file within 8,000 characters.
+ *   whole file within 8,000 characters. A 未读文件 or 没取到的内容 list that does not fit goes whole to `unread.txt` or `gaps.txt`, and INDEX.md points there.
  * `directory` must be absolute and `budget` a positive integer. Directories are created 0700 and files 0600.
  */
 export async function buildEvidencePack(input: EvidencePackInput): Promise<string> {
@@ -544,6 +584,7 @@ export async function buildEvidencePack(input: EvidencePackInput): Promise<strin
   const root = join(input.directory, 'evidence');
   const temp = join(input.directory, `evidence.${randomUUID()}.tmp`);
   await mkdir(input.directory, { recursive: true, mode: DIR_MODE });
+  for (const name of await readdir(input.directory)) if (TEMP_NAME.test(name)) await rm(join(input.directory, name), { recursive: true, force: true });
   try {
     for (const dir of [temp, join(temp, 'sources'), join(temp, 'dsh')]) await mkdir(dir, { mode: DIR_MODE });
     await writePack(temp, input, budget);
