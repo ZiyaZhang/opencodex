@@ -1,5 +1,5 @@
 /** The `report` action: the evidence pack, one analyst session, then the report recorded on the candidate. */
-import { rename, rm } from 'node:fs/promises';
+import { rename, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { canTransition, transition, type Candidate, type Evidence, type Status } from '../../core/candidate.js';
 import { GitHubError, type GitHubClient } from '../github.js';
@@ -26,8 +26,9 @@ async function startedOn(ctx: HostContext, day: string): Promise<number> {
 /**
  * The daily limit counts analyst sessions: every one costs model tokens, the ones that time out or fail included. A report is admitted
  * when the sessions started today plus the reports admitted and not yet at their session stay under the limit; it counts once its
- * session is about to start (`countSession`), and leaves the admitted ones (`release`) if it ends before that. Each step runs in the
- * counter's lane, so two reports cannot both take the last place.
+ * session is about to start (`countSession`), and leaves the admitted ones (`release`) if it ends before that. A run whose session never
+ * came to exist (`create` refused it) gives its place back (`refund`). Each step runs in the counter's lane, so two reports cannot both
+ * take the last place.
  */
 function admit(ctx: HostContext, day: string, limit: number): Promise<void> {
   return ctx.lanes.reports.run(async () => {
@@ -45,6 +46,14 @@ function countSession(ctx: HostContext, day: string): Promise<void> {
 function release(ctx: HostContext): Promise<void> {
   return ctx.lanes.reports.run(async () => { ctx.reportsRunning--; });
 }
+function refund(ctx: HostContext, day: string): Promise<void> {
+  return ctx.lanes.reports.run(async () => {
+    const started = await startedOn(ctx, day);
+    if (started > 0) await ctx.store.setCheckpoint(counterOf(day), String(started - 1));
+  });
+}
+/** Whether a failure of `generateReport` came after its session existed: from then on it rejects with a `ReportSessionError` naming it. */
+const hadSession = (error: unknown) => typeof error === 'object' && error !== null && typeof (error as { sessionId?: unknown }).sessionId === 'string';
 
 /**
  * Gives the bare pull request entries of the candidate (a `#N` without a URL, which a failed or rate-limited lookup leaves) the URL and
@@ -76,14 +85,20 @@ async function withPullRequests(ctx: HostContext, candidate: Candidate, github: 
 }
 
 /**
- * Moves an earlier `evidence/` aside to `evidence.prev/`, replacing an older one, and returns how to put it back; undefined when there was
- * none. A failed rerun puts the earlier report back (`report.prev.md`), and its evidence goes back with it.
+ * Moves an earlier `evidence/` aside to `evidence.prev/`, replacing an older backup, and returns how to put it back and how to drop it;
+ * undefined when there is no `evidence/`, in which case a backup already there is left alone. A failed rerun puts the earlier report back
+ * (`report.prev.md`), and its evidence goes back with it.
  */
-async function setEvidenceAside(reportDir: string): Promise<(() => Promise<void>) | undefined> {
+async function setEvidenceAside(reportDir: string): Promise<{ putBack(): Promise<void>; drop(): Promise<void> } | undefined> {
   const evidence = join(reportDir, 'evidence'), backup = join(reportDir, 'evidence.prev');
+  const present = await stat(evidence).then(() => true, error => { if (isMissing(error)) return false; throw error; });
+  if (!present) return undefined;
   await rm(backup, { recursive: true, force: true });
-  try { await rename(evidence, backup); } catch (error) { if (isMissing(error)) return undefined; throw error; }
-  return async () => { await rm(evidence, { recursive: true, force: true }); await rename(backup, evidence); };
+  await rename(evidence, backup);
+  return {
+    async putBack() { await rm(evidence, { recursive: true, force: true }); await rename(backup, evidence); },
+    async drop() { await rm(backup, { recursive: true, force: true }); },
+  };
 }
 
 /**
@@ -92,8 +107,8 @@ async function setEvidenceAside(reportDir: string): Promise<(() => Promise<void>
  * `dailyReportLimit`. Then:
  * 1. the GitHub part, with 10 minutes (`timeouts.github`) to finish: the bare pull request entries are repaired, the diffs fetched;
  * 2. the evidence pack is built in `reports/<id>/evidence/` (index hits, diffs, and what could not be read), the earlier one set aside;
- * 3. one analyst session writes `reports/<id>/report.md` (it counts toward the day from here); its failure is `generateReport`'s
- *    `ReportSessionError`, whose message names the session, and puts the earlier report and evidence back;
+ * 3. one analyst session writes `reports/<id>/report.md` (it counts toward the day from here, unless it never came to exist); its failure
+ *    is `generateReport`'s `ReportSessionError`, whose message names the session, and puts the earlier report and evidence back;
  * 4. one patch moves the candidate to `reported` with the report record. A finished report is recorded even when the plugin is unloading
  *    meanwhile, and a patch that fails names the session that wrote it.
  */
@@ -118,7 +133,7 @@ export async function report(ctx: HostContext, id: string): Promise<void> {
       const { index } = ctx;
       if (!index) gaps.push('no DSH index hits: the index has not been built yet');
       const reportDir = join(ctx.directory, 'reports', id);
-      const putBack = await setEvidenceAside(reportDir);
+      const aside = await setEvidenceAside(reportDir);
       let record;
       try {
         await buildEvidencePack({ directory: reportDir, candidate: repaired, diffs, dshHits: index ? dshHitsFor(index, repaired) : [], mirror, gaps });
@@ -129,12 +144,13 @@ export async function report(ctx: HostContext, id: string): Promise<void> {
           ...(settings.reportPreset && { preset: settings.reportPreset }), ...(ctx.reportPollMs !== undefined && { pollMs: ctx.reportPollMs }),
         });
       } catch (error) {
-        try { await putBack?.(); } catch (restoring) {
+        if (counted && !hadSession(error)) await refund(ctx, day);
+        try { await aside?.putBack(); } catch (restoring) {
           throw new Error(`${messageOf(error)}；另外，上一份证据没能放回：${messageOf(restoring)}`, { cause: error });
         }
         throw error;
       }
-      await rm(join(reportDir, 'evidence.prev'), { recursive: true, force: true });
+      await aside?.drop();
       const at = ctx.now().toISOString();
       const done = record;
       try {

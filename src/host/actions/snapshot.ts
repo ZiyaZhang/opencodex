@@ -5,7 +5,7 @@ import { clip } from '../changelog-parser.js';
 import { MAX_PAYLOAD, type OpenCodexResponse } from '../remote.js';
 import { messageOf, type HostContext, type Task } from './context.js';
 
-/** Candidates the list carries: the newest by `updatedAt`, ignored ones included. */
+/** Candidates the list carries at least: every reported and started one, then the newest new ones, then the newest ignored ones. */
 const LIST_LIMIT = 800;
 /** Code points of a listed summary and of a listed classification rationale. */
 const SUMMARY_LIMIT = 300, RATIONALE_LIMIT = 120;
@@ -35,6 +35,16 @@ function listed(candidate: Candidate, damaged: Set<string>): Candidate {
   };
 }
 
+/**
+ * The candidates the list carries, in this order: every `reported` and `started` one, however many, then the newest others up to 800 in
+ * all, `new` before `ignored`; within each group latest change first. Ignoring a batch can then never push an active candidate out.
+ */
+function selected(all: Candidate[]): Candidate[] {
+  const active = all.filter(candidate => candidate.status === 'reported' || candidate.status === 'started');
+  const rest = [...all.filter(candidate => candidate.status === 'new'), ...all.filter(candidate => candidate.status === 'ignored')];
+  return [...active, ...rest.slice(0, Math.max(0, LIST_LIMIT - active.length))];
+}
+
 function busyOf(ctx: HostContext): OpenCodexResponse['busy'] {
   const candidates: Record<string, Exclude<Task, 'status'>> = {};
   for (const [id, task] of ctx.busy) if (task !== 'status') candidates[id] = task;
@@ -44,8 +54,8 @@ function busyOf(ctx: HostContext): OpenCodexResponse['busy'] {
 /**
  * The answer to an action that has finished: the snapshot with `result` laid over it. Building the snapshot never fails the action. When
  * the list or the checkpoints cannot be read, the answer goes without them and `notice` says so; a damaged record is listed without what is
- * damaged and named in `notice`; an answer that would pass the Remote's 4 MB bound goes without the list. The list holds the 800 newest
- * candidates (see `listed` for what each carries); `totalCandidates` and `omittedCandidates` say how many there are and how many it leaves out.
+ * damaged and named in `notice`; an answer that would pass the Remote's 4 MB bound goes without the list. The list holds the candidates
+ * `selected` picks, each as `listed` shows it; `totalCandidates` and `omittedCandidates` say how many there are and how many it leaves out.
  */
 export async function respond(ctx: HostContext, result: ActionResult = {}): Promise<OpenCodexResponse> {
   const notices: string[] = [];
@@ -53,7 +63,7 @@ export async function respond(ctx: HostContext, result: ActionResult = {}): Prom
   try {
     const all = await ctx.store.list();
     const damaged = new Set<string>();
-    const candidates = all.slice(0, LIST_LIMIT).map(candidate => listed(candidate, damaged));
+    const candidates = selected(all).map(candidate => listed(candidate, damaged));
     listing = { candidates, totalCandidates: all.length, omittedCandidates: all.length - candidates.length };
     if (damaged.size > 0) notices.push(`这些候选的记录有损坏，列表里只显示能读的部分：${[...damaged].join('、')}`);
   } catch (error) {

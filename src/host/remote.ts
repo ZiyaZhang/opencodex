@@ -26,11 +26,12 @@ export type OpenCodexRequest =
 export interface OpenCodexResponse {
   settings: Settings;
   /**
-   * The 800 newest candidates by `updatedAt`, ignored ones included. Each evidence entry carries only `kind`, `ref` and `url`, `summary` is
-   * cut to 300 code points and `classification.rationale` to 120; `candidate` returns one record whole.
+   * Every `reported` and `started` candidate, then the newest others up to 800 in all, `new` before `ignored`; within each group latest
+   * change first. Each evidence entry carries only `kind`, `ref` and `url`, `summary` is cut to 300 code points and
+   * `classification.rationale` to 120; `candidate` returns one record whole.
    */
   candidates: Candidate[];
-  /** How many candidates there are, and how many of them (the oldest) `candidates` leaves out. */
+  /** How many candidates there are, and how many of them (the oldest new ones, then ignored ones) `candidates` leaves out. */
   totalCandidates: number;
   omittedCandidates: number;
   checkpoints: Record<string, string | undefined>;

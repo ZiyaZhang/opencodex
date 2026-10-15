@@ -172,13 +172,14 @@ function fakeDsh() {
   const defaults: ModelSelection[] = [];
   let gate: Promise<void> | undefined;
   let release = () => {};
-  const hooks: { creatorPrompted?: (request: SessionPromptRequest) => Promise<void>; activationError?: Error } = {};
+  const hooks: { creatorPrompted?: (request: SessionPromptRequest) => Promise<void>; activationError?: Error; createError?: Error } = {};
   return {
     created, renamed, selected, prompts, cancelled, statuses, policies, defaults, hooks,
     hold() { gate = new Promise(resolve => { release = resolve; }); },
     open() { release(); gate = undefined; },
     sessionController: {
       async create(request: SessionCreateRequest) {
+        if (hooks.createError) throw hooks.createError;
         created.push(request);
         const sessionId = SessionId(`${request.agentPreset || 'analyst'}-${created.length}`);
         cwd.set(sessionId, request.cwd!);
@@ -419,23 +420,45 @@ function realistic(n: number): Candidate {
   };
 }
 
-test('2,000 realistic candidates list the newest 800 and the answer stays under 4 MB', async () => {
+/** Writes candidate files straight into the data directory: thousands of upserts would each read the whole store. */
+async function writeCandidates(directory: string, candidates: Candidate[]): Promise<void> {
+  await mkdir(join(directory, 'candidates'), { recursive: true });
+  await Promise.all(candidates.map(candidate => writeFile(join(directory, 'candidates', `${candidate.id}.json`), JSON.stringify(candidate))));
+}
+
+test('2,000 realistic candidates list 800 and the answer stays under 4 MB', async () => {
   const f = await fixture();
   try {
-    await mkdir(join(f.directory, 'candidates'), { recursive: true });
     const all = Array.from({ length: 2_000 }, (_, n) => realistic(n));
     const raw = all.reduce((sum, candidate) => sum + JSON.stringify(candidate).length, 0);
     assert.ok(raw > MAX_PAYLOAD, `the records themselves (${raw} characters) would not fit`);
-    await Promise.all(all.map(candidate => writeFile(join(f.directory, 'candidates', `${candidate.id}.json`), JSON.stringify(candidate))));
+    await writeCandidates(f.directory, all);
     const response = await f.call({ action: 'snapshot' });
     assert.deepEqual([response.candidates.length, response.totalCandidates, response.omittedCandidates], [800, 2_000, 1_200]);
-    assert.deepEqual(response.candidates.map(candidate => candidate.id), all.slice(0, 800).map(candidate => candidate.id), 'newest updatedAt first');
-    assert.ok(response.candidates.some(candidate => candidate.status === 'ignored'), 'ignored ones are listed');
+    const active = all.filter(candidate => candidate.status === 'reported'), fresh = all.filter(candidate => candidate.status === 'new');
+    assert.deepEqual(response.candidates.map(candidate => candidate.id), [...active, ...fresh].slice(0, 800).map(candidate => candidate.id),
+      'reported first, then the newest new ones; ignored ones only when there is room');
     const { result } = OPEN_CODEX_DESCRIPTOR;
     assert.ok(result.mode === 'strict' && result.encode);
     const size = JSON.stringify(result.encode(response, () => null)).length;
     assert.ok(size < MAX_PAYLOAD, `${size} characters`);
     assert.equal(response.notice, undefined);
+  } finally { await f.close(); }
+});
+
+test('the list keeps every reported and started candidate, and ignored ones go last', async () => {
+  const f = await fixture();
+  try {
+    // The oldest are active and the newest were just ignored: a list of the newest 800 would lose every active one.
+    const all = Array.from({ length: 900 }, (_, n): Candidate => ({ ...realistic(n), status: n < 100 ? 'ignored' : n >= 850 ? (n % 2 === 0 ? 'reported' : 'started') : 'new' }));
+    await writeCandidates(f.directory, all);
+    const response = await f.call({ action: 'snapshot' });
+    const active = all.filter(candidate => candidate.status === 'reported' || candidate.status === 'started');
+    const fresh = all.filter(candidate => candidate.status === 'new');
+    assert.deepEqual([active.length, fresh.length], [50, 750]);
+    assert.deepEqual(response.candidates.map(candidate => candidate.id), [...active, ...fresh].map(candidate => candidate.id));
+    assert.deepEqual([response.totalCandidates, response.omittedCandidates], [900, 100]);
+    assert.ok(response.candidates.every(candidate => candidate.status !== 'ignored'));
   } finally { await f.close(); }
 });
 
@@ -675,6 +698,24 @@ test('a failed report session is named in the error, counts toward the day, and 
     assert.equal(find(await f.call({ action: 'report', id: candidate.id }), candidate.id)!.report?.sessionId, 'analyst-3');
     assert.equal(await exists(join(reportDir, 'evidence', 'marker.txt')), false);
     assert.equal(await exists(join(reportDir, 'evidence.prev')), false);
+  } finally { await f.close(); }
+});
+
+test('a report whose session was never created gives its daily place back, and a lone evidence backup is left alone', async () => {
+  const f = await fixture({ settings: { dshMirrorPath: MIRROR, dailyReportLimit: 1 } });
+  try {
+    const candidate = await rssItem(f.store);
+    // A backup without an evidence/ beside it is the only copy left of that pack.
+    const backup = join(f.directory, 'reports', candidate.id, 'evidence.prev');
+    await mkdir(backup, { recursive: true });
+    await writeFile(join(backup, 'marker.txt'), 'the only copy');
+    f.dsh.hooks.createError = new Error('unknown agent preset');
+    await assert.rejects(f.call({ action: 'report', id: candidate.id }), { name: 'ReportSessionError', message: '报告会话准备失败：unknown agent preset' });
+    assert.equal(await f.store.checkpoint(COUNTER), '0', 'the place is given back');
+    assert.equal(await readFile(join(backup, 'marker.txt'), 'utf8'), 'the only copy', 'with no evidence/ to set aside, the backup stays');
+    f.dsh.hooks.createError = undefined;
+    assert.equal(find(await f.call({ action: 'report', id: candidate.id }), candidate.id)!.status, 'reported', 'the one place of the day was free');
+    assert.equal(await f.store.checkpoint(COUNTER), '1');
   } finally { await f.close(); }
 });
 
