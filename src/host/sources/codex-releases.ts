@@ -166,14 +166,33 @@ function clipLines(text: string, limit: number): string {
   return `${kept.join('\n').trimEnd()}\n…`;
 }
 
-/** Paths that are tests or snapshots, matched on `/<path>` so a top-level `tests/` counts too. */
-const TEST_PATH = [/\/tests?\//, /_tests?\.rs$/, /\.snap/, /\.spec\./, /\.test\./];
+/**
+ * Paths that are tests or snapshots: a `test` or `tests` directory, a `__tests__` directory, a Rust test module next to its code (`tests.rs`, `<name>_test.rs`,
+ * `<name>_tests.rs`), a snapshot, a spec, a test file. The directory and module patterns start at the beginning of the path or at a `/`, so `contests.rs` and `latest/` are not tests.
+ */
+const TEST_PATH = [/(?:^|\/)tests?\//, /(?:^|\/)__tests__\//, /(?:^|\/)(?:tests|[^/]+_tests?)\.rs$/, /\.snap/, /\.spec\./, /\.test\./];
 /** Paths by lines changed, most first, with the tests and snapshots after everything else: what a pull request does is in its source files. */
 function rankedPaths(files: PullRequest['files']): string[] {
   return files
-    .map((file, index) => ({ path: file.path, churn: file.additions + file.deletions, test: TEST_PATH.some(pattern => pattern.test(`/${file.path}`)), index }))
+    .map((file, index) => ({ path: file.path, churn: file.additions + file.deletions, test: TEST_PATH.some(pattern => pattern.test(file.path)), index }))
     .sort((a, b) => Number(a.test) - Number(b.test) || b.churn - a.churn || a.index - b.index)
     .map(file => file.path);
+}
+
+/** A title or a line as a reader compares it: no heading marker, one space between words, case folded. */
+const plain = (line: string): string => line.replace(/^#{1,6}\s+/, '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+/**
+ * A pull request description as the excerpt shows it: without its HTML comments (the hints a template leaves for the author, which a reader never sees),
+ * without a first line that only repeats the title, and with each run of blank lines folded into one. A comment that is never closed is left as it is.
+ */
+function tidyBody(body: string, title: string): string {
+  const lines = body.replace(/<!--[\s\S]*?-->/g, '').split(/\r\n|\r|\n/).map(line => line.trimEnd());
+  const first = lines.findIndex(line => line !== '');
+  if (first >= 0 && plain(lines[first]!) === plain(title)) lines[first] = '';
+  const tidy: string[] = [];
+  for (const line of lines) if (line !== '' || tidy.at(-1)) tidy.push(line); // a blank line only right after a line with text
+  return tidy.join('\n').trimEnd();
 }
 
 /** The title, the description cut at a whole line, and the ranked paths, one section each; a path list that is cut says how many files it left out. */
@@ -181,7 +200,7 @@ function excerptOf(pr: PullRequest): string {
   const paths = rankedPaths(pr.files);
   const listed = paths.slice(0, EXCERPT_FILES);
   if (paths.length > EXCERPT_FILES) listed.push(`…另有 ${paths.length - EXCERPT_FILES} 个文件`);
-  return [pr.title, clipLines(pr.body, EXCERPT_BODY), listed.join('\n')].filter(section => section !== '').join('\n\n');
+  return [pr.title, clipLines(tidyBody(pr.body, pr.title), EXCERPT_BODY), listed.join('\n')].filter(section => section !== '').join('\n\n');
 }
 
 /** The evidence entries earlier runs stored that came from a real lookup (they have a URL), by reference. The most recently updated candidate wins. */

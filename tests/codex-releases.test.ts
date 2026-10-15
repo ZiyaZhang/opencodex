@@ -993,6 +993,67 @@ test('collectReleases: the excerpt is the title, the description cut at a whole 
   });
 });
 
+test('collectReleases: the description in the excerpt has no HTML comments, no first line that repeats the title, and no run of blank lines', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const stub = stubGitHub(['rust-v0.162.0', 'rust-v0.161.0'], [release('rust-v0.162.0', notes('Add beta view. (#60010, #60011, #60012, #60013, #60014)'))]);
+    const bodies = new Map<number, string>([
+      // A template hint above the title, a comment inside a line, and comments that leave blank lines behind; CRLF, as GitHub often sends it.
+      [60010, '<!--\r\nThank you for your PR!\r\nPlease read the guide.\r\n-->\r\nPR 60010 title\r\n\r\n## What changed\r\n\r\nDoes <!-- inline -->the thing. <!-- trailing -->\r\n\r\n<!-- another -->\r\n\r\n## Testing\r\n\r\nRan it.\r\n'],
+      // The title as a heading, in another case, is still a repeat.
+      [60011, '# PR 60011 TITLE\n\nBecause it is needed.'],
+      // A first line that only starts like the title is part of the description.
+      [60012, 'PR 60012 title and more\n\nBecause.'],
+      // A description that is nothing but the title leaves no section.
+      [60013, 'PR 60013 title\n'],
+      // A comment ends at the first `-->`, and a comment that is never closed stays.
+      [60014, 'a<!-- x -->b<!-- y -->c\nopen <!-- never closed\nrest'],
+    ]);
+    stub.state.pullOverride = n => ({ body: bodies.get(n) ?? '' });
+    await collectReleases(store, stub.github, snapshotDir);
+    const [beta] = await store.list({ source: 'codex-release' });
+    const [a, b, c, d, e] = beta!.evidence.map(entry => entry.excerpt);
+    const paths = (n: number) => pathsOf(n, 2).join('\n');
+    assert.equal(a, `PR 60010 title\n\n## What changed\n\nDoes the thing.\n\n## Testing\n\nRan it.\n\n${paths(60010)}`);
+    assert.equal(b, `PR 60011 title\n\nBecause it is needed.\n\n${paths(60011)}`);
+    assert.equal(c, `PR 60012 title\n\nPR 60012 title and more\n\nBecause.\n\n${paths(60012)}`);
+    assert.equal(d, excerptOf(60013));
+    assert.equal(e, `PR 60014 title\n\nabc\nopen <!-- never closed\nrest\n\n${paths(60014)}`);
+  });
+});
+
+test('collectReleases: tests, snapshots and Rust test modules rank after the rest of a pull request, however many lines they change', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const source = [ // not tests, though some look like it
+      ['codex-rs/core/src/contests.rs', 50],
+      ['codex-rs/core/src/testing.rs', 40],
+      ['web/src/my__tests__/foo.ts', 30],
+      ['codex-rs/core/src/latest/mod.rs', 20],
+      ['docs/readme.md', 10],
+    ] as const;
+    const tests = [ // each changes more lines than any source file
+      ['codex-rs/core/src/session/tests.rs', 900],
+      ['codex-rs/core/src/session_test.rs', 800],
+      ['codex-rs/core/src/session_tests.rs', 700],
+      ['tests.rs', 650],
+      ['web/src/__tests__/button.ts', 600],
+      ['__tests__/top.ts', 550],
+      ['codex-rs/core/tests/suite/x.rs', 500],
+      ['codex-rs/tui/src/snapshots/z.snap', 400],
+      ['web/app.spec.ts', 300],
+      ['web/app.test.ts', 200],
+      ['tests/top.rs', 100],
+    ] as const;
+    // Handed over in an order that is neither of the two.
+    const given = [...tests.filter((_, i) => i % 2 === 0), ...source, ...tests.filter((_, i) => i % 2 === 1)];
+    const stub = stubGitHub(['rust-v0.162.0', 'rust-v0.161.0'], [release('rust-v0.162.0', notes('Add beta view. (#60010)'))]);
+    stub.state.pullOverride = () => ({ files: given.map(([path, additions]) => ({ path, additions, deletions: 0 })) });
+    await collectReleases(store, stub.github, snapshotDir);
+    const [beta] = await store.list({ source: 'codex-release' });
+    const [, listed] = beta!.evidence[0]!.excerpt!.split('\n\n'); // the title, then the paths
+    assert.deepEqual(listed!.split('\n'), [...source, ...tests].map(([path]) => path));
+  });
+});
+
 test('collectReleases: a short description is kept whole, an empty one leaves no section, and a single line that is too long is cut inside', async () => {
   await withStore(async (store, snapshotDir) => {
     const stub = stubGitHub(['rust-v0.162.0', 'rust-v0.161.0'], [release('rust-v0.162.0', notes('Add beta view. (#60010, #60011, #60012)'))]);
