@@ -155,6 +155,30 @@ test('link definitions are counted by line, repeated labels too, outside fenced 
   assert.equal(linkDefinitions('- [x] 做完\n- [ ] 没做\n[链接](https://x)\n[]: x\n    代码'), 0);
 });
 
+test('link definitions the line count misses are still counted, through marked\'s own lexer', () => {
+  assert.equal(linkDefinitions('[//\n]: # (SECRET)\n\n正文'), 1, 'a label split over two lines');
+  assert.equal(linkDefinitions('```x`\n\n[a]: https://secret\n\n正文'), 1, 'after a line that only looks like a fence');
+  assert.equal(linkDefinitions('<div>\n```\n</div>\n\n[b]: https://secret\n\n正文'), 1, 'after a fence-like line inside raw HTML');
+  const renderer = render(createElement(Markdown, { text: '[//\n]: # (SECRET)\n\n正文', sanitizer: purifier }));
+  assert.match(textOf(renderer.root), /有 1 行链接定义没有显示/);
+});
+
+test('a report that sanitizes to no text at all is shown raw, with a note', () => {
+  const text = '<frameset><frame src="https://x"></frameset>\n\n藏起来的正文';
+  const renderer = render(createElement(Markdown, { text, sanitizer: purifier }));
+  assert.equal(renderer.root.findAll(node => node.props.dangerouslySetInnerHTML !== undefined).length, 0);
+  assert.equal(textOf(renderer.root.findAllByType('pre')[0]!), text);
+  assert.match(textOf(renderer.root), /排版后没有一个字能显示，下面是原文。/);
+  assert.equal(renderer.root.findAll(node => node.type === 'button').length, 0, 'no formatted view to switch to');
+  const definitionsOnly = render(createElement(Markdown, { text: '[a]: https://x\n[b]: https://y', sanitizer: purifier }));
+  assert.equal(textOf(definitionsOnly.root.findAllByType('pre')[0]!), '[a]: https://x\n[b]: https://y');
+});
+
+test('invisible characters written as HTML character references are counted', () => {
+  assert.equal(hiddenCharacters('a&#x200B;b&#X202e;c&#8203;d&#8238e&ZeroWidthSpace;f&zwj;g'), 6);
+  assert.equal(hiddenCharacters('&amp; &#x41; &#65; &copy; https://x?a=1&it=2 &#x110000; &nbsp;'), 0);
+});
+
 test('the report notice counts what is not shown, and 看原文 shows the raw text', () => {
   const text = '<title>藏</title>\n\n[//]: # (藏起来的话)\n\n正文';
   const renderer = render(createElement(Markdown, { text, sanitizer: purifier }));
