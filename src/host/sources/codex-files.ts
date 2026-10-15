@@ -21,7 +21,10 @@ const CONFIG_DOC = 'codex-rs/config.md';
 export const WATCHED = (path: string): boolean => (FEATURE_SOURCE.test(path) && !TEST_MODULE.test(path)) || SCHEMA_TYPE.test(path) || DOC.test(path) || path === CONFIG_DOC;
 export interface ChangedPath { path: string; status: 'added' | 'removed' | 'modified' }
 export interface ChangedFile extends ChangedPath {
-  /** Lines of the new version that the old version does not have. Empty for a removed file and for a file that could not be read. */
+  /**
+   * Lines of the new version that the old version does not have. Empty for a removed file and for a file that could not be read.
+   * Empty without an `error` does not mean that the file was read and gained nothing: a removed file and an `index.ts` are never read (the path and `status` tell which).
+   */
   added: string[];
   /** Why the content was not compared (a failed or refused request, the rate limit, or the fetch budget); `added` is then empty. Never set for a removed file, which is not read. */
   error?: string;
@@ -29,7 +32,7 @@ export interface ChangedFile extends ChangedPath {
 export interface FileGroup { key: string; title: string; kind: EvidenceKind; files: ChangedFile[]; excerpt: string }
 /**
  * What one check of this source did: the window it covered (none when there was nothing new), the candidates it created and the existing ones it added to.
- * `gap` is true when the stored checkpoint could not start the window (its tag is gone, or it is no usable tag), so that the window starts at the previous minor
+ * `gap` is true when the stored checkpoint could not start the window (its tag is gone, or it is no stable tag at all), so that the window starts at the previous minor
  * and the releases in between were not collected.
  */
 export interface FilesCollection { window?: StableWindow; added: number; merged: number; gap: boolean }
@@ -85,11 +88,13 @@ export const addedLines = (before: string, after: string): string[] => newLines(
 const CLOSER: Record<string, string> = { '}': '{', ']': '[', ')': '(', '>': '<' };
 /** Where the scan of a ts-rs file stands between two lines: the brackets still open, and whether a block comment is. */
 interface Scan { open: string[]; comment: boolean }
+/** What stands before the brace that opens a type (`export type X = {`) or one variant of a union (`} | {`), or nothing at all on a line that starts with it. */
+const BEFORE_OPENER = /(?:^|[=|&])\s*$/;
 /**
- * A line cut after each top-level `, ` or `; `, so that one field is one line whatever the length of the line it sits on: a type that grows from 185 to 210 characters
- * must not turn all its fields into new lines. Top level is directly inside the braces of the type, or of one variant of a union, with no other bracket open.
- * ts-rs breaks a type at its doc comments, and the field lines after a comment have no `{` of their own, so `scan` keeps the open brackets from line to line.
- * Nested objects, generics, tuples, strings and comments stay whole.
+ * A line cut after each top-level `, ` or `; `, and right after the brace that opens a type or a variant of a union, so that one field is one line whatever the length of
+ * the line it sits on, and the first field is not glued to the brace (a field inserted before it must not make it a new line). Top level is directly inside the braces of
+ * the type, or of one variant of a union, with no other bracket open. ts-rs breaks a type at its doc comments, and the field lines after a comment have no `{` of their own,
+ * so `scan` keeps the open brackets from line to line. Nested objects, generics, tuples, strings and comments stay whole.
  */
 function splitFields(line: string, scan: Scan): string[] {
   const pieces: string[] = [];
@@ -103,8 +108,14 @@ function splitFields(line: string, scan: Scan): string[] {
       else if (ch === '"') inString = false;
     } else if (ch === '/' && line[i + 1] === '*') { scan.comment = true; i++; }
     else if (ch === '"') inString = true;
-    else if ('{[(<'.includes(ch)) scan.open.push(ch);
-    else if (CLOSER[ch] !== undefined) { if (scan.open.at(-1) === CLOSER[ch]) scan.open.pop(); }
+    else if ('{[(<'.includes(ch)) {
+      scan.open.push(ch);
+      if (ch === '{' && scan.open.length === 1 && BEFORE_OPENER.test(line.slice(start, i))) {
+        pieces.push(line.slice(start, i + 1));
+        start = i + 1;
+        while (line[start] === ' ') start++;
+      }
+    } else if (CLOSER[ch] !== undefined) { if (scan.open.at(-1) === CLOSER[ch]) scan.open.pop(); }
     else if ((ch === ',' || ch === ';') && line[i + 1] === ' ' && scan.open.length === 1 && scan.open[0] === '{') {
       pieces.push(line.slice(start, i + 1));
       start = i + 2;
@@ -113,9 +124,11 @@ function splitFields(line: string, scan: Scan): string[] {
   pieces.push(line.slice(start));
   return pieces;
 }
+/** A piece with nothing but brackets, punctuation and comment marks in it: the end of a type, the junction between two variants, the edge of a doc comment. */
+const DELIMITERS = /^\s*(?:[{}[\]()<>;,|&\s]*|\/\*+|\*+\/?)\s*$/;
 /**
  * The lines compared for a ts-rs generated file: without the leading `//` header and the `import type` lines, which change when the generator or an unrelated type does,
- * and with every line cut into its fields. Blank lines are dropped.
+ * with every line cut into its fields, and without the pieces that are only delimiters (`};`, `}`, `{`, `} | {`, the opening and closing marks of a doc comment) or blank. The text of a doc comment stays.
  */
 export function schemaLines(text: string): string[] {
   const lines: string[] = [];
@@ -124,7 +137,7 @@ export function schemaLines(text: string): string[] {
   for (const line of text.split(LINE_BREAK)) {
     if (header && (!line.trim() || line.startsWith('//'))) continue;
     header = false;
-    if (line.trim() && !/^import type .*;\s*$/.test(line)) lines.push(...splitFields(line, scan).filter(piece => piece.trim()));
+    if (line.trim() && !/^import type .*;\s*$/.test(line)) lines.push(...splitFields(line, scan).filter(piece => !DELIMITERS.test(piece)));
   }
   return lines;
 }
@@ -300,7 +313,8 @@ function isOlder(a: string, b: string): boolean {
 /**
  * The window to collect and the watched blobs at its two ends. Normally that is `stableWindow` of the newest tags and the checkpoint. A checkpoint that fell out of the newest
  * tags (a long absence) still starts the window: it is a stable tag, and two trees cover any range. Only when the tree of that tag cannot be fetched (404) is the window the previous
- * minor's instead; a checkpoint that cannot be a start at all (no stable tag, or not older than the newest one) is ignored in the same way. Both are a `gap`.
+ * minor's instead; a checkpoint that is no stable tag at all is ignored in the same way. Both are a `gap`. A checkpoint newer than the newest listed tag (a release taken back, a listing
+ * that lags) is no gap: there is no window, so that the checkpoint does not move back and nothing the user has seen is collected again under a new key.
  */
 async function planWindow(github: Pick<GitHubClient, 'stableTags' | 'treePaths'>, checkpoint: string | undefined, signal?: AbortSignal): Promise<{ window?: StableWindow; before: Map<string, string>; after: Map<string, string>; gap: boolean }> {
   const tags = await github.stableTags(RECENT_STABLE_TAGS, signal);
@@ -314,17 +328,18 @@ async function planWindow(github: Pick<GitHubClient, 'stableTags' | 'treePaths'>
     const window = stableWindow(tags, checkpoint);
     return window ? trees(window, false) : none(false);
   }
-  if (STABLE_TAG.test(checkpoint) && isOlder(checkpoint, newest)) {
-    const window: StableWindow = { from: checkpoint, to: newest, releases: [...tags] };
-    const [from, to] = await Promise.allSettled([github.treePaths(window.from, WATCHED, signal), github.treePaths(window.to, WATCHED, signal)]);
-    if (to.status === 'rejected') throw to.reason;
-    if (from.status === 'fulfilled') return { window, before: from.value, after: to.value, gap: false };
-    if (!(from.reason instanceof GitHubError && from.reason.status === 404)) throw from.reason;
-    const previous = stableWindow(tags); // the stored tag is gone
-    return previous ? { window: previous, before: await github.treePaths(previous.from, WATCHED, signal), after: to.value, gap: true } : none(true);
+  if (!STABLE_TAG.test(checkpoint)) { // no tag at all: ignored
+    const window = stableWindow(tags);
+    return window ? trees(window, true) : none(true);
   }
-  const window = stableWindow(tags);
-  return window ? trees(window, true) : none(true);
+  if (!isOlder(checkpoint, newest)) return none(false); // newer than the newest listed tag (it is not equal: that is among the tags)
+  const window: StableWindow = { from: checkpoint, to: newest, releases: [...tags] };
+  const [from, to] = await Promise.allSettled([github.treePaths(window.from, WATCHED, signal), github.treePaths(window.to, WATCHED, signal)]);
+  if (to.status === 'rejected') throw to.reason;
+  if (from.status === 'fulfilled') return { window, before: from.value, after: to.value, gap: false };
+  if (!(from.reason instanceof GitHubError && from.reason.status === 404)) throw from.reason;
+  const previous = stableWindow(tags); // the stored tag is gone
+  return previous ? { window: previous, before: await github.treePaths(previous.from, WATCHED, signal), after: to.value, gap: true } : none(true);
 }
 
 /**

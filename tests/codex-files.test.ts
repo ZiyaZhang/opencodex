@@ -73,26 +73,44 @@ test('addedLines reads CRLF like LF and never leaves a carriage return behind', 
   assert.deepEqual(addedLines('a\r\nb\r\n', 'a\nb\n'), []); // converting the line endings of a whole file adds nothing
 });
 
-test('schemaLines drops the generated header and the import lines, and cuts every type line into its fields, long or short', () => {
+test('schemaLines drops the generated header and the import lines, cuts every type line into its fields and leaves out the pieces that are only delimiters', () => {
   const text = tsFile('Thing', fieldsOf(10), ['A', 'B']);
   assert.ok(text.split('\n').some(line => line.length > 200)); // the shape of the real files: the whole type on one line
-  assert.deepEqual(schemaLines(text), ['export type Thing = { field0: string | null,', ...fieldsOf(10).slice(1).map(field => `${field},`), '};']);
+  // The brace that opens the type ends a piece of its own, so the first field is a piece like the others; the closing `};` is no piece.
+  assert.deepEqual(schemaLines(text), ['export type Thing = {', ...fieldsOf(10).map(field => `${field},`)]);
   // A short line is cut the same way: a line that grows past any length must not turn its fields into new lines.
-  assert.deepEqual(schemaLines(tsFile('Small', ['a: string', 'b: number'], ['A'])), ['export type Small = { a: string,', 'b: number,', '};']);
-  // Only the first header line, as in an index file.
+  assert.deepEqual(schemaLines(tsFile('Small', ['a: string', 'b: number'], ['A'])), ['export type Small = {', 'a: string,', 'b: number,']);
+  // Only the first header line, as in an index file; the braces of a re-export open no type.
   assert.deepEqual(schemaLines(indexFile(['A', 'B'])), ['export type { A } from "./A";', 'export type { B } from "./B";']);
   assert.deepEqual(schemaLines(''), []);
+});
+
+test('schemaLines ends a piece at the brace that opens a type or a variant of a union, and leaves out every piece that is only delimiters', () => {
+  assert.deepEqual(schemaLines('export type Empty = {};'), ['export type Empty = {']);
+  assert.deepEqual(schemaLines('export type Pair = {a: string, } & {c: boolean, };'), ['export type Pair = {', 'a: string,', 'c: boolean,']); // no `} & {` between the two
+  // The marks of a doc comment go, its text stays, an empty comment line included among the marks.
+  const documented = 'export type Thing = {a: string, /**\n * First paragraph.\n *\n * Second paragraph.\n */\nb: number, };';
+  assert.deepEqual(schemaLines(documented), ['export type Thing = {', 'a: string,', ' * First paragraph.', ' * Second paragraph.', 'b: number,']);
+  // An inline union of objects inside a field is not a variant of the type: it stays whole in the piece of its field.
+  assert.deepEqual(
+    schemaLines('export type Item = {id: string, status: { "type": "completed" } | { "type": "failed", error: string }, done: boolean, };'),
+    ['export type Item = {', 'id: string,', 'status: { "type": "completed" } | { "type": "failed", error: string },', 'done: boolean,'],
+  );
+  // A brace that opens no type is not cut after: an object type inside a field, or a statement that is no definition.
+  assert.deepEqual(schemaLines('export type Wrapped = Array<{ a: string, b: number }>;'), ['export type Wrapped = Array<{ a: string, b: number }>;']);
+  assert.deepEqual(schemaLines('export { A } from "./A";'), ['export { A } from "./A";']);
+  for (const delimiters of ['};', '}', '{', '/**', ' */', ' *', '} | {', ' ; ', ',']) assert.deepEqual(schemaLines(`${GENERATED}\n${delimiters}\n`), [], JSON.stringify(delimiters));
 });
 
 test('schemaLines keeps its brackets from line to line: the fields after a doc comment are cut like the others, the comment is not', () => {
   // ts-rs breaks a type at its doc comments, so the line after one has no `{` of its own.
   const documented = `${GENERATED}\n\n${GENERATOR}\nimport type { A } from "./A";\n\nexport type Thing = {id: string, name: string | null, /**\n * If true, opt in, for the record; once.\n */\nraw: boolean, map: { [key in string]?: JsonValue } | null, last: number, };\n`;
   assert.deepEqual(schemaLines(documented), [
-    'export type Thing = {id: string,', 'name: string | null,', '/**', ' * If true, opt in, for the record; once.', ' */',
-    'raw: boolean,', 'map: { [key in string]?: JsonValue } | null,', 'last: number,', '};',
+    'export type Thing = {', 'id: string,', 'name: string | null,', ' * If true, opt in, for the record; once.',
+    'raw: boolean,', 'map: { [key in string]?: JsonValue } | null,', 'last: number,',
   ]);
   // Nothing is carried from one file to the next.
-  assert.deepEqual(schemaLines('export type Open = { a: string, '), ['export type Open = { a: string,']);
+  assert.deepEqual(schemaLines('export type Open = { a: string, '), ['export type Open = {', 'a: string,']);
   assert.deepEqual(schemaLines('b: number, c: string'), ['b: number, c: string']);
 });
 
@@ -101,20 +119,20 @@ test('schemaLines: a type line that grows from 185 to 210 characters has the sam
   const typeLine = (text: string) => text.split('\n').find(line => line.startsWith('export type'))!;
   assert.equal(typeLine(before).length, 185);
   assert.ok(typeLine(after).length > 200);
-  assert.deepEqual(schemaLines(after), [...schemaLines(before).slice(0, -1), 'scopeName: string | null,', '};']);
+  assert.deepEqual(schemaLines(after), [...schemaLines(before), 'scopeName: string | null,']);
 });
 
 test('schemaLines splits only at the top level of a type: nested objects, generics, tuples and strings stay whole', () => {
   const nested = `export type Deep = { a: { b: string, c: number }, d: Array<{ e: string, f: number }>, g: [string, number], kind: "one, two; three", ${'h: string, '.repeat(20)}};`;
   assert.deepEqual(schemaLines(nested), [
-    'export type Deep = { a: { b: string, c: number },', 'd: Array<{ e: string, f: number }>,', 'g: [string, number],', 'kind: "one, two; three",', ...Array.from({ length: 20 }, () => 'h: string,'), '};',
+    'export type Deep = {', 'a: { b: string, c: number },', 'd: Array<{ e: string, f: number }>,', 'g: [string, number],', 'kind: "one, two; three",', ...Array.from({ length: 20 }, () => 'h: string,'),
   ]);
-  // Each variant of a union is a top level of its own.
+  // Each variant of a union is a top level of its own, and the junction between two is no piece.
   const union = `export type Item = { "type": "a", id: string, text: string, ${'pad: string, '.repeat(8)}} | { "type": "b", id: string, items: Array<string>, };`;
   const pieces = schemaLines(union);
-  assert.deepEqual(pieces.slice(0, 3), ['export type Item = { "type": "a",', 'id: string,', 'text: string,']);
-  assert.deepEqual(pieces.slice(-4), ['} | { "type": "b",', 'id: string,', 'items: Array<string>,', '};']);
-  assert.ok(pieces.every(piece => piece.length <= 200));
+  assert.deepEqual(pieces.slice(0, 3), ['export type Item = {', '"type": "a",', 'id: string,']);
+  assert.deepEqual(pieces.slice(-3), ['"type": "b",', 'id: string,', 'items: Array<string>,']);
+  assert.ok(pieces.every(piece => piece.length <= 200 && !piece.includes('} | {')));
 });
 
 test('groups by family and bounds the excerpt', () => {
@@ -470,10 +488,10 @@ test('collectFileChanges: every changed protocol type of the window is one candi
     assert.equal(schema!.title, '协议类型有变化（0.162）：3 个类型');
     assert.deepEqual(schema!.evidence, [
       { kind: 'schema', ref: type('Turn'), url: urlOf(WINDOW, type('Turn')), excerpt: 'rootTurnId?: string,' },
-      { kind: 'schema', ref: type('v2/RequestHeader'), url: urlOf(WINDOW, type('v2/RequestHeader')), excerpt: 'export type RequestHeader = { name: string,\nvalue: string,\n};' },
+      { kind: 'schema', ref: type('v2/RequestHeader'), url: urlOf(WINDOW, type('v2/RequestHeader')), excerpt: 'export type RequestHeader = {\nname: string,\nvalue: string,' },
       { kind: 'schema', ref: type('v2/SkillSummary'), url: urlOf(WINDOW, type('v2/SkillSummary')), excerpt: 'scope: string,' },
     ]);
-    assert.equal(schema!.summary, 'Turn: rootTurnId?: string,\nv2/RequestHeader: export type RequestHeader = { name: string,\nv2/RequestHeader: value: string,\nv2/RequestHeader: };\nv2/SkillSummary: scope: string,');
+    assert.equal(schema!.summary, 'Turn: rootTurnId?: string,\nv2/RequestHeader: export type RequestHeader = {\nv2/RequestHeader: name: string,\nv2/RequestHeader: value: string,\nv2/SkillSummary: scope: string,');
 
     // The snapshot lists all six changed files: the index files were not read, the idle one was read and added nothing.
     const { files } = await readSnapshot(snapshotDir, WINDOW);
@@ -1029,6 +1047,63 @@ test('collectFileChanges: a new file without a non-blank line gives no candidate
   });
 });
 
+test('collectFileChanges: a field inserted before the first one, or a doc comment added above it, does not report the fields that merely moved down', async () => {
+  const path = `${DIR}/v2/Thing.ts`;
+  const scene = (older: string, newer: string) => stubGitHub(
+    { 'rust-v0.162.0': new Map([[path, '1']]), 'rust-v0.162.1': new Map([[path, '2']]) },
+    { [`rust-v0.162.0:${path}`]: older, [`rust-v0.162.1:${path}`]: newer },
+  );
+  const base = tsFile('Thing', ['a: string', 'b: number']);
+  // ts-rs puts the doc comment inline: it breaks the line, and the field after it starts a line of its own.
+  const documented = `${GENERATED}\n\n${GENERATOR}\n\nexport type Thing = {/**\n * The first field.\n */\na: string, b: number, };\n`;
+  for (const [what, newer, expected] of [['a field inserted first', tsFile('Thing', ['z: boolean', 'a: string', 'b: number']), ['z: boolean,']], ['a doc comment above the first field', documented, [' * The first field.']]] as const) {
+    await withStore(async (store, snapshotDir) => {
+      assert.deepEqual(await collectFileChanges(store, scene(base, newer).github, snapshotDir), { window: WINDOW, added: 1, merged: 0, gap: false }, what);
+      assert.deepEqual((await readSnapshot(snapshotDir, WINDOW)).files[0]!.added, expected, what);
+    });
+  }
+});
+
+test('collectFileChanges: a closing brace or a comment mark is never reported as an added line', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const path = `${DIR}/v2/Item.ts`;
+    const variant = (name: string) => `{ "type": "${name}", id: string, }`;
+    const union = (...names: string[]) => `${GENERATED}\n\n${GENERATOR}\n\nexport type Item = ${names.map(variant).join(' | ')};\n`;
+    const stub = stubGitHub(
+      { 'rust-v0.162.0': new Map([[path, '1']]), 'rust-v0.162.1': new Map([[path, '2']]) },
+      { [`rust-v0.162.0:${path}`]: union('a', 'b'), [`rust-v0.162.1:${path}`]: union('a', 'b', 'c') },
+    );
+    assert.equal((await collectFileChanges(store, stub.github, snapshotDir)).added, 1);
+    // A third variant adds its discriminator and one more `id`: not the junction `} | {` and not a `};`.
+    assert.deepEqual((await readSnapshot(snapshotDir, WINDOW)).files[0]!.added, ['"type": "c",', 'id: string,']);
+  });
+});
+
+test('collectFileChanges: a stored tag newer than the newest listed one means no window and no gap; the checkpoint and what the user has seen stay as they are', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const stub = scenario();
+    await collectFileChanges(store, stub.github, snapshotDir);
+    const [first] = await filesCandidates(store);
+    await store.transition(first!.id, 'reported');
+    const seen = await filesCandidates(store);
+    const asked = { trees: stub.calls.treePaths.length, files: stub.calls.fileAt.length };
+
+    // The listing knows nothing newer than 0.162.1, yet the checkpoint says 0.170.0 (a release was taken back, say).
+    await store.setCheckpoint('lastFilesTag', 'rust-v0.170.0');
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: false });
+    assert.equal(stub.calls.treePaths.length, asked.trees);
+    assert.equal(stub.calls.fileAt.length, asked.files);
+    assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.170.0'); // never moved back
+    assert.deepEqual(await filesCandidates(store), seen); // nothing collected again under another key
+  });
+  await withStore(async (store, snapshotDir) => {
+    const stub = stubGitHub({}, {}, ['rust-v0.162.1', 'rust-v0.162.0']); // a single minor, so there is no earlier one to fall back to either
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: false });
+    assert.deepEqual(stub.calls.treePaths, []);
+    assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.170.0');
+  }, 'rust-v0.170.0');
+});
+
 const doc = (sha: string) => new Map([['docs/skills.md', sha]]);
 const gone = (tag: string) => new GitHubError(`GitHub HTTP 404 for repos/openai/codex/git/trees/${tag}: Not Found`, `repos/openai/codex/git/trees/${tag}`, { status: 404 });
 /** Makes the tree request of `tag` fail with `error`; the request is still recorded. */
@@ -1089,8 +1164,8 @@ test('collectFileChanges: only a 404 of the stored tag means it is gone; any oth
   }
 });
 
-test('collectFileChanges: a stored tag that cannot start a window is ignored, with a gap; with no earlier minor there is no window either', async () => {
-  for (const checkpoint of ['not-a-tag', 'rust-v0.170.0']) { // no stable tag at all, and a tag newer than the newest
+test('collectFileChanges: a stored value that is no stable tag is ignored, with a gap; with no earlier minor there is no window either', async () => {
+  for (const checkpoint of ['not-a-tag']) { // no stable tag at all
     await withStore(async (store, snapshotDir) => {
       const stub = stubGitHub(
         { 'rust-v0.161.0': doc('1'), 'rust-v0.162.1': doc('2') },
@@ -1140,11 +1215,11 @@ test('collectFileChanges: protocol types found by a patch release join the candi
     // Z was found only by the first window and stays in front, with its own link; Y was found by both, its lines are merged and its link spans both; X is new.
     assert.deepEqual(merged!.evidence, [
       { kind: 'schema', ref: type('Z'), url: urlOf(first, type('Z')), excerpt: 'z2: string,' },
-      { kind: 'schema', ref: type('X'), url: urlOf(second, type('X')), excerpt: 'export type X = { x1: string,\n};' },
+      { kind: 'schema', ref: type('X'), url: urlOf(second, type('X')), excerpt: 'export type X = {\nx1: string,' },
       { kind: 'schema', ref: type('Y'), url: urlOf(windowOf('rust-v0.161.0', 'rust-v0.162.1'), type('Y')), excerpt: 'y2: string,\ny3: string,' },
     ]);
     assert.equal(merged!.title, '协议类型有变化（0.162）：3 个类型'); // the types of the whole candidate
-    assert.equal(merged!.summary, 'Z: z2: string,\nX: export type X = { x1: string,\nX: };\nY: y2: string,\nY: y3: string,');
+    assert.equal(merged!.summary, 'Z: z2: string,\nX: export type X = {\nX: x1: string,\nY: y2: string,\nY: y3: string,');
     assert.deepEqual(merged!.window, { fromTag: 'rust-v0.161.0', toTag: 'rust-v0.162.1' });
 
     // The next minor does not merge into it.
