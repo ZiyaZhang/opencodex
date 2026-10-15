@@ -1,16 +1,22 @@
 import { build } from 'esbuild';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+// Anchor every relative path below to the repository root, so the script behaves the same from any directory.
+// esbuild captures process.cwd() when it is imported, before this runs, so its builds also get absWorkingDir.
+const root = fileURLToPath(new URL('..', import.meta.url));
+process.chdir(root);
 
 await rm('dist', { recursive: true, force: true });
 await mkdir('dist/host', { recursive: true });
 await build({
-  entryPoints: ['src/host/index.ts'], outfile: 'dist/host/index.js',
+  absWorkingDir: root, entryPoints: ['src/host/index.ts'], outfile: 'dist/host/index.js',
   bundle: true, packages: 'external', platform: 'node', target: 'node22',
   format: 'esm', sourcemap: true,
 });
 const client = await build({
-  entryPoints: ['src/client/index.tsx'], bundle: true, write: false,
+  absWorkingDir: root, entryPoints: ['src/client/index.tsx'], bundle: true, write: false,
   platform: 'browser', target: 'es2022', format: 'cjs', jsx: 'automatic',
   external: ['react', 'react/jsx-runtime', 'react-dom', 'react-dom/client', '@deepseek-ai/cordis', '@deepseek-ai/dsh-client-ui-slots'],
   define: { 'process.env.NODE_ENV': '"production"' },
