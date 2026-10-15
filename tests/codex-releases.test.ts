@@ -59,13 +59,13 @@ test('the PR list leaves the text in the other shapes older notes used', () => {
   ]);
 });
 
-test('a bullet wrapped onto continuation lines is read whole, trailing PR list included', () => {
+test('a bullet wrapped onto indented continuation lines is read whole, trailing PR list included', () => {
   const body = [
     '## New Features',
     '',
     '- Add tools for creating and listing',
     '  managed Git worktrees from trusted',
-    'local projects. (#50148,',
+    '\tlocal projects. (#50148,',
     '  #50149)',
     '- Pin tasks in the Command Center. (#51500)',
     '',
@@ -75,6 +75,18 @@ test('a bullet wrapped onto continuation lines is read whole, trailing PR list i
   assert.deepEqual(parseReleaseBody(body), [
     { text: 'Add tools for creating and listing managed Git worktrees from trusted local projects.', prs: [50148, 50149] },
     { text: 'Pin tasks in the Command Center.', prs: [51500] },
+  ]);
+});
+
+test('an un-indented line under a bullet is not part of it, whether it ends the list or sits between bullets', () => {
+  // The changelog link right under the last bullet, with no blank line before it.
+  const changelog = '**Full Changelog**: https://github.com/openai/codex/compare/rust-v0.161.0...rust-v0.162.0';
+  assert.deepEqual(parseReleaseBody(['## New Features', '', '- Pin tasks in the Command Center. (#51500)', changelog, ''].join('\n')), [
+    { text: 'Pin tasks in the Command Center.', prs: [51500] },
+  ]);
+  assert.deepEqual(parseReleaseBody(['## New Features', '', '- Pin tasks in the Command Center. (#51500)', changelog, '- Add worktree tools. (#50148)', ''].join('\n')), [
+    { text: 'Pin tasks in the Command Center.', prs: [51500] },
+    { text: 'Add worktree tools.', prs: [50148] },
   ]);
 });
 
@@ -118,6 +130,11 @@ test('a sub-heading stays inside New Features, the next level-2 heading ends it'
   assert.deepEqual(parseReleaseBody(body).map(f => f.prs), [[10001], [10002]]);
 });
 
+test('a level-1 heading ends the New Features section', () => {
+  const body = ['## New Features', '', '- One. (#10001)', '', '# Appendix', '', '- Two. (#10002)', ''].join('\n');
+  assert.deepEqual(parseReleaseBody(body).map(f => f.prs), [[10001]]);
+});
+
 test('window starts at the checkpoint, or at the previous minor on first run', () => {
   const tags = ['rust-v0.163.0', 'rust-v0.162.1', 'rust-v0.162.0', 'rust-v0.161.0', 'rust-v0.160.1', 'rust-v0.160.0'];
   assert.deepEqual(stableWindow(tags), { from: 'rust-v0.162.1', to: 'rust-v0.163.0', releases: ['rust-v0.163.0'] });
@@ -140,32 +157,38 @@ const release = (tag: string, body: string, prerelease = false): Release => ({ t
 /** Release notes shaped like the real ones: New Features first, then sections whose bullets must not become candidates. */
 const notes = (...bullets: string[]): string =>
   `## New Features\n\n${bullets.map(b => `- ${b}`).join('\n')}\n\n## Bug Fixes\n\n- Fix a crash. (#99999)\n\n## Changelog\n\n- #99998 Unrelated change @someone\n`;
-const pullRequest = (n: number): PullRequest => ({
+const pathsOf = (n: number, count: number): string[] => Array.from({ length: count }, (_, i) => `codex-rs/pr${n}/file${i}.rs`);
+const pullRequest = (n: number, fileCount: number): PullRequest => ({
   number: n, title: `PR ${n} title`, body: '', url: `${PULL_URL}/${n}`, additions: 3, deletions: 1,
-  files: [{ path: `codex-rs/tui/src/pr${n}.rs`, additions: 2, deletions: 1 }, { path: `docs/pr${n}.md`, additions: 1, deletions: 0 }],
+  files: pathsOf(n, fileCount).map(path => ({ path, additions: 1, deletions: 0 })),
 });
-const excerptOf = (n: number): string => `PR ${n} title\ncodex-rs/tui/src/pr${n}.rs\ndocs/pr${n}.md`;
+/** The evidence excerpt of a stub pull request with its default two files: the title, then one path per line. */
+const excerptOf = (n: number): string => [`PR ${n} title`, ...pathsOf(n, 2)].join('\n');
+/** `n` characters that tell their position apart, so a cut in the wrong place shows. */
+const digits = (n: number): string => Array.from({ length: n }, (_, i) => String(i % 10)).join('');
 
 type ReleasesGitHub = Pick<GitHubClient, 'stableTags' | 'release' | 'pullRequest'>;
-/** `state` can be changed between runs (a new release, a failing PR); `calls` records what the collector asked for. */
+type Signals = Array<AbortSignal | undefined>;
+/** `state` can be changed between runs (a new release, a failing PR, a large PR); `calls` records what the collector asked for and `signals` the signal it passed along. */
 function stubGitHub(tags: string[], releases: Release[]) {
-  const state = { tags, releases: new Map(releases.map(r => [r.tag, r])), failing: new Set<number>() };
+  const state = { tags, releases: new Map(releases.map(r => [r.tag, r])), failing: new Set<number>(), fileCount: 2 };
   const calls = { stableTags: [] as number[], release: [] as string[], pullRequest: [] as number[] };
+  const signals = { stableTags: [] as Signals, release: [] as Signals, pullRequest: [] as Signals };
   const github: ReleasesGitHub = {
-    stableTags: async limit => { calls.stableTags.push(limit); return state.tags.slice(0, limit); },
-    release: async tag => {
-      calls.release.push(tag);
+    stableTags: async (limit, signal) => { calls.stableTags.push(limit); signals.stableTags.push(signal); return state.tags.slice(0, limit); },
+    release: async (tag, signal) => {
+      calls.release.push(tag); signals.release.push(signal);
       const found = state.releases.get(tag);
       if (!found) throw new Error(`no release ${tag}`);
       return found;
     },
-    pullRequest: async n => {
-      calls.pullRequest.push(n);
+    pullRequest: async (n, signal) => {
+      calls.pullRequest.push(n); signals.pullRequest.push(signal);
       if (state.failing.has(n)) throw new Error(`GitHub HTTP 404 for repos/openai/codex/pulls/${n}`);
-      return pullRequest(n);
+      return pullRequest(n, state.fileCount);
     },
   };
-  return { github, state, calls };
+  return { github, state, calls, signals };
 }
 
 /** A store whose clock advances one second per write, so `updatedAt` order is the order of the writes. */
@@ -187,7 +210,7 @@ test('collectReleases: the first run covers the releases since the previous mino
     ]);
 
     const first = await collectReleases(store, stub.github, snapshotDir);
-    assert.deepEqual(first, { window: { from: 'rust-v0.161.0', to: 'rust-v0.162.1', releases: ['rust-v0.162.1', 'rust-v0.162.0'] }, added: 3, gap: false });
+    assert.deepEqual(first, { window: { from: 'rust-v0.161.0', to: 'rust-v0.162.1', releases: ['rust-v0.162.1', 'rust-v0.162.0'] }, added: 3, gap: false, prLookupFailures: 0 });
     assert.deepEqual(stub.calls.stableTags, [12]);
     // Oldest first, and the starting point 0.161.0 was seen before the window opened: it is neither fetched nor collected.
     assert.deepEqual(stub.calls.release, ['rust-v0.162.0', 'rust-v0.162.1']);
@@ -222,6 +245,7 @@ test('collectReleases: the first run covers the releases since the previous mino
     assert.equal(second.window, undefined);
     assert.equal(second.added, 0);
     assert.equal(second.gap, false);
+    assert.equal(second.prLookupFailures, 0);
     assert.deepEqual(stub.calls.stableTags, [12, 12]);
     assert.equal(stub.calls.release.length, releaseCalls);
     assert.equal(stub.calls.pullRequest.length, pullCalls);
@@ -231,7 +255,7 @@ test('collectReleases: the first run covers the releases since the previous mino
     stub.state.tags.unshift('rust-v0.163.0');
     stub.state.releases.set('rust-v0.163.0', release('rust-v0.163.0', notes('Add delta pane. (#60030)')));
     const third = await collectReleases(store, stub.github, snapshotDir);
-    assert.deepEqual(third, { window: { from: 'rust-v0.162.1', to: 'rust-v0.163.0', releases: ['rust-v0.163.0'] }, added: 1, gap: false });
+    assert.deepEqual(third, { window: { from: 'rust-v0.162.1', to: 'rust-v0.163.0', releases: ['rust-v0.163.0'] }, added: 1, gap: false, prLookupFailures: 0 });
     assert.equal(await store.checkpoint('lastStableTag'), 'rust-v0.163.0');
     assert.equal((await store.list({ source: 'codex-release' }))[0]!.title, 'Add delta pane.');
   });
@@ -247,7 +271,7 @@ test('collectReleases: a checkpoint covers every stable release since it, across
       release('rust-v0.162.0', notes('Already seen. (#60010)')),
     ]);
     const result = await collectReleases(store, stub.github, snapshotDir);
-    assert.deepEqual(result, { window: { from: 'rust-v0.162.0', to: 'rust-v0.164.0', releases: ['rust-v0.164.0', 'rust-v0.163.0', 'rust-v0.162.1'] }, added: 3, gap: false });
+    assert.deepEqual(result, { window: { from: 'rust-v0.162.0', to: 'rust-v0.164.0', releases: ['rust-v0.164.0', 'rust-v0.163.0', 'rust-v0.162.1'] }, added: 3, gap: false, prLookupFailures: 0 });
     assert.deepEqual(stub.calls.release, ['rust-v0.162.1', 'rust-v0.163.0', 'rust-v0.164.0']);
     const stored = await store.list({ source: 'codex-release' });
     assert.deepEqual(stored.map(c => c.window?.toTag), ['rust-v0.164.0', 'rust-v0.163.0', 'rust-v0.162.1']);
@@ -279,7 +303,7 @@ test('collectReleases: a checkpoint older than the fetched tags reports a gap an
       release('rust-v0.162.0', notes('Add beta view. (#60010)')),
     ]);
     const result = await collectReleases(store, stub.github, snapshotDir);
-    assert.deepEqual(result, { window: { from: 'rust-v0.161.0', to: 'rust-v0.162.1', releases: ['rust-v0.162.1', 'rust-v0.162.0'] }, added: 2, gap: true });
+    assert.deepEqual(result, { window: { from: 'rust-v0.161.0', to: 'rust-v0.162.1', releases: ['rust-v0.162.1', 'rust-v0.162.0'] }, added: 2, gap: true, prLookupFailures: 0 });
     // The checkpoint moves into the list, so the next run no longer reports a gap.
     assert.equal(await store.checkpoint('lastStableTag'), 'rust-v0.162.1');
     assert.equal((await collectReleases(store, stub.github, snapshotDir)).gap, false);
@@ -293,12 +317,30 @@ test('collectReleases: a pull request that cannot be fetched still gives a candi
     // A signal that is not aborted changes nothing: a failed lookup is still just a missing pull request.
     const result = await collectReleases(store, stub.github, snapshotDir, new AbortController().signal);
     assert.equal(result.added, 1);
+    assert.equal(result.prLookupFailures, 1);
     const [beta] = await store.list({ source: 'codex-release' });
     assert.deepEqual(beta!.evidence, [
       { kind: 'pr', ref: '#60010', url: `${PULL_URL}/60010`, excerpt: excerptOf(60010) },
       { kind: 'pr', ref: '#60011' },
       { kind: 'pr', ref: '#60012', url: `${PULL_URL}/60012`, excerpt: excerptOf(60012) },
     ]);
+  });
+});
+
+test('collectReleases: prLookupFailures counts every lookup that fell back to a bare reference, across bullets and releases', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const stub = stubGitHub(['rust-v0.162.1', 'rust-v0.162.0', 'rust-v0.161.0'], [
+      release('rust-v0.162.1', notes('Add alpha tool. (#60001, #60002)')),
+      release('rust-v0.162.0', notes('Add beta view. (#60010)', 'Add gamma flag. (#60020, #60021)')),
+    ]);
+    for (const n of [60001, 60002, 60021]) stub.state.failing.add(n);
+    const result = await collectReleases(store, stub.github, snapshotDir);
+    assert.equal(result.added, 3); // a failed lookup never costs a candidate
+    assert.equal(result.prLookupFailures, 3);
+    const bare = (await store.list({ source: 'codex-release' })).flatMap(c => c.evidence).filter(e => e.url === undefined).map(e => e.ref).sort();
+    assert.deepEqual(bare, ['#60001', '#60002', '#60021']);
+    // Nothing is left to collect, so nothing can fail.
+    assert.equal((await collectReleases(store, stub.github, snapshotDir)).prLookupFailures, 0);
   });
 });
 
@@ -330,5 +372,74 @@ test('collectReleases: a failed release fetch fails the run and keeps the checkp
     assert.equal(retry.added, 1); // only 0.162.1 is new; the stored 0.162.0 candidate is refreshed to the same content
     assert.equal(await store.checkpoint('lastStableTag'), 'rust-v0.162.1');
     assert.equal((await store.list({ source: 'codex-release' })).length, 2);
+  });
+});
+
+test('collectReleases: the newest release is on top of the list and, within a release, the first bullet of the notes', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const stub = stubGitHub(['rust-v0.162.1', 'rust-v0.162.0', 'rust-v0.161.0'], [
+      release('rust-v0.162.1', notes('Alpha one. (#60001)', 'Alpha two. (#60002)')),
+      release('rust-v0.162.0', notes('Beta one. (#60010)', 'Beta two. (#60011)')),
+    ]);
+    await collectReleases(store, stub.github, snapshotDir);
+    const stored = await store.list({ source: 'codex-release' });
+    assert.deepEqual(stored.map(c => c.title), ['Alpha one.', 'Alpha two.', 'Beta one.', 'Beta two.']);
+    // list() sorts by updatedAt, newest first: each candidate was written after the one listed below it.
+    for (let i = 1; i < stored.length; i++) {
+      assert.ok(stored[i - 1]!.updatedAt > stored[i]!.updatedAt, `${stored[i - 1]!.title} should have been written after ${stored[i]!.title}`);
+    }
+  });
+});
+
+test('collectReleases: a title of up to 160 code points is the bullet itself, a longer one is cut to 160 with a trailing ellipsis', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const exact = digits(160), over = digits(161);
+    const emoji = `${'x'.repeat(158)}😀😀😀`; // 161 code points but 164 UTF-16 units: a cut by units would split the first emoji
+    const stub = stubGitHub(['rust-v0.162.0', 'rust-v0.161.0'], [
+      release('rust-v0.162.0', notes(`${exact} (#60001)`, `${over} (#60002)`, `${emoji} (#60003)`)),
+    ]);
+    await collectReleases(store, stub.github, snapshotDir);
+    const stored = await store.list({ source: 'codex-release' });
+    const byPr = (n: number) => stored.find(c => c.fingerprint === `codex-release:pr:${n}`)!;
+
+    assert.equal(byPr(60001).title, exact);
+    assert.equal(byPr(60002).title, `${digits(159)}…`);
+    assert.equal(byPr(60003).title, `${'x'.repeat(158)}😀…`);
+    for (const n of [60001, 60002, 60003]) assert.equal([...byPr(n).title].length, 160);
+    assert.doesNotMatch(byPr(60003).title, /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/); // no half of a surrogate pair
+    // The summary keeps the whole bullet.
+    assert.equal(byPr(60001).summary, exact);
+    assert.equal(byPr(60002).summary, over);
+    assert.equal(byPr(60003).summary, emoji);
+  });
+});
+
+test('collectReleases: the evidence excerpt names at most 20 files of a large pull request', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const stub = stubGitHub(['rust-v0.162.0', 'rust-v0.161.0'], [release('rust-v0.162.0', notes('Add beta view. (#60010)'))]);
+    stub.state.fileCount = 25;
+    await collectReleases(store, stub.github, snapshotDir);
+    const [beta] = await store.list({ source: 'codex-release' });
+    const excerpt = beta!.evidence[0]!.excerpt!;
+    const lines = excerpt.split('\n');
+    assert.equal(lines[0], 'PR 60010 title');
+    assert.deepEqual(lines.slice(1), pathsOf(60010, 20)); // the first 20 paths, in the order the pull request lists them
+    assert.ok(!excerpt.includes('file20.rs'));
+  });
+});
+
+test('collectReleases: the signal is passed on to stableTags, release and pullRequest', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const stub = stubGitHub(['rust-v0.162.1', 'rust-v0.162.0', 'rust-v0.161.0'], [
+      release('rust-v0.162.1', notes('Add alpha tool. (#60001)')),
+      release('rust-v0.162.0', notes('Add beta view. (#60010, #60011)')),
+    ]);
+    const { signal } = new AbortController();
+    await collectReleases(store, stub.github, snapshotDir, signal);
+    // One call for the tag list, one per release in the window, one per pull request; each got the very same signal object.
+    assert.equal(stub.signals.stableTags.length, 1);
+    assert.equal(stub.signals.release.length, 2);
+    assert.equal(stub.signals.pullRequest.length, 3);
+    for (const [name, received] of Object.entries(stub.signals)) assert.ok(received.every(s => s === signal), `${name} did not receive the signal`);
   });
 });

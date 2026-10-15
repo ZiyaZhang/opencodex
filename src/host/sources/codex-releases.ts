@@ -20,8 +20,9 @@ const PR_REF = String.raw`(?:#\d+|\[#\d+\]\([^)\s]*\))`;
 const PR_LIST = new RegExp(String.raw`\s*\(${PR_REF}(?:,?\s*${PR_REF})*\)\s*\.?\s*$`);
 
 /**
- * The bullets of the `## New Features` section as one line each. A bullet that wraps onto the lines after it is joined, whether
- * those lines are indented or not; a blank line or a heading ends it. A heading of level 1 or 2 ends the section, a deeper one does not.
+ * The bullets of the `## New Features` section as one line each. An indented line directly under a bullet continues it, as wrapped
+ * text does. A blank line, a heading, or an un-indented line such as `**Full Changelog**: …` ends the bullet, and that line is not read.
+ * A heading of level 1 or 2 ends the section, a deeper one does not.
  * Line endings are normalised first: the 0.158.0 notes ship with CRLF, and `.` in a pattern does not match `\r`.
  */
 function newFeatureBullets(body: string): string[] {
@@ -38,8 +39,8 @@ function newFeatureBullets(body: string): string[] {
     if (!inSection) continue;
     const bullet = /^\s*[-*]\s+(.*)$/.exec(line);
     if (bullet) { bullets.push(bullet[1]!); open = true; }
-    else if (!line.trim()) open = false;
-    else if (open) bullets[bullets.length - 1] += ` ${line}`;
+    else if (open && /^\s+\S/.test(line)) bullets[bullets.length - 1] += ` ${line}`;
+    else open = false;
   }
   return bullets;
 }
@@ -72,23 +73,30 @@ export function stableWindow(tags: string[], lastSeen?: string): StableWindow | 
   return { from: tags[fromIndex]!, to, releases: tags.slice(0, fromIndex) };
 }
 
-export interface ReleaseCollection { window?: StableWindow; added: number; /** The checkpoint is older than the fetched tags; intermediate releases were not collected. */ gap: boolean }
+export interface ReleaseCollection {
+  window?: StableWindow; added: number;
+  /** The checkpoint is older than the fetched tags; intermediate releases were not collected. */
+  gap: boolean;
+  /** Pull request lookups of this run that failed. Each left only a bare `#N` reference as evidence, and nothing retries them. */
+  prLookupFailures: number;
+}
 
-/** At most `limit` characters (code points, so an emoji is never cut in half); a longer text ends in an ellipsis, as the desktop source clips its messages. */
+/** At most `limit` code points, so an emoji is never cut in half. A longer text is cut to `limit - 1` code points and ends in `…`, the way the desktop source clips its messages. */
 function clip(text: string, limit: number): string {
   const chars = [...text];
   return chars.length > limit ? `${chars.slice(0, limit - 1).join('')}…` : text;
 }
 
-/** One entry per pull request, in the order the bullet lists them. A pull request that cannot be fetched keeps its bare reference. */
-async function evidenceFor(github: Pick<GitHubClient, 'pullRequest'>, numbers: number[], signal?: AbortSignal): Promise<Evidence[]> {
+/** One entry per pull request, in the order the bullet lists them, and how many lookups failed. A pull request that cannot be fetched keeps its bare reference. */
+async function evidenceFor(github: Pick<GitHubClient, 'pullRequest'>, numbers: number[], signal?: AbortSignal): Promise<{ evidence: Evidence[]; failures: number }> {
   const pulls = await Promise.all(numbers.map(n => github.pullRequest(n, signal).catch((error: unknown) => {
     if (signal?.aborted) throw error; // an abort ends the run; it is not a missing pull request
     return undefined;
   })));
-  return pulls.map((pr, i): Evidence => pr
+  const evidence = pulls.map((pr, i): Evidence => pr
     ? { kind: 'pr', ref: `#${pr.number}`, url: pr.url, excerpt: [pr.title, ...pr.files.slice(0, EXCERPT_FILES).map(f => f.path)].join('\n') }
     : { kind: 'pr', ref: `#${numbers[i]}` });
+  return { evidence, failures: pulls.filter(pr => pr === undefined).length };
 }
 
 /**
@@ -100,21 +108,24 @@ export async function collectReleases(store: CandidateStore, github: Pick<GitHub
   const lastSeen = await store.checkpoint('lastStableTag');
   const gap = lastSeen !== undefined && !tags.includes(lastSeen);
   const window = stableWindow(tags, lastSeen);
-  if (!window) return { added: 0, gap };
-  let added = 0;
-  // Oldest first: the store lists by last write, so the newest release ends up on top.
+  if (!window) return { added: 0, gap, prLookupFailures: 0 };
+  let added = 0, prLookupFailures = 0;
+  // Oldest release first, and within a release the last bullet first: the store lists the latest write first, so the newest release
+  // ends up on top and the first bullet of the notes leads its release.
   for (const tag of [...window.releases].reverse()) {
     const release = await github.release(tag, signal);
     if (release.prerelease) continue; // the tags endpoint has no prerelease flag; the release record is authoritative
     await writeJsonAtomic(join(snapshotDir, 'codex-releases', `${tag}.json`), release);
-    for (const feature of parseReleaseBody(release.body)) {
+    for (const feature of parseReleaseBody(release.body).reverse()) {
+      const { evidence, failures } = await evidenceFor(github, feature.prs, signal);
+      prLookupFailures += failures;
       const { created } = await store.upsert({
         source: 'codex-release', key: `pr:${feature.prs[0]}`, title: clip(feature.text, TITLE_LIMIT), summary: feature.text,
-        evidence: await evidenceFor(github, feature.prs, signal), window: { fromTag: window.from, toTag: tag },
+        evidence, window: { fromTag: window.from, toTag: tag },
       });
       if (created) added++;
     }
   }
   await store.setCheckpoint('lastStableTag', window.to);
-  return { window, added, gap };
+  return { window, added, gap, prLookupFailures };
 }
