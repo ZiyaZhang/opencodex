@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { execFile, execFileSync } from 'node:child_process';
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import type { Source } from '../src/core/candidate.ts';
 import { ValidationError } from '../src/core/check.ts';
 import { DEFAULT_SETTINGS, mergeSettings, validateSettings, type ModelRoute, type Settings, type SettingsPatch } from '../src/core/settings.ts';
@@ -44,9 +46,9 @@ const ghExit = (stderr: string) => Object.assign(new Error('Command failed: gh')
 
 /**
  * A gh runner that answers like openai/codex with two stable tags: the 0.162.0 notes, a two-file pull request for every number,
- * and trees in which only the feature registry differs. Every call is recorded; `failTrees`, `failPr` and `failRelease` each break one kind of request.
+ * and trees in which only the feature registry differs. Every call is recorded; `failTrees`, `failPr`, `failRelease` and `failContents` each break one kind of request.
  */
-function codex(body: string, options: { failTrees?: boolean; failPr?: number; failRelease?: string } = {}): { gh: GhRunner; calls: string[][] } {
+function codex(body: string, options: { failTrees?: boolean; failPr?: number; failRelease?: string; failContents?: string } = {}): { gh: GhRunner; calls: string[][] } {
   const calls: string[][] = [];
   const gh: GhRunner = async args => {
     calls.push(args);
@@ -75,6 +77,7 @@ function codex(body: string, options: { failTrees?: boolean; failPr?: number; fa
         ] });
       }
       const file = /^repos\/openai\/codex\/contents\/(.+)\?ref=(.+)$/.exec(target);
+      if (file && options.failContents) throw ghExit(options.failContents);
       const text = file && decodeURIComponent(file[1]!) === FLAGS ? FLAGS_AT[decodeURIComponent(file[2]!)] : undefined;
       if (text !== undefined) return JSON.stringify({ encoding: 'base64', content: Buffer.from(text).toString('base64') });
     }
@@ -98,7 +101,7 @@ test('a failing source is recorded and the others still run; the desktop source 
     assert.equal(result.index, undefined);
     assert.deepEqual(result.desktop, { version: '', changed: false, added: 0, keys: 0 });
     assert.deepEqual(result.releases, { added: 0, gap: false, prLookupFailures: 0, unreleased: [], unrecognized: [], rateLimited: false });
-    assert.deepEqual(result.files, { added: 0, merged: 0, gap: false });
+    assert.deepEqual(result.files, { added: 0, merged: 0, gap: false, unread: { overBudget: 0, rateLimited: 0, failed: 0 } });
     assert.equal(result.rss, 0);
     assert.deepEqual(await store.checkpoints(), {});
     assert.deepEqual(await store.list(), []);
@@ -116,7 +119,8 @@ test('a check collects every source into the data directory, and a second check 
     assert.deepEqual(first.errors, []);
     assert.deepEqual(first.releases.window, { from: 'rust-v0.161.0', to: 'rust-v0.162.0', releases: ['rust-v0.162.0'] });
     assert.deepEqual([first.releases.added, first.releases.prLookupFailures, first.releases.gap], [6, 0, false]);
-    assert.deepEqual(first.files, { window: { from: 'rust-v0.161.0', to: 'rust-v0.162.0', releases: ['rust-v0.162.0'] }, added: 1, merged: 0, gap: false });
+    const nothingUnread = { overBudget: 0, rateLimited: 0, failed: 0 };
+    assert.deepEqual(first.files, { window: { from: 'rust-v0.161.0', to: 'rust-v0.162.0', releases: ['rust-v0.162.0'] }, added: 1, merged: 0, gap: false, unread: nothingUnread });
     assert.deepEqual(first.desktop, { version: '', changed: false, added: 0, keys: 0 });
     assert.ok(first.rss > 0);
     assert.deepEqual([await count(store, 'codex-release'), await count(store, 'codex-files'), await count(store, 'rss'), await count(store, 'desktop')], [6, 1, first.rss, 0]);
@@ -130,8 +134,8 @@ test('a check collects every source into the data directory, and a second check 
     assert.ok(first.index && first.index.entries > 0);
     const index = await loadIndex(home);
     assert.ok(index, 'index/dsh-index.json reads back as an index');
-    assert.equal(index.entries.length, first.index.entries);
-    assert.equal(index.commit, first.index.commit);
+    assert.deepEqual(first.index, { entries: index.entries.length, commit: index.commit, builtAt: index.builtAt });
+    assert.deepEqual(JSON.parse(JSON.stringify(first)), first, 'the result goes over JSON unchanged');
     const state = await store.checkpoints();
     assert.deepEqual([state.lastStableTag, state.lastFilesTag, state.indexCommit], ['rust-v0.162.0', 'rust-v0.162.0', first.index.commit]);
     assert.match(state.rssHash ?? '', /^[0-9a-f]{64}$/);
@@ -142,7 +146,7 @@ test('a check collects every source into the data directory, and a second check 
     assert.ok(!second.releases.window);
     assert.ok(!second.desktop.changed);
     assert.deepEqual([second.releases.added, second.desktop.added, second.rss], [0, 0, 0]);
-    assert.deepEqual(second.files, { added: 0, merged: 0, gap: false });
+    assert.deepEqual(second.files, { added: 0, merged: 0, gap: false, unread: nothingUnread });
     assert.equal(second.index?.entries, first.index.entries);
     assert.equal((await store.list()).length, 6 + 1 + first.rss);
     const tagsPage = 'repos/openai/codex/tags?per_page=100&page=1';
@@ -158,7 +162,7 @@ test('a watched-file diff that failed is taken up by the next check, although th
     const first = await check(codex(body, { failTrees: true }).gh);
     assert.equal(first.releases.added, 6);
     assert.ok(first.rss > 0);
-    assert.deepEqual(first.files, { added: 0, merged: 0, gap: false });
+    assert.deepEqual(first.files, { added: 0, merged: 0, gap: false, unread: { overBudget: 0, rateLimited: 0, failed: 0 } });
     assert.equal(first.errors.length, 1);
     assert.match(first.errors[0]!, /^files: .*HTTP 502/);
     assert.equal(await store.checkpoint('lastStableTag'), 'rust-v0.162.0');
@@ -193,7 +197,7 @@ test('gaps since the stored tags and failed PR lookups are reported, and the win
     assert.equal(result.errors.length, 3);
     assert.match(result.errors[0]!, /^releases: .*rust-v0\.150\.0.*rust-v0\.161\.0/);
     assert.match(result.errors[1]!, /^releases: 1 PR lookups failed \(GitHub HTTP 404 for repos\/openai\/codex\/pulls\/50148: .*\); those candidates carry bare evidence until the next run$/);
-    assert.equal(result.errors[2], 'files: the stored tag no longer exists; the window restarted at the previous minor');
+    assert.equal(result.errors[2], 'files: the stored tag could not be used as the window start; the window restarted at rust-v0.161.0');
   });
 });
 
@@ -213,7 +217,7 @@ test('a rate limit and release notes of an unknown shape are reported without fa
     // gh names no reset time; the release source stops at the release it could not read and keeps its checkpoint.
     const limited = await quietCheck(home, store, codex(await readRelease(), { failRelease: 'HTTP 403: API rate limit exceeded for user ID 1. (https://api.github.com/repos/openai/codex/releases/tags/rust-v0.162.0)' }).gh);
     assert.equal(limited.releases.rateLimited, true);
-    assert.deepEqual(limited.errors, ['releases: GitHub rate limit hit; the checkpoint stopped before the affected release']);
+    assert.deepEqual(limited.errors, ['releases: GitHub rate limit hit; the checkpoint stopped before rust-v0.162.0']);
     assert.equal(await store.checkpoint('lastStableTag'), undefined);
 
     const odd = await quietCheck(home, store, codex('Highlights\n\n- Faster startup (#51600)\n').gh);
@@ -221,14 +225,17 @@ test('a rate limit and release notes of an unknown shape are reported without fa
     assert.deepEqual(odd.errors, ['releases: release notes format not recognized for rust-v0.162.0']);
   });
   await withHome(async (home, store) => {
-    // REST names the reset time; it is reported in ISO form. The watched-file source asks for the same tags and fails on the same limit.
+    // REST names the reset time; it is reported in ISO form. The limit refused the tag listing, so no release was touched and the notice names none.
+    // The watched-file source asks for the same tags and fails on the same limit.
     const resetAt = new Date('2026-10-15T13:00:00.000Z');
     const limit: typeof fetch = async () => new Response(JSON.stringify({ message: 'API rate limit exceeded for 192.0.2.1.' }), {
       status: 403, headers: { 'content-type': 'application/json', 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(resetAt.getTime() / 1000) },
     });
     const result = await runCheck({ directory: home, store, settings: QUIET, github: new GitHubClient({ gh: null, fetch: limit }), fetcher: serve(await readFeed()), signal: never(), now: NOW });
     assert.equal(result.errors.length, 2);
-    assert.equal(result.errors[0], 'releases: GitHub rate limit hit, resets at 2026-10-15T13:00:00.000Z; the checkpoint stopped before the affected release');
+    assert.equal(result.errors[0], 'releases: GitHub rate limit hit, resets at 2026-10-15T13:00:00.000Z');
+    assert.equal(result.releases.rateLimitResetAt, '2026-10-15T13:00:00.000Z');
+    assert.deepEqual(JSON.parse(JSON.stringify(result)), result);
     assert.match(result.errors[1]!, /^files: GitHub HTTP 403 for repos\/openai\/codex\/tags\?per_page=100&page=1: API rate limit exceeded/);
     assert.ok(result.rss > 0, 'the RSS source is not held up by GitHub');
   });
@@ -236,7 +243,92 @@ test('a rate limit and release notes of an unknown shape are reported without fa
     // A retry-after too large for a Date leaves an Invalid Date behind; the notice goes out without a reset time rather than failing.
     const garbled: typeof fetch = async () => new Response('{}', { status: 403, headers: { 'retry-after': '1e300' } });
     const result = await runCheck({ directory: home, store, settings: QUIET, github: new GitHubClient({ gh: null, fetch: garbled }), fetcher: serve('', 404), signal: never() });
-    assert.equal(result.errors[0], 'releases: GitHub rate limit hit; the checkpoint stopped before the affected release');
+    assert.equal(result.errors[0], 'releases: GitHub rate limit hit');
+    assert.equal(result.releases.rateLimitResetAt, undefined);
+  });
+});
+
+/** openai/codex over anonymous REST: the two stable tags, notes with only Bug Fixes (so no pull request is looked up), and `docs` pages added at rust-v0.162.0. Records each path asked for. */
+function restCodex(docs: number): { fetch: typeof fetch; paths: string[] } {
+  const paths: string[] = [];
+  const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  const pages = Array.from({ length: docs }, (_, i) => `docs/page-${String(i + 1).padStart(2, '0')}.md`);
+  const answer = async (input: string | URL | Request): Promise<Response> => {
+    const path = String(input).replace('https://api.github.com/', '');
+    paths.push(path);
+    if (path === 'repos/openai/codex/tags?per_page=100&page=1') return json(TAGS.map(name => ({ name })));
+    const release = /^repos\/openai\/codex\/releases\/tags\/(.+)$/.exec(path);
+    if (release) return json({ tag_name: decodeURIComponent(release[1]!), published_at: '2026-10-08T18:55:59Z', body: '## Bug Fixes\n\n- Fix a crash. (#51203)\n', prerelease: false });
+    const tree = /^repos\/openai\/codex\/git\/trees\/([^?]+)\?recursive=1$/.exec(path);
+    if (tree) return json({ truncated: false, tree: decodeURIComponent(tree[1]!) === 'rust-v0.162.0' ? pages.map(page => ({ path: page, type: 'blob', sha: page })) : [] });
+    if (/^repos\/openai\/codex\/contents\//.test(path)) return json({ encoding: 'base64', content: Buffer.from('# A new page\n\nIt says what is new.\n').toString('base64') });
+    return new Response(JSON.stringify({ message: 'Not Found' }), { status: 404 });
+  };
+  return { fetch: answer as typeof fetch, paths };
+}
+
+test('changed files that were not read are reported by reason, and a rate limit says the window will be retried', async () => {
+  const body = await readRelease();
+  await withHome(async (home, store) => {
+    const failed = await quietCheck(home, store, codex(body, { failContents: 'gh: Server Error (HTTP 500)' }).gh);
+    assert.deepEqual(failed.files.unread, { overBudget: 0, rateLimited: 0, failed: 1 });
+    assert.deepEqual(failed.errors, ['files: 1 changed files not read (0 over budget, 0 rate limited, 1 failed)']);
+  });
+  await withHome(async (home, store) => {
+    const limited = await quietCheck(home, store, codex(body, { failContents: 'HTTP 403: API rate limit exceeded for user ID 1. (https://api.github.com/repos/openai/codex/contents/x)' }).gh);
+    assert.deepEqual(limited.errors, ['files: 1 changed files not read (0 over budget, 1 rate limited, 0 failed); the window will be retried']);
+    const retried = await quietCheck(home, store, codex(body).gh);
+    assert.deepEqual(retried.files.window, { from: 'rust-v0.161.0', to: 'rust-v0.162.0', releases: ['rust-v0.162.0'] });
+    assert.deepEqual(retried.errors, []);
+  });
+  await withHome(async (home, store) => {
+    // Anonymous REST reads 10 files a check: the release source has used part of the hour's 60 requests, and a modified file costs two.
+    const rest = restCodex(12);
+    const result = await runCheck({ directory: home, store, settings: QUIET, github: new GitHubClient({ gh: null, fetch: rest.fetch }), fetcher: serve(await readFeed()), signal: never(), now: NOW });
+    assert.equal(rest.paths.filter(path => path.includes('/contents/')).length, 10);
+    assert.deepEqual(result.files.unread, { overBudget: 2, rateLimited: 0, failed: 0 });
+    assert.deepEqual(result.errors, ['files: 2 changed files not read (2 over budget, 0 rate limited, 0 failed)']);
+  });
+});
+
+test('one check at a time per data directory: a call while a check runs gets that check', async () => {
+  const github = codex(await readRelease());
+  const xml = await readFeed();
+  await withHome(async (home, store) => {
+    const fetched: string[] = [];
+    const options: CheckOptions = { directory: home, store, settings: QUIET, github: new GitHubClient({ gh: github.gh }), fetcher: serve(xml, 200, fetched), signal: never(), now: NOW };
+    const first = runCheck(options);
+    // The same directory spelled another way; the second call's own (aborted) signal is not used.
+    const second = runCheck({ ...options, directory: `${home}/./`, signal: AbortSignal.abort() });
+    assert.equal(second, first);
+    const [a, b] = await Promise.all([first, second]);
+    assert.equal(a, b);
+    assert.equal(a.releases.added, 6);
+    assert.equal(fetched.length, 1);
+    const tagsPage = 'repos/openai/codex/tags?per_page=100&page=1';
+    assert.equal(github.calls.filter(args => args.at(-1) === tagsPage).length, 2, 'once per GitHub source');
+    // Once it has finished, the next call is a check of its own.
+    const third = runCheck(options);
+    assert.notEqual(third, first);
+    assert.equal((await third).releases.added, 0);
+    assert.equal(fetched.length, 2);
+  });
+});
+
+test('error lines say why a fetch failed, fold whitespace and stop at 300 characters', async () => {
+  await withHome(async (home, store) => {
+    const rssLine = async (fetcher: typeof fetch) =>
+      (await runCheck({ directory: home, store, settings: QUIET, github: offline(), fetcher, signal: never() })).errors.find(line => line.startsWith('rss:'));
+    const refused = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:7890'), { code: 'ECONNREFUSED' });
+    assert.equal(await rssLine(async () => { throw new TypeError('fetch failed', { cause: refused }); }), 'rss: fetch failed (connect ECONNREFUSED 127.0.0.1:7890)');
+    assert.equal(await rssLine(async () => { throw new TypeError('fetch failed', { cause: { code: 'UND_ERR_SOCKET' } }); }), 'rss: fetch failed (UND_ERR_SOCKET)');
+    const long = (await rssLine(async () => { throw new Error(`first line\n\n  second\tline ${'x'.repeat(400)}`); }))!;
+    assert.equal([...long].length, 300);
+    assert.ok(long.startsWith('rss: first line second line xxx') && long.endsWith('…'), long);
+    // A GitHubError says why by itself; its cause, the raw gh error, would only repeat the command line.
+    const gh: GhRunner = async args => { throw Object.assign(new Error(`Command failed: gh ${args.join(' ')}\nerror connecting to api.github.com`), { code: 1, stderr: 'error connecting to api.github.com\n' }); };
+    const { errors } = await runCheck({ directory: home, store, settings: QUIET, github: new GitHubClient({ gh }), fetcher: serve('', 404), signal: never() });
+    assert.equal(errors[0], 'releases: GitHub request for repos/openai/codex/tags?per_page=100&page=1 failed (gh): error connecting to api.github.com');
   });
 });
 
@@ -297,6 +389,14 @@ test('pruneDesktopSnapshots keeps the newest version directories by mtime and le
     await assert.rejects(pruneDesktopSnapshots(snapshots, 0), ValidationError);
     assert.equal((await readdir(dir)).length, 4);
   });
+  await withHome(async snapshots => {
+    // Equal mtimes: the names decide, in natural order, so build 10 is newer than build 9.
+    const dir = join(snapshots, 'desktop');
+    const at = new Date(Date.UTC(2026, 9, 1));
+    for (const name of ['26.1007.9_(9)', '26.1007.10_(10)', '26.1007.11_(11)']) { await mkdir(join(dir, name), { recursive: true }); await utimes(join(dir, name), at, at); }
+    await pruneDesktopSnapshots(snapshots, 2);
+    assert.deepEqual((await readdir(dir)).sort(), ['26.1007.10_(10)', '26.1007.11_(11)']);
+  });
 });
 
 test('refreshIndex writes the index and its commit, and a wrong or empty mirror keeps the previous index', async () => {
@@ -314,6 +414,67 @@ test('refreshIndex writes the index and its commit, and a wrong or empty mirror 
     } finally { await rm(empty, { recursive: true, force: true }); }
     assert.equal(await readFile(file, 'utf8'), written);
     assert.deepEqual(await loadIndex(home), index);
+  });
+});
+
+/** Git without the caller's GIT_* variables (a hook exports GIT_DIR) and without user configuration. */
+const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', '-c', 'commit.gpgsign=false', ...args], {
+  cwd, encoding: 'utf8', env: { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith('GIT_'))), HOME: cwd },
+});
+
+test('refreshIndex keeps the previous index when the new one shrinks below half or loses its commit, unless forced', async () => {
+  await withHome(async (home, store) => {
+    const repo = join(home, 'mirror-git');
+    await cp(MIRROR, repo, { recursive: true });
+    git(repo, 'init', '-q');
+    git(repo, 'add', '.');
+    git(repo, 'commit', '-q', '-m', 'mirror');
+    const known = await refreshIndex(home, store, repo);
+    assert.match(known.commit, /^[0-9a-f]{40}$/);
+    assert.ok(known.entries.length >= 3);
+    const file = join(home, 'index', 'dsh-index.json');
+    const written = await readFile(file, 'utf8');
+    // The same content outside git: an unknown commit does not replace an index of a known one.
+    await assert.rejects(refreshIndex(home, store, MIRROR), /no readable commit.*keeping the previous index/);
+    // One package where the previous index had more than two entries: a mirror cut short, or the wrong path.
+    const small = join(home, 'mirror-small');
+    await mkdir(join(small, 'packages', 'g', 'one'), { recursive: true });
+    await writeFile(join(small, 'packages', 'g', 'one', 'README.md'), '# one\n\n## Summary\n\nOne package.\n');
+    await assert.rejects(refreshIndex(home, store, small), new RegExp(`has 1 entries, fewer than half of the previous ${known.entries.length}`));
+    assert.equal(await readFile(file, 'utf8'), written);
+    assert.equal(await store.checkpoint('indexCommit'), known.commit);
+    // A rebuild the user asked for goes through.
+    assert.equal((await refreshIndex(home, store, small, { force: true })).entries.length, 1);
+    assert.equal((await loadIndex(home))?.entries.length, 1);
+    // An unknown commit after an unknown commit is no loss: a mirror that is no git checkout still gets refreshed.
+    assert.equal((await refreshIndex(home, store, MIRROR)).commit, 'unknown');
+  });
+});
+
+const SCRIPT = fileURLToPath(new URL('../scripts/collect.ts', import.meta.url));
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+/** Runs the CLI through tsx and resolves with its exit code and output, a failing exit included. */
+async function cli(...args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  try {
+    const { stdout, stderr } = await promisify(execFile)(process.execPath, ['--import', 'tsx', SCRIPT, ...args], { cwd: ROOT, encoding: 'utf8' });
+    return { code: 0, stdout, stderr };
+  } catch (error) {
+    const failed = error as { code?: number; stdout?: string; stderr?: string };
+    return { code: failed.code ?? -1, stdout: failed.stdout ?? '', stderr: failed.stderr ?? '' };
+  }
+}
+
+test('the CLI exits 2 with one line, and no stack trace, for an unknown option, a stray argument, bad settings or a --home it cannot write', async () => {
+  await withHome(async home => {
+    const file = join(home, 'a-file');
+    await writeFile(file, '');
+    for (const args of [['--home', home, '--bogus'], ['--home', home, 'stray'], ['--home'], [], ['--home', home, '--locale', 'zh CN'], ['--home', join(file, 'home')], ['--home', file]]) {
+      const { code, stdout, stderr } = await cli(...args);
+      assert.equal(code, 2, `${args.join(' ')}: ${stderr}`);
+      assert.equal(stdout, '');
+      assert.equal(stderr.trimEnd().split('\n').length, 1, stderr);
+      assert.doesNotMatch(stderr, /^\s+at /m);
+    }
   });
 });
 
