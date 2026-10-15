@@ -34,8 +34,15 @@ export interface FileGroup { key: string; title: string; kind: EvidenceKind; fil
  * What one check of this source did: the window it covered (none when there was nothing new), the candidates it created and the existing ones it added to.
  * `gap` is true when the stored checkpoint could not start the window (its tag is gone, or it is no stable tag at all), so that the window starts at the previous minor
  * and the releases in between were not collected.
+ * `unread` counts the changed files whose content was not read, by reason; a removed file and an `index.ts` are never read and do not count. `rateLimited` is the file the rate limit
+ * refused and the ones skipped after it. While it is above zero the checkpoint stays where it was, so that the next check retries the window, and `rateLimitResetAt` says when
+ * the limit lifts, if GitHub said so.
  */
-export interface FilesCollection { window?: StableWindow; added: number; merged: number; gap: boolean }
+export interface FilesCollection {
+  window?: StableWindow; added: number; merged: number; gap: boolean;
+  unread: { overBudget: number; rateLimited: number; failed: number };
+  rateLimitResetAt?: Date;
+}
 
 /** The window is worked out from this many of the newest stable tags, as the release source does. */
 const RECENT_STABLE_TAGS = 12;
@@ -288,9 +295,9 @@ const isRateLimit = (error: unknown): boolean => error instanceof GitHubError &&
 
 /**
  * Both versions of one added or modified file, compared line by line (an added file has no old version). A file that cannot be read is recorded with its error so that the
- * rest of the run goes on; an abort ends the run. `rateLimited` tells the caller to stop asking.
+ * rest of the run goes on; an abort ends the run. `rateLimited` tells the caller to stop asking, `resetAt` when the limit lifts.
  */
-async function readChange(github: Pick<GitHubClient, 'fileAt'>, window: StableWindow, change: ChangedPath, signal?: AbortSignal): Promise<{ file: ChangedFile; rateLimited: boolean }> {
+async function readChange(github: Pick<GitHubClient, 'fileAt'>, window: StableWindow, change: ChangedPath, signal?: AbortSignal): Promise<{ file: ChangedFile; rateLimited: boolean; resetAt?: Date }> {
   // An async wrapper, so that a call which throws instead of rejecting still leaves both reads for `Promise.all` to settle.
   const read = async (tag: string) => github.fileAt(tag, change.path, signal);
   try {
@@ -299,7 +306,8 @@ async function readChange(github: Pick<GitHubClient, 'fileAt'>, window: StableWi
     return { file: { ...change, added }, rateLimited: false };
   } catch (error) {
     if (signal?.aborted) throw error;
-    return { file: { ...change, added: [], error: (error instanceof Error ? error.message : String(error)) || 'unknown error' }, rateLimited: isRateLimit(error) };
+    const rateLimited = isRateLimit(error);
+    return { file: { ...change, added: [], error: (error instanceof Error ? error.message : String(error)) || 'unknown error' }, rateLimited, resetAt: rateLimited ? (error as GitHubError).rateLimitResetAt : undefined };
   }
 }
 
@@ -347,7 +355,9 @@ async function planWindow(github: Pick<GitHubClient, 'stableTags' | 'treePaths'>
  * that changed in it: the feature-flag sources, all protocol types together, and each doc on its own. `added` counts the candidates created, `merged` the existing ones added to,
  * `gap` says whether the window had to start at the previous minor because the stored tag could not start it.
  * The checkpoint moves only after the snapshot and every candidate are stored: a failed tag or tree request, or a failed store, throws and the next check retries the window
- * (a candidate the earlier attempt already stored is recognised by its `toTag` and left alone). A file that cannot be read is recorded and does not hold the checkpoint back.
+ * (a candidate the earlier attempt already stored is recognised by its `toTag` and left alone). A file that cannot be read, or is past the budget, is recorded and does not hold
+ * the checkpoint back. A rate limit does: the files it kept unread are counted, the checkpoint stays, and the next check retries the window. Because a stored group is left alone
+ * on a retry, a group with a file the rate limit kept unread is not stored yet: it waits for the retry, which can store it complete. The groups read in full are stored now.
  * The candidate is keyed by the minor version, so a patch release adds to the candidate of its minor while that is still `new`: its evidence is kept (matched by `ref`, the lines of a
  * file found by both windows are merged), `window.fromTag` stays at the first window's, and the summary is rebuilt from all of it. Once the user has moved the candidate on, the
  * findings go to a candidate of the full version instead.
@@ -362,21 +372,29 @@ export async function collectFileChanges(
   check(Number.isInteger(budget) && budget >= 0, `budget must be a non-negative integer, got ${budget}`);
   signal?.throwIfAborted();
   const { window, before, after, gap } = await planWindow(github, await store.checkpoint(CHECKPOINT), signal);
-  if (!window) return { added: 0, merged: 0, gap };
+  const unread = { overBudget: 0, rateLimited: 0, failed: 0 };
+  if (!window) return { added: 0, merged: 0, gap, unread };
   const changes = changedWatched(before, after);
   const loaded = new Map<string, ChangedFile>();
-  let slots = budget, limited = false;
+  const held = new Set<string>(); // the files the rate limit kept unread
+  let slots = budget, limited = false, resetAt: Date | undefined;
   for (const change of [...changes].sort(byPriority)) {
     signal?.throwIfAborted();
     if (change.status === 'removed' || isIndex(change.path)) loaded.set(change.path, { ...change, added: [] }); // nothing to read, or nothing that reaches a candidate
-    else if (slots === 0) loaded.set(change.path, { ...change, added: [], error: OVER_BUDGET });
-    else {
+    else if (slots === 0) {
+      loaded.set(change.path, { ...change, added: [], error: OVER_BUDGET });
+      unread.overBudget++;
+    } else {
       slots--;
-      if (limited) loaded.set(change.path, { ...change, added: [], error: RATE_LIMITED });
-      else {
+      if (limited) {
+        loaded.set(change.path, { ...change, added: [], error: RATE_LIMITED });
+        held.add(change.path);
+        unread.rateLimited++;
+      } else {
         const reading = await readChange(github, window, change, signal);
-        limited = reading.rateLimited;
         loaded.set(change.path, reading.file);
+        if (reading.rateLimited) { limited = true; resetAt = reading.resetAt; held.add(change.path); unread.rateLimited++; }
+        else if (reading.file.error !== undefined) unread.failed++;
       }
     }
   }
@@ -385,7 +403,9 @@ export async function collectFileChanges(
   await writeJsonAtomic(join(snapshotDir, 'codex-files', `${window.from}__${window.to}.json`), { window, files });
 
   let added = 0, merged = 0;
+  const waiting = new Set([...held].map(path => groupOf(path).key));
   for (const group of groupWatchedFiles(files)) {
+    if (waiting.has(group.key)) continue; // stored half-read it would be left alone by the retry, with its unread marker in it
     const { key, version, existing, stored } = await targetFor(store, group.key, window.to);
     // Merging a window again would count the lines its stored excerpt left out twice, and a candidate the user has moved on would get a copy.
     if (stored) continue;
@@ -400,6 +420,6 @@ export async function collectFileChanges(
     if (result.created) added++;
     else merged++; // the window's end differs from the one it had, so an existing candidate always changes
   }
-  await store.setCheckpoint(CHECKPOINT, window.to);
-  return { window, added, merged, gap };
+  if (unread.rateLimited === 0) await store.setCheckpoint(CHECKPOINT, window.to); // after a rate limit the next check reads the window again
+  return { window, added, merged, gap, unread, ...(resetAt && { rateLimitResetAt: resetAt }) };
 }

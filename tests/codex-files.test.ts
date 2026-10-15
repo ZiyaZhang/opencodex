@@ -224,10 +224,13 @@ const windowOf = (from: string, to: string): StableWindow => ({ from, to, releas
 const WINDOW = windowOf('rust-v0.162.0', 'rust-v0.162.1');
 /** The link of an evidence entry: GitHub's compare page with the anchor of the file. */
 const urlOf = (window: StableWindow, path: string): string => `https://github.com/openai/codex/compare/${window.from}...${window.to}#diff-${createHash('sha256').update(path).digest('hex')}`;
+/** Nothing was left unread. */
+const NONE = { overBudget: 0, rateLimited: 0, failed: 0 };
 const OVER_BUDGET = '超出本次读取上限';
 const RATE_LIMITED = '已达 GitHub 速率限制';
 const isAbortError = (error: unknown) => (error as Error).name === 'AbortError';
-const rateLimit = (path: string) => new GitHubError(`GitHub HTTP 403 for repos/openai/codex/contents/${path}: API rate limit exceeded`, `repos/openai/codex/contents/${path}`, { status: 403, rateLimited: true });
+const RESET = new Date('2026-10-15T07:30:00Z');
+const rateLimit = (path: string, rateLimitResetAt?: Date) => new GitHubError(`GitHub HTTP 403 for repos/openai/codex/contents/${path}: API rate limit exceeded`, `repos/openai/codex/contents/${path}`, { status: 403, rateLimited: true, rateLimitResetAt });
 
 /**
  * `trees` holds the watched blobs of each tag and `texts` the file bodies by `tag:path`; `state.tags` is the stable tag list, newest first.
@@ -296,7 +299,7 @@ async function assertNothingWritten(store: CandidateStore, snapshotDir: string, 
 test('collectFileChanges: one candidate per group, a removed file is not read, the snapshot keeps every changed file, the next check finds no window', async () => {
   await withStore(async (store, snapshotDir) => {
     const stub = scenario();
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 3, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 3, merged: 0, gap: false, unread: NONE });
     assert.deepEqual(stub.calls.stableTags, [12]);
     assert.deepEqual(stub.calls.treePaths, ['rust-v0.162.0', 'rust-v0.162.1']);
     // Feature flags first, then config.md, then docs. The removed feature file is not read at all; an added one is read at `to` only.
@@ -329,7 +332,7 @@ test('collectFileChanges: one candidate per group, a removed file is not read, t
     assert.deepEqual(flags!.evidence, [{ kind: 'feature-flag', ref: 'codex-rs/features/src/lib.rs', url: urlOf(WINDOW, 'codex-rs/features/src/lib.rs'), excerpt: '（文件已删除）' }]);
 
     // The next check: no newer tag, so no window; nothing is requested and nothing is rewritten.
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: false, unread: NONE });
     assert.deepEqual(stub.calls.stableTags, [12, 12]);
     assert.equal(stub.calls.treePaths.length, 2);
     assert.equal(stub.calls.fileAt.length, 3);
@@ -348,14 +351,14 @@ test('collectFileChanges: it works out its own window from the tags and keeps it
     await store.setCheckpoint('lastStableTag', 'rust-v0.160.0'); // the release source's checkpoint has no say here, and stays as it is
 
     // No checkpoint of its own: the window starts at the newest tag of the previous minor.
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: { from: 'rust-v0.161.0', to: 'rust-v0.162.1', releases: ['rust-v0.162.1', 'rust-v0.162.0'] }, added: 1, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: { from: 'rust-v0.161.0', to: 'rust-v0.162.1', releases: ['rust-v0.162.1', 'rust-v0.162.0'] }, added: 1, merged: 0, gap: false, unread: NONE });
     assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.1');
     assert.equal(await store.checkpoint('lastStableTag'), 'rust-v0.160.0');
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: false, unread: NONE });
 
     // A patch release: the window starts at the checkpoint, and the candidate of the minor takes it in.
     stub.state.tags.unshift('rust-v0.162.2');
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: windowOf('rust-v0.162.1', 'rust-v0.162.2'), added: 0, merged: 1, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: windowOf('rust-v0.162.1', 'rust-v0.162.2'), added: 0, merged: 1, gap: false, unread: NONE });
     assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.2');
     assert.equal(stub.calls.treePaths.length, 4); // two windows; the idle check asked for no tree
     assert.deepEqual(await readSnapshot(snapshotDir, windowOf('rust-v0.162.1', 'rust-v0.162.2')), {
@@ -367,7 +370,7 @@ test('collectFileChanges: it works out its own window from the tags and keeps it
 test('collectFileChanges: with a single minor and no checkpoint there is no window', async () => {
   await withStore(async (store, snapshotDir) => {
     const stub = stubGitHub({}, {}, ['rust-v0.162.1', 'rust-v0.162.0']);
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: false, unread: NONE });
     assert.deepEqual(stub.calls.treePaths, []);
     assert.equal(await store.checkpoint('lastFilesTag'), undefined);
   }, null);
@@ -387,7 +390,7 @@ test('collectFileChanges: a failed tag list or tree request throws and leaves th
     await assertNothingWritten(store, snapshotDir);
 
     stub.github.treePaths = trees;
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 3, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 3, merged: 0, gap: false, unread: NONE });
     assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.1');
   });
 });
@@ -404,7 +407,7 @@ test('collectFileChanges: a failure while storing keeps the checkpoint; the retr
     assert.equal(first.length, 1);
 
     store.upsert = upsert;
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 2, merged: 0, gap: false }); // the stored group is recognised and left as it was
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 2, merged: 0, gap: false, unread: NONE }); // the stored group is recognised and left as it was
     assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.1');
     const all = await filesCandidates(store);
     assert.equal(all.length, 3);
@@ -428,7 +431,7 @@ test('collectFileChanges: a retried window leaves a stored candidate alone, even
     assert.match(stored!.evidence[0]!.excerpt!, /\n…另有 \d+ 行$/);
 
     store.upsert = upsert;
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 1, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 1, merged: 0, gap: false, unread: NONE });
     assert.deepEqual((await filesCandidates(store)).find(c => c.id === stored!.id), stored); // merged again, its omitted lines would have been counted twice
   });
 });
@@ -445,7 +448,7 @@ test('collectFileChanges: a retried window does not copy a group into a full-ver
     const moved = (await filesCandidates(store))[0]!;
 
     store.upsert = upsert;
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 2, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 2, merged: 0, gap: false, unread: NONE });
     const all = await filesCandidates(store);
     assert.deepEqual(all.map(c => c.fingerprint), ['codex-files:doc:codex-rs/config.md:0.162', 'codex-files:doc:docs/skills.md:0.162', 'codex-files:feature-flags:0.162']); // no ':0.162.1' copy
     assert.deepEqual(all[0], moved);
@@ -479,7 +482,7 @@ test('collectFileChanges: every changed protocol type of the window is one candi
         [`rust-v0.162.1:${type('v2/index')}`]: indexFile(['SkillSummary', 'Header', 'RequestHeader']),
       },
     );
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 1, merged: 0, gap: false }); // ClientRequest.ts did not change
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 1, merged: 0, gap: false, unread: NONE }); // ClientRequest.ts did not change
 
     const [schema, ...others] = await filesCandidates(store);
     assert.equal(others.length, 0);
@@ -510,7 +513,7 @@ test('collectFileChanges: a window where only index files changed gives a snapsh
       { 'rust-v0.162.0': new Map([[`${DIR}/index.ts`, '1']]), 'rust-v0.162.1': new Map([[`${DIR}/index.ts`, '2']]) },
       { [`rust-v0.162.0:${DIR}/index.ts`]: indexFile(['A']), [`rust-v0.162.1:${DIR}/index.ts`]: indexFile(['A', 'B']) },
     );
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 0, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 0, merged: 0, gap: false, unread: NONE });
     assert.deepEqual(stub.calls.fileAt, []); // an index file never reaches a candidate, so it is not read
     assert.deepEqual((await readSnapshot(snapshotDir, WINDOW)).files, [{ path: `${DIR}/index.ts`, status: 'modified', added: [] }]);
     assert.deepEqual(await store.list(), []);
@@ -526,7 +529,7 @@ test('collectFileChanges: a promoted flag shows as added although its new line e
       { 'rust-v0.162.0': new Map([[path, '1']]), 'rust-v0.162.1': new Map([[path, '2']]) },
       { [`rust-v0.162.0:${path}`]: flags(true, false, false), [`rust-v0.162.1:${path}`]: flags(true, true, false) },
     );
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 1, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 1, merged: 0, gap: false, unread: NONE });
     const [candidate] = await filesCandidates(store);
     assert.equal(candidate!.title, '功能开关注册表有变化（0.162）');
     assert.equal(candidate!.evidence[0]!.excerpt, '        default_enabled: true,');
@@ -573,7 +576,7 @@ test('collectFileChanges: a file that cannot be read is recorded with its error,
     const stub = scenario();
     const tooBig = 'codex-rs/config.md@rust-v0.162.1 is larger than the 1 MB the GitHub contents API returns (2500000 bytes)';
     stub.failing.set('codex-rs/config.md', new Error(tooBig));
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 3, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 3, merged: 0, gap: false, unread: { overBudget: 0, rateLimited: 0, failed: 1 } });
     assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.1');
 
     const { files } = await readSnapshot(snapshotDir, WINDOW);
@@ -712,7 +715,8 @@ test('collectFileChanges: at most 60 files are read by default, the types last s
     const stub = stubGitHub({ 'rust-v0.162.0': new Map(), 'rust-v0.162.1': after }, texts);
 
     // The 3 feature files make one group, the 3 protocol types one, config.md one and the 60 docs sixty: 63 candidates.
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 63, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 63, merged: 0, gap: false, unread: { overBudget: 7, rateLimited: 0, failed: 0 } });
+    assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.1'); // a budget overflow is final for the window: no retry
     const fetched = stub.calls.fileAt.map(call => call.slice('rust-v0.162.1:'.length));
     assert.equal(fetched.length, 60);
     assert.deepEqual(fetched.slice(0, 4), ['codex-rs/features/src/a.rs', 'codex-rs/features/src/b.rs', 'codex-rs/features/src/c.rs', 'codex-rs/config.md']);
@@ -770,7 +774,7 @@ test('collectFileChanges: a budget of zero reads nothing, an omitted one is the 
   });
 });
 
-test('collectFileChanges: after a rate limit the remaining files are recorded unread and not requested', async () => {
+test('collectFileChanges: after a rate limit the remaining files are recorded unread and not requested, and the checkpoint stays', async () => {
   const docs = ['a', 'b', 'c'].map(name => `docs/${name}.md`);
   const scene = () => stubGitHub(
     { 'rust-v0.162.0': new Map([['codex-rs/features/src/old.rs', '1']]), 'rust-v0.162.1': new Map([['codex-rs/features/src/f.rs', '1'], ['codex-rs/config.md', '1'], ...docs.map((path): [string, string] => [path, '1'])]) },
@@ -778,38 +782,139 @@ test('collectFileChanges: after a rate limit the remaining files are recorded un
   );
   await withStore(async (store, snapshotDir) => {
     const stub = scene();
-    const limit = rateLimit('docs/a.md');
+    const limit = rateLimit('docs/a.md', RESET);
     stub.failing.set('docs/a.md', limit);
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 5, merged: 0, gap: false }); // the feature files, config.md and three docs
+    // The groups are the feature files (f.rs and the removed old.rs), config.md and three docs; the three docs are the ones the limit touched, so two groups are stored.
+    const result = await collectFileChanges(store, stub.github, snapshotDir);
+    assert.deepEqual(result, { window: WINDOW, added: 2, merged: 0, gap: false, unread: { overBudget: 0, rateLimited: 3, failed: 0 }, rateLimitResetAt: RESET });
     // Flags, config.md, then docs/a.md is refused; docs/b.md and docs/c.md are never asked for.
     assert.deepEqual(stub.calls.fileAt, ['rust-v0.162.1:codex-rs/features/src/f.rs', 'rust-v0.162.1:codex-rs/config.md', 'rust-v0.162.1:docs/a.md']);
-    const { files } = await readSnapshot(snapshotDir, WINDOW);
+    const { files } = await readSnapshot(snapshotDir, WINDOW); // the snapshot is written all the same
     const byPath = (path: string) => files.find(f => f.path === path)!;
     assert.equal(byPath('docs/a.md').error, limit.message); // the request that was refused keeps its own error
     for (const path of ['docs/b.md', 'docs/c.md']) assert.deepEqual(byPath(path), { path, status: 'added', added: [], error: RATE_LIMITED });
     assert.deepEqual(byPath('codex-rs/features/src/old.rs'), { path: 'codex-rs/features/src/old.rs', status: 'removed', added: [] }); // a removed file is never a read error
-    const b = await store.findByFingerprint('codex-files:doc:docs/b.md:0.162');
-    assert.equal(b!.summary, `b.md: （内容未读取：${RATE_LIMITED}）`);
-    assert.equal(b!.evidence[0]!.excerpt, `（内容未读取：${RATE_LIMITED}）`);
-    assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.1'); // read failures do not hold the checkpoint back
+    assert.deepEqual((await filesCandidates(store)).map(c => c.fingerprint), ['codex-files:doc:codex-rs/config.md:0.162', 'codex-files:feature-flags:0.162']);
+    assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.0'); // the next check reads the window again
   });
-  // gh reports a GraphQL rate limit without any status: the flag is what counts.
+  // gh reports a GraphQL rate limit without any status, and may not know when it lifts: the flag is what counts, and there is no reset time to report.
   await withStore(async (store, snapshotDir) => {
     const stub = scene();
     stub.failing.set('docs/a.md', new GitHubError('GitHub request for repos/openai/codex/contents/docs/a.md failed (gh): API rate limit already exceeded', 'repos/openai/codex/contents/docs/a.md', { rateLimited: true }));
-    await collectFileChanges(store, stub.github, snapshotDir);
+    const result = await collectFileChanges(store, stub.github, snapshotDir);
     assert.equal(stub.calls.fileAt.length, 3);
+    assert.equal(result.unread.rateLimited, 3);
+    assert.ok(!('rateLimitResetAt' in result));
+    assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.0');
   });
-  // A 403 that is no rate limit (the contents API answers 403 for a blob over 1 MB), and any other failure, cost only their own file.
+  // A 403 that is no rate limit (the contents API answers 403 for a blob over 1 MB), and any other failure, cost only their own file and hold nothing back.
   for (const failure of [new GitHubError('GitHub HTTP 403 for repos/openai/codex/contents/docs/a.md: This API returns blobs up to 1 MB in size', 'repos/openai/codex/contents/docs/a.md', { status: 403 }), new Error('boom')]) {
     await withStore(async (store, snapshotDir) => {
       const stub = scene();
       stub.failing.set('docs/a.md', failure);
-      await collectFileChanges(store, stub.github, snapshotDir);
+      const result = await collectFileChanges(store, stub.github, snapshotDir);
       assert.equal(stub.calls.fileAt.length, 5);
+      assert.deepEqual(result.unread, { overBudget: 0, rateLimited: 0, failed: 1 });
+      assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.1');
       assert.equal((await readSnapshot(snapshotDir, WINDOW)).files.filter(f => f.error).length, 1);
     });
   }
+});
+
+test('collectFileChanges: the unread files are counted by reason; a removed file and an index file are not unread', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const read = ['codex-rs/features/src/f.rs', 'codex-rs/config.md', 'docs/a.md', 'docs/b.md', 'docs/c.md', `${DIR}/T.ts`];
+    const stub = stubGitHub(
+      { 'rust-v0.162.0': new Map([['codex-rs/features/src/old.rs', '1']]), 'rust-v0.162.1': new Map([...read, `${DIR}/index.ts`].map((path): [string, string] => [path, '1'])) },
+      Object.fromEntries(read.map(path => [`rust-v0.162.1:${path}`, path.endsWith('.ts') ? tsFile('T', ['a: string']) : `body of ${path}\n`])),
+    );
+    stub.failing.set('codex-rs/config.md', new Error('boom')); // some other failure
+    stub.failing.set('docs/a.md', rateLimit('docs/a.md', RESET));
+    // Budget 5: f.rs, config.md and the three docs take the slots. config.md fails, docs/a.md is refused by the limit, docs/b.md and docs/c.md are skipped after it,
+    // and T.ts is past the budget. The removed old.rs and index.ts are not read, and are not counted.
+    const result = await collectFileChanges(store, stub.github, snapshotDir, undefined, { budget: 5 });
+    assert.deepEqual(result.unread, { overBudget: 1, rateLimited: 3, failed: 1 });
+    assert.equal(result.rateLimitResetAt, RESET);
+    const { files } = await readSnapshot(snapshotDir, WINDOW);
+    assert.deepEqual(files.filter(f => f.error).map(f => f.path), [`${DIR}/T.ts`, 'codex-rs/config.md', 'docs/a.md', 'docs/b.md', 'docs/c.md']); // in the order of the tree diff
+    assert.deepEqual(files.filter(f => !f.error && f.added.length === 0).map(f => f.path), [`${DIR}/index.ts`, 'codex-rs/features/src/old.rs']);
+  });
+});
+
+test('collectFileChanges: a rate limit keeps the checkpoint, even when it refuses the last file; a budget overflow or a failed read does not', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const stub = scenario();
+    stub.failing.set('docs/skills.md', rateLimit('docs/skills.md')); // the last file to read: nothing is skipped after it, and it is still unread
+    const result = await collectFileChanges(store, stub.github, snapshotDir);
+    assert.deepEqual(result, { window: WINDOW, added: 2, merged: 0, gap: false, unread: { overBudget: 0, rateLimited: 1, failed: 0 } });
+    assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.0');
+    assert.equal((await readSnapshot(snapshotDir, WINDOW)).files.length, 3); // the snapshot, and the candidates of what was read, are written
+    assert.equal((await filesCandidates(store)).length, 2);
+  });
+  await withStore(async (store, snapshotDir) => {
+    const result = await collectFileChanges(store, scenario().github, snapshotDir, undefined, { budget: 1 });
+    assert.deepEqual(result.unread, { overBudget: 1, rateLimited: 0, failed: 0 });
+    assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.1');
+  });
+  await withStore(async (store, snapshotDir) => {
+    const stub = scenario();
+    stub.failing.set('docs/skills.md', new Error('GitHub HTTP 500'));
+    const result = await collectFileChanges(store, stub.github, snapshotDir);
+    assert.deepEqual(result.unread, { overBudget: 0, rateLimited: 0, failed: 1 });
+    assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.1');
+  });
+});
+
+test('collectFileChanges: the groups a rate limit touched wait for the retry, the ones read in full are stored now and left as they are then', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const lines = Array.from({ length: 300 }, (_, i) => `line ${i} ${'x'.repeat(40)}`);
+    const paths = ['codex-rs/features/src/f.rs', 'codex-rs/config.md', 'docs/a.md', 'docs/b.md', `${DIR}/T.ts`];
+    const stub = stubGitHub(
+      { 'rust-v0.162.0': new Map(), 'rust-v0.162.1': new Map(paths.map((path): [string, string] => [path, '1'])) },
+      Object.fromEntries(paths.map(path => [`rust-v0.162.1:${path}`, path === 'codex-rs/config.md' ? `${lines.join('\n')}\n` : path.endsWith('.ts') ? tsFile('T', ['a: string']) : `body of ${path}\n`])),
+    );
+    stub.failing.set('docs/a.md', rateLimit('docs/a.md', RESET));
+
+    // docs/a.md is refused; docs/b.md and the type file, which comes last, are skipped. Their groups wait; the feature files and config.md (its excerpt clipped) are stored.
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 2, merged: 0, gap: false, unread: { overBudget: 0, rateLimited: 3, failed: 0 }, rateLimitResetAt: RESET });
+    const stored = await filesCandidates(store);
+    assert.deepEqual(stored.map(c => c.fingerprint), ['codex-files:doc:codex-rs/config.md:0.162', 'codex-files:feature-flags:0.162']);
+    assert.match(stored[0]!.evidence[0]!.excerpt!, /\n…另有 \d+ 行$/);
+    assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.0');
+
+    // The limit has lifted: the retry reads the window again and stores what waited. What was stored before is left exactly as it was, the clipped excerpt included.
+    stub.failing.clear();
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 3, merged: 0, gap: false, unread: NONE });
+    assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.1');
+    const all = await filesCandidates(store);
+    assert.deepEqual(all.map(c => c.fingerprint), ['codex-files:doc:codex-rs/config.md:0.162', 'codex-files:doc:docs/a.md:0.162', 'codex-files:doc:docs/b.md:0.162', 'codex-files:feature-flags:0.162', 'codex-files:schema:0.162']);
+    for (const before of stored) assert.deepEqual(all.find(c => c.id === before.id), before);
+    assert.equal(all.find(c => c.fingerprint === 'codex-files:doc:docs/a.md:0.162')!.summary, 'a.md: body of docs/a.md');
+    assert.ok(all.every(c => !c.summary.includes('内容未读取') && c.evidence.every(e => !e.excerpt?.includes('内容未读取')))); // no unread marker was ever stored for a file the limit kept back
+    assert.deepEqual((await readSnapshot(snapshotDir, WINDOW)).files.filter(f => f.error), []);
+
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: false, unread: NONE });
+  });
+});
+
+test('collectFileChanges: a group the rate limit kept waiting is added to the candidate an earlier window made, once, when the retry stores it', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const stub = skillsAcrossReleases({ '0.161.0': 'one\n', '0.162.0': 'one\ntwo\n', '0.162.1': 'one\ntwo\nthree\n' });
+    await collectFileChanges(store, stub.github, snapshotDir);
+    const [first] = await filesCandidates(store);
+
+    stub.release('rust-v0.162.1');
+    stub.failing.set('docs/skills.md', rateLimit('docs/skills.md', RESET));
+    const limited = await collectFileChanges(store, stub.github, snapshotDir);
+    assert.deepEqual(limited, { window: SECOND, added: 0, merged: 0, gap: false, unread: { overBudget: 0, rateLimited: 1, failed: 0 }, rateLimitResetAt: RESET });
+    assert.deepEqual(await filesCandidates(store), [first]); // untouched: not even a marker went in
+
+    stub.failing.clear();
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: SECOND, added: 0, merged: 1, gap: false, unread: NONE });
+    const [merged] = await filesCandidates(store);
+    assert.equal(merged!.evidence[0]!.excerpt, 'two\nthree');
+    assert.deepEqual(merged!.window, { fromTag: 'rust-v0.161.0', toTag: 'rust-v0.162.1' });
+  }, 'rust-v0.161.0');
 });
 
 test('collectFileChanges: an edit that adds nothing is not a candidate, a removal is', async () => {
@@ -857,7 +962,7 @@ test('collectFileChanges: a window with no watched change gives a snapshot, no c
   await withStore(async (store, snapshotDir) => {
     const same = new Map([['docs/a.md', '1']]);
     const stub = stubGitHub({ 'rust-v0.162.0': same, 'rust-v0.162.1': new Map(same) }, {});
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 0, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 0, merged: 0, gap: false, unread: NONE });
     assert.deepEqual(await readSnapshot(snapshotDir, WINDOW), { window: WINDOW, files: [] });
     assert.deepEqual(stub.calls.fileAt, []);
     assert.deepEqual(await store.list(), []);
@@ -882,12 +987,12 @@ const FIRST = windowOf('rust-v0.161.0', 'rust-v0.162.0'), SECOND = windowOf('rus
 test('collectFileChanges: a patch release merges the lines of a file found by both windows, older lines first, and rebuilds the summary', async () => {
   await withStore(async (store, snapshotDir) => {
     const stub = skillsAcrossReleases({ '0.161.0': 'one\n', '0.162.0': 'one\ntwo\n', '0.162.1': 'one\ntwo\nthree\ntwo\n' });
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: FIRST, added: 1, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: FIRST, added: 1, merged: 0, gap: false, unread: NONE });
     const [first] = await filesCandidates(store);
     assert.equal(first!.evidence[0]!.excerpt, 'two');
 
     stub.release('rust-v0.162.1');
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: SECOND, added: 0, merged: 1, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: SECOND, added: 0, merged: 1, gap: false, unread: NONE });
     const stored = await filesCandidates(store);
     assert.equal(stored.length, 1);
     const [merged] = stored;
@@ -961,7 +1066,7 @@ test('collectFileChanges: once the user has moved the candidate of the minor on,
       const moved = (await filesCandidates(store))[0]!;
 
       stub.release('rust-v0.162.1');
-      assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: SECOND, added: 1, merged: 0, gap: false }, status);
+      assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: SECOND, added: 1, merged: 0, gap: false, unread: NONE }, status);
       const all = await filesCandidates(store);
       assert.deepEqual(all.map(c => c.fingerprint), ['codex-files:doc:docs/skills.md:0.162', 'codex-files:doc:docs/skills.md:0.162.1'], status);
       assert.deepEqual(all[0], moved, status); // what the user moved on is left exactly as it was
@@ -974,7 +1079,7 @@ test('collectFileChanges: once the user has moved the candidate of the minor on,
 
       // The next patch release does not join the full-version candidate of the last one: the minor is still moved on, so it gets its own.
       stub.release('rust-v0.162.2');
-      assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: THIRD, added: 1, merged: 0, gap: false }, status);
+      assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: THIRD, added: 1, merged: 0, gap: false, unread: NONE }, status);
       assert.deepEqual((await filesCandidates(store)).map(c => c.fingerprint), ['codex-files:doc:docs/skills.md:0.162', 'codex-files:doc:docs/skills.md:0.162.1', 'codex-files:doc:docs/skills.md:0.162.2'], status);
     }, 'rust-v0.161.0');
   }
@@ -988,7 +1093,7 @@ test('collectFileChanges: a candidate restored to new takes in the findings of t
     await store.transition(candidate!.id, 'ignored');
     await store.transition(candidate!.id, 'new');
     stub.release('rust-v0.162.1');
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: SECOND, added: 0, merged: 1, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: SECOND, added: 0, merged: 1, gap: false, unread: NONE });
     assert.equal((await filesCandidates(store)).length, 1);
   }, 'rust-v0.161.0');
 });
@@ -1001,14 +1106,14 @@ test('collectFileChanges: a type line that crosses 200 characters reports only i
     { [`rust-v0.162.0:${path}`]: older, [`rust-v0.162.1:${path}`]: newer },
   );
   await withStore(async (store, snapshotDir) => {
-    assert.deepEqual(await collectFileChanges(store, scene(short, long).github, snapshotDir), { window: WINDOW, added: 1, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, scene(short, long).github, snapshotDir), { window: WINDOW, added: 1, merged: 0, gap: false, unread: NONE });
     assert.deepEqual((await readSnapshot(snapshotDir, WINDOW)).files[0]!.added, ['scopeName: string | null,']); // not the eight pieces of a line that was whole before
     const [candidate] = await filesCandidates(store);
     assert.equal(candidate!.evidence[0]!.excerpt, 'scopeName: string | null,');
     assert.equal(candidate!.summary, 'v2/Thing: scopeName: string | null,');
   });
   await withStore(async (store, snapshotDir) => {
-    assert.deepEqual(await collectFileChanges(store, scene(long, short).github, snapshotDir), { window: WINDOW, added: 0, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, scene(long, short).github, snapshotDir), { window: WINDOW, added: 0, merged: 0, gap: false, unread: NONE });
     assert.deepEqual((await readSnapshot(snapshotDir, WINDOW)).files[0]!.added, []);
   });
 });
@@ -1021,7 +1126,7 @@ test('collectFileChanges: index files are not read and take no slot of the budge
       { [`rust-v0.162.1:${paths[0]}`]: tsFile('Turn', ['a: string']), [`rust-v0.162.1:${paths[2]}`]: tsFile('Other', ['b: string']) },
     );
     // Budget 2: Turn.ts and v2/Other.ts are read although index.ts sits between them.
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir, undefined, { budget: 2 }), { window: WINDOW, added: 1, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir, undefined, { budget: 2 }), { window: WINDOW, added: 1, merged: 0, gap: false, unread: NONE });
     assert.deepEqual(stub.calls.fileAt, [`rust-v0.162.1:${paths[0]}`, `rust-v0.162.1:${paths[2]}`]);
     const { files } = await readSnapshot(snapshotDir, WINDOW);
     assert.deepEqual(files.filter(f => f.path.endsWith('/index.ts')), [{ path: paths[1], status: 'added', added: [] }, { path: paths[3], status: 'added', added: [] }]);
@@ -1040,7 +1145,7 @@ test('collectFileChanges: a new file without a non-blank line gives no candidate
         [`rust-v0.162.1:${bare}`]: `${GENERATED}\n\n${GENERATOR}\nimport type { A } from "./A";\n`, // a header and an import, no type
       },
     );
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 1, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 1, merged: 0, gap: false, unread: NONE });
     assert.deepEqual((await filesCandidates(store)).map(c => c.fingerprint), ['codex-files:doc:docs/real.md:0.162']);
     const { files } = await readSnapshot(snapshotDir, WINDOW);
     assert.deepEqual(files.map(f => [f.path, f.status, f.added.length, f.error]), [[bare, 'added', 0, undefined], ['docs/blank.md', 'added', 0, undefined], ['docs/empty.md', 'added', 0, undefined], ['docs/real.md', 'added', 1, undefined]]);
@@ -1058,7 +1163,7 @@ test('collectFileChanges: a field inserted before the first one, or a doc commen
   const documented = `${GENERATED}\n\n${GENERATOR}\n\nexport type Thing = {/**\n * The first field.\n */\na: string, b: number, };\n`;
   for (const [what, newer, expected] of [['a field inserted first', tsFile('Thing', ['z: boolean', 'a: string', 'b: number']), ['z: boolean,']], ['a doc comment above the first field', documented, [' * The first field.']]] as const) {
     await withStore(async (store, snapshotDir) => {
-      assert.deepEqual(await collectFileChanges(store, scene(base, newer).github, snapshotDir), { window: WINDOW, added: 1, merged: 0, gap: false }, what);
+      assert.deepEqual(await collectFileChanges(store, scene(base, newer).github, snapshotDir), { window: WINDOW, added: 1, merged: 0, gap: false, unread: NONE }, what);
       assert.deepEqual((await readSnapshot(snapshotDir, WINDOW)).files[0]!.added, expected, what);
     });
   }
@@ -1090,7 +1195,7 @@ test('collectFileChanges: a stored tag newer than the newest listed one means no
 
     // The listing knows nothing newer than 0.162.1, yet the checkpoint says 0.170.0 (a release was taken back, say).
     await store.setCheckpoint('lastFilesTag', 'rust-v0.170.0');
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: false, unread: NONE });
     assert.equal(stub.calls.treePaths.length, asked.trees);
     assert.equal(stub.calls.fileAt.length, asked.files);
     assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.170.0'); // never moved back
@@ -1098,7 +1203,7 @@ test('collectFileChanges: a stored tag newer than the newest listed one means no
   });
   await withStore(async (store, snapshotDir) => {
     const stub = stubGitHub({}, {}, ['rust-v0.162.1', 'rust-v0.162.0']); // a single minor, so there is no earlier one to fall back to either
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: false, unread: NONE });
     assert.deepEqual(stub.calls.treePaths, []);
     assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.170.0');
   }, 'rust-v0.170.0');
@@ -1124,14 +1229,14 @@ test('collectFileChanges: after a long absence the window starts at the stored t
       { 'rust-v0.150.0:docs/skills.md': 'one\n', 'rust-v0.162.1:docs/skills.md': 'one\ntwo\n' },
     );
     const window: StableWindow = { from: 'rust-v0.150.0', to: 'rust-v0.162.1', releases: TAGS };
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window, added: 1, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window, added: 1, merged: 0, gap: false, unread: NONE });
     assert.deepEqual(stub.calls.treePaths, ['rust-v0.150.0', 'rust-v0.162.1']); // two trees cover any range
     assert.deepEqual(await readSnapshot(snapshotDir, window), { window, files: [{ path: 'docs/skills.md', status: 'modified', added: ['two'] }] });
     const [candidate] = await filesCandidates(store);
     assert.equal(candidate!.fingerprint, 'codex-files:doc:docs/skills.md:0.162');
     assert.deepEqual(candidate!.window, { fromTag: 'rust-v0.150.0', toTag: 'rust-v0.162.1' });
     assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.1');
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: false, unread: NONE });
   }, 'rust-v0.150.0');
 });
 
@@ -1143,11 +1248,11 @@ test('collectFileChanges: when the tree of the stored tag is gone the window sta
     );
     failTree(stub, 'rust-v0.150.0', gone('rust-v0.150.0'));
     const previous: StableWindow = { from: 'rust-v0.161.0', to: 'rust-v0.162.1', releases: ['rust-v0.162.1', 'rust-v0.162.0'] };
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: previous, added: 1, merged: 0, gap: true });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: previous, added: 1, merged: 0, gap: true, unread: NONE });
     assert.deepEqual(stub.calls.treePaths, ['rust-v0.150.0', 'rust-v0.162.1', 'rust-v0.161.0']); // the tree of the newest tag is used again, not asked for twice
     assert.deepEqual((await filesCandidates(store))[0]!.window, { fromTag: 'rust-v0.161.0', toTag: 'rust-v0.162.1' });
     assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.1');
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: false }); // the checkpoint is a usable one again
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: false, unread: NONE }); // the checkpoint is a usable one again
   }, 'rust-v0.150.0');
 });
 
@@ -1172,7 +1277,7 @@ test('collectFileChanges: a stored value that is no stable tag is ignored, with 
         { 'rust-v0.161.0:docs/skills.md': 'one\n', 'rust-v0.162.1:docs/skills.md': 'one\ntwo\n' },
       );
       const result = await collectFileChanges(store, stub.github, snapshotDir);
-      assert.deepEqual(result, { window: { ...PREVIOUS_MINOR, releases: ['rust-v0.162.1', 'rust-v0.162.0'] }, added: 1, merged: 0, gap: true }, checkpoint);
+      assert.deepEqual(result, { window: { ...PREVIOUS_MINOR, releases: ['rust-v0.162.1', 'rust-v0.162.0'] }, added: 1, merged: 0, gap: true, unread: NONE }, checkpoint);
       assert.deepEqual(stub.calls.treePaths, ['rust-v0.161.0', 'rust-v0.162.1'], checkpoint); // the unusable tag is never asked for
       assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.1');
     }, checkpoint);
@@ -1181,7 +1286,7 @@ test('collectFileChanges: a stored value that is no stable tag is ignored, with 
     await withStore(async (store, snapshotDir) => {
       const stub = stubGitHub({ 'rust-v0.162.1': new Map() }, {}, ['rust-v0.162.1', 'rust-v0.162.0']);
       if (checkpoint === 'rust-v0.150.0') failTree(stub, checkpoint, gone(checkpoint));
-      assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: true }, checkpoint);
+      assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { added: 0, merged: 0, gap: true, unread: NONE }, checkpoint);
       assert.equal(await store.checkpoint('lastFilesTag'), checkpoint); // nothing was collected, so the checkpoint stays where it is
     }, checkpoint);
   }
@@ -1208,9 +1313,9 @@ test('collectFileChanges: protocol types found by a patch release join the candi
     );
     const first = windowOf('rust-v0.161.0', 'rust-v0.162.0'), second = windowOf('rust-v0.162.0', 'rust-v0.162.1'), third = windowOf('rust-v0.162.1', 'rust-v0.163.0');
 
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: first, added: 1, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: first, added: 1, merged: 0, gap: false, unread: NONE });
     stub.state.tags.unshift('rust-v0.162.1');
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: second, added: 0, merged: 1, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: second, added: 0, merged: 1, gap: false, unread: NONE });
     const [merged] = await filesCandidates(store);
     // Z was found only by the first window and stays in front, with its own link; Y was found by both, its lines are merged and its link spans both; X is new.
     assert.deepEqual(merged!.evidence, [
@@ -1224,7 +1329,7 @@ test('collectFileChanges: protocol types found by a patch release join the candi
 
     // The next minor does not merge into it.
     stub.state.tags.unshift('rust-v0.163.0');
-    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: third, added: 1, merged: 0, gap: false });
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: third, added: 1, merged: 0, gap: false, unread: NONE });
     const all = await filesCandidates(store);
     assert.deepEqual(all.map(c => c.fingerprint), ['codex-files:schema:0.162', 'codex-files:schema:0.163']);
     assert.deepEqual(all[0], merged);
