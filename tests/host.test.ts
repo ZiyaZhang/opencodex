@@ -1,0 +1,588 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { Context, Service } from '@deepseek-ai/cordis';
+import type { ModelSelection } from '@deepseek-ai/dsh-agent';
+import type { FinishReason, GenerateOptions, LlmCallConfig, StreamChunk } from '@deepseek-ai/dsh-llm';
+import { SessionId } from '@deepseek-ai/dsh-session';
+import type { SessionCancelRequest, SessionCreateRequest, SessionPromptRequest, SessionRenameRequest, SessionSelectModelRequest } from '@deepseek-ai/dsh-api-session-controller/types';
+import type { InvocationDescriptor } from '@deepseek-ai/dsh-typert-protocol';
+import { transition, type Candidate, type Evidence } from '../src/core/candidate.ts';
+import { ValidationError } from '../src/core/check.ts';
+import { DEFAULT_SETTINGS, type Settings } from '../src/core/settings.ts';
+import { CandidateStore } from '../src/core/store.ts';
+import { GitHubClient, type GhRunner } from '../src/host/github.ts';
+import OpenCodex, { type Timers } from '../src/host/index.ts';
+import { OPEN_CODEX_DESCRIPTOR, parseRequest, type OpenCodexRequest, type OpenCodexResponse } from '../src/host/remote.ts';
+
+const MIRROR = fileURLToPath(new URL('./fixtures/mirror/', import.meta.url));
+const RELEASE = await readFile(new URL('./fixtures/release-0.162.0.md', import.meta.url), 'utf8');
+const FEED = await readFile(new URL('./fixtures/changelog-rss-sample.xml', import.meta.url), 'utf8');
+// The RSS fixture's items are dated Aug-Oct 2026; the clock is pinned so the parser's 120-day window never drifts.
+const NOW = new Date('2026-10-15T08:00:00.000Z');
+const COUNTER = 'reportsOn-2026-10-15';
+const HOUR = 3_600_000;
+const UNKNOWN_ID = '00000000-0000-4000-8000-000000000000';
+
+/** A report as an analyst session leaves it, citing a file of the fixture mirror. */
+const REPORT = [
+  '# Managed worktrees', '',
+  '## 结论', '做第 1 级。', '',
+  '## Codex 怎么做的', '- PR #50148', '',
+  '## DSH 现在有没有', '- `packages/experimental/worktree/README.md:1` 有 worktree 插件', '',
+  '## 差哪些扩展点', '- 无', '',
+  '## 分级', '| 级别 |', '',
+  '## 建议', '做 1', '',
+].join('\n');
+const DIFF = [
+  'diff --git a/codex-rs/core/src/worktree.rs b/codex-rs/core/src/worktree.rs',
+  'index 1111111..2222222 100644',
+  '--- a/codex-rs/core/src/worktree.rs',
+  '+++ b/codex-rs/core/src/worktree.rs',
+  '@@ -1,1 +1,2 @@',
+  ' pub struct Worktree;',
+  '+pub fn create_worktree() {}',
+  '',
+].join('\n');
+
+// GitHub: openai/codex with two stable tags, the 0.162.0 notes, one pull request shape for every number, and trees in which only the feature registry differs.
+const TAGS = ['rust-v0.162.0', 'rust-v0.161.0'];
+const FLAGS = 'codex-rs/features/src/lib.rs';
+const FLAGS_AT: Record<string, string> = {
+  'rust-v0.161.0': 'pub enum Feature {\n    Worktrees,\n}\n',
+  'rust-v0.162.0': 'pub enum Feature {\n    Worktrees,\n    RemoteCompaction,\n}\n',
+};
+/** What `gh` prints, as JSON, for each request the client makes. */
+function fixtureFor(args: string[]): unknown {
+  const target = args.at(-1)!;
+  if (args[0] === 'release' && args[1] === 'view') return { tagName: target, body: RELEASE, publishedAt: '2026-10-08T18:55:59Z', isPrerelease: false };
+  if (args[0] === 'pr' && args[1] === 'view') {
+    return {
+      number: Number(target), title: `PR ${target}`, body: `What ${target} changes.`, url: `https://github.com/openai/codex/pull/${target}`,
+      additions: 3, deletions: 1, changedFiles: 1, files: [{ path: 'codex-rs/core/src/worktree.rs', additions: 3, deletions: 1 }],
+    };
+  }
+  if (args[0] === 'api') {
+    if (target.startsWith('repos/openai/codex/tags?')) return target.endsWith('&page=1') ? TAGS.map(name => ({ name })) : [];
+    const tree = /^repos\/openai\/codex\/git\/trees\/([^?]+)\?recursive=1$/.exec(target);
+    if (tree) return { truncated: false, tree: [{ path: FLAGS, type: 'blob', sha: `flags-${decodeURIComponent(tree[1]!)}` }] };
+    const file = /^repos\/openai\/codex\/contents\/(.+)\?ref=(.+)$/.exec(target);
+    const text = file && FLAGS_AT[decodeURIComponent(file[2]!)];
+    if (text) return { encoding: 'base64', content: Buffer.from(text).toString('base64') };
+  }
+  throw new Error(`unexpected gh call: ${args.join(' ')}`);
+}
+/** Serves `fixtureFor`, the diff of any pull request as text, and records every call. */
+function codexGh(calls: string[][] = []): GhRunner {
+  return async args => {
+    calls.push(args);
+    return args[0] === 'pr' && args[1] === 'diff' ? DIFF : JSON.stringify(fixtureFor(args));
+  };
+}
+const offlineGh: GhRunner = async () => { throw Object.assign(new Error('Command failed: gh'), { code: 1, stderr: 'gh: offline' }); };
+const serve = (body: string, status = 200): typeof fetch => async () => new Response(body, { status });
+
+/** A timer table the test fires by hand. */
+function fakeTimers() {
+  const armed = new Map<number, { run: () => void; ms: number }>();
+  const log: Array<{ handle: number; ms: number }> = [];
+  const cleared: number[] = [];
+  let last = 0;
+  const timers: Timers = {
+    set(run, ms) { const handle = ++last; armed.set(handle, { run, ms }); log.push({ handle, ms }); return handle; },
+    clear(handle) { cleared.push(handle as number); armed.delete(handle as number); },
+  };
+  return {
+    timers, armed, log, cleared,
+    /** Runs the one armed timer. */
+    fire() {
+      assert.equal(armed.size, 1, 'exactly one timer is armed');
+      const [[handle, entry]] = [...armed];
+      armed.delete(handle);
+      entry.run();
+    },
+  };
+}
+
+/** The ids of the candidate blocks in a classification request. */
+function idsOf(request: GenerateOptions): string[] {
+  const part = request.messages[0]?.content[0];
+  return part?.type === 'text' ? [...part.text.matchAll(/<candidate id="([^"]+)"/g)].map(match => match[1]!) : [];
+}
+const classifyAll = (ids: string[]) => JSON.stringify(ids.map(id => ({ id, category: 'cli-core', relevance: 'high', rationale: '测试' })));
+/** A stand-in for `ctx.llm`: the n-th call answers with `answers[n]` (classify everything when there is none), text or a finish reason. */
+function fakeLlm(answers: Array<(ids: string[]) => string | FinishReason> = []) {
+  const requests: GenerateOptions[] = [];
+  return {
+    requests,
+    async prepareCall(config: LlmCallConfig) {
+      return {
+        config,
+        stream(request: GenerateOptions): AsyncIterable<StreamChunk> {
+          requests.push(request);
+          const answer = (answers[requests.length - 1] ?? classifyAll)(idsOf(request));
+          return (async function* (): AsyncGenerator<StreamChunk> {
+            if (typeof answer !== 'string') { yield { type: 'finish', reason: answer }; return; }
+            yield { type: 'text-delta', index: 0, text: answer };
+            yield { type: 'finish', reason: { kind: 'stop' } };
+          })();
+        },
+      };
+    },
+  };
+}
+
+/** Rejects once `signal` fires. */
+const whenAborted = (signal: AbortSignal) => new Promise<never>((_, reject) => {
+  if (signal.aborted) reject(signal.reason);
+  signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+});
+/**
+ * DSH's session controller, agents and default model, as plain objects. A session in a `reports/` directory writes `report.md` when it is
+ * prompted (after `hold()`, only once `open()` is called); a creator session writes nothing.
+ */
+function fakeDsh() {
+  const created: SessionCreateRequest[] = [];
+  const renamed: SessionRenameRequest[] = [];
+  const selected: SessionSelectModelRequest[] = [];
+  const prompts: SessionPromptRequest[] = [];
+  const cancelled: string[] = [];
+  const statuses = new Map<string, string>();
+  const cwd = new Map<string, string>();
+  const policies: string[] = [];
+  const defaults: ModelSelection[] = [];
+  let gate: Promise<void> | undefined;
+  let release = () => {};
+  const hooks: { creatorPrompted?: (request: SessionPromptRequest) => Promise<void>; activationError?: Error } = {};
+  return {
+    created, renamed, selected, prompts, cancelled, statuses, policies, defaults, hooks,
+    hold() { gate = new Promise(resolve => { release = resolve; }); },
+    open() { release(); gate = undefined; },
+    sessionController: {
+      async create(request: SessionCreateRequest) {
+        created.push(request);
+        const sessionId = SessionId(`${request.agentPreset || 'analyst'}-${created.length}`);
+        cwd.set(sessionId, request.cwd!);
+        return { sessionId };
+      },
+      async rename(request: SessionRenameRequest) { renamed.push(request); return { title: request.title, seq: 1 }; },
+      async selectModel(request: SessionSelectModelRequest) { selected.push(request); return { selected: request }; },
+      async resolveAgent(sessionId: string) { return hooks.activationError ? { error: hooks.activationError } : { agent: { session: { id: sessionId, append() {} } } }; },
+      async prompt(request: SessionPromptRequest, signal: AbortSignal) {
+        prompts.push(request);
+        const dir = cwd.get(request.sessionId)!;
+        if (dir.includes(`${sep}reports${sep}`)) {
+          if (gate) await Promise.race([gate, whenAborted(signal)]);
+          await writeFile(join(dir, 'report.md'), REPORT);
+        } else await hooks.creatorPrompted?.(request);
+        return { accepted: true };
+      },
+      cancel(request: SessionCancelRequest) { cancelled.push(request.sessionId); return { accepted: true }; },
+    },
+    agents: { get: (sessionId: string) => ({ status: statuses.get(sessionId) ?? 'idle', async whenIdle() {} }) },
+    agentDefaultModel: {
+      currentSelection: (): ModelSelection => ({ provider: 'deepseek-official', model: 'deepseek-flash' }),
+      async saveSelection(selection: ModelSelection) { defaults.push(selection); },
+    },
+    approval: { setPolicy(_agent: unknown, policy: string) { policies.push(policy); } },
+  };
+}
+
+interface FixtureOptions {
+  /** Written to settings.json over the defaults, with the desktop source off; `null` writes no file. */
+  settings?: Partial<Settings> | null;
+  gh?: GhRunner;
+  llm?: ReturnType<typeof fakeLlm>;
+  feed?: typeof fetch;
+  checkTimeoutMs?: number;
+}
+/** An OpenCodex Host on a fresh Cordis context and a temporary data directory, every external service replaced. */
+async function fixture(options: FixtureOptions = {}) {
+  const directory = await mkdtemp(join(tmpdir(), 'oc-host-'));
+  if (options.settings !== null) {
+    await writeFile(join(directory, 'settings.json'), JSON.stringify({ ...DEFAULT_SETTINGS, desktopPlistPath: '', ...options.settings }));
+  }
+  const ctx = new Context();
+  const descriptors: InvocationDescriptor[] = [];
+  const dsh = fakeDsh();
+  const llm = options.llm ?? fakeLlm();
+  ctx.provide('typert', { register(contribution: { invocations: InvocationDescriptor[] }) { descriptors.push(...contribution.invocations); return async () => {}; } } as never);
+  ctx.provide('sessionController', dsh.sessionController as never);
+  ctx.provide('agents', dsh.agents as never);
+  ctx.provide('llm', llm as never);
+  ctx.provide('agentDefaultModel', dsh.agentDefaultModel as never);
+  ctx.provide('approval', dsh.approval as never);
+  const timers = fakeTimers();
+  const plugin = new OpenCodex(ctx, { dataDirectory: directory }, {
+    github: new GitHubClient({ gh: options.gh ?? codexGh() }), fetcher: options.feed ?? serve(FEED), now: () => NOW, timers: timers.timers, reportPollMs: 2,
+    ...(options.checkTimeoutMs !== undefined && { checkTimeoutMs: options.checkTimeoutMs }),
+  });
+  const call = (request: OpenCodexRequest) => plugin.call(request, new AbortController().signal);
+  /** Another store on the same directory, for seeding and reading back; use it only while no action runs. */
+  const store = new CandidateStore(directory, () => NOW);
+  let closed = false;
+  const unload = async () => { if (!closed) { closed = true; await ctx.fiber.dispose(); } };
+  const close = async () => { await unload(); await rm(directory, { recursive: true, force: true }); };
+  return { plugin, ctx, directory, call, store, dsh, llm, timers, descriptors, unload, close };
+}
+type Fixture = Awaited<ReturnType<typeof fixture>>;
+
+/** A candidate written straight to the store. */
+async function seed(store: CandidateStore, key: string, fields: { source?: Candidate['source']; title?: string; evidence?: Evidence[] } = {}): Promise<Candidate> {
+  const { candidate } = await store.upsert({
+    source: fields.source ?? 'codex-release', key, title: fields.title ?? `Feature ${key}`, summary: `Summary of ${key}`,
+    evidence: fields.evidence ?? [{ kind: 'pr', ref: '#50148', url: 'https://github.com/openai/codex/pull/50148', excerpt: 'PR 50148\n\nWhat it changes.' }],
+  });
+  return candidate;
+}
+/** `candidate` moved to reported with a report file on disk, as a finished report action leaves it. */
+async function asReported(f: Fixture, candidate: Candidate): Promise<Candidate> {
+  await mkdir(join(f.directory, 'reports', candidate.id), { recursive: true });
+  await writeFile(join(f.directory, 'reports', candidate.id, 'report.md'), REPORT);
+  const report = { path: `reports/${candidate.id}/report.md`, sessionId: 'analyst-0', generatedAt: NOW.toISOString(), checks: { requiredSections: true, dshRefsTotal: 1, dshRefsResolved: 1 } };
+  return f.store.patch(candidate.id, current => ({ ...transition(current, 'reported', NOW.toISOString()), report }));
+}
+const find = (response: OpenCodexResponse, id: string) => response.candidates.find(candidate => candidate.id === id);
+const exists = (path: string) => stat(path).then(() => true, () => false);
+
+test('the Host registers its Remote descriptor and a first snapshot writes the default settings', async () => {
+  const f = await fixture({ settings: null });
+  try {
+    assert.deepEqual(f.descriptors.map(descriptor => descriptor.id), [OPEN_CODEX_DESCRIPTOR.id]);
+    await f.store.setCheckpoint('lastStableTag', 'rust-v0.161.0');
+    const response = await f.call({ action: 'snapshot' });
+    assert.deepEqual(response.settings, DEFAULT_SETTINGS);
+    assert.deepEqual(JSON.parse(await readFile(join(f.directory, 'settings.json'), 'utf8')), DEFAULT_SETTINGS);
+    assert.deepEqual(response.checkpoints, { lastStableTag: 'rust-v0.161.0' }, 'checkpoints come from the store');
+    assert.deepEqual(response.candidates, []);
+    assert.equal(response.lastCheck, undefined);
+    assert.equal(response.indexSummary, undefined);
+  } finally { await f.close(); }
+});
+
+/** A Cordis context holding only the Typert registry: enough for a Host that never reaches DSH. */
+function typertOnly(): Context {
+  const ctx = new Context();
+  ctx.provide('typert', { register() { return async () => {}; } } as never);
+  return ctx;
+}
+
+test('a damaged settings.json stops the plugin from starting and names the file', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'oc-host-'));
+  try {
+    await writeFile(join(directory, 'settings.json'), '{ not json');
+    const plugin = new OpenCodex(typertOnly(), { dataDirectory: directory }, { timers: fakeTimers().timers });
+    await assert.rejects(plugin[Service.init](), (error: Error) => error.message.includes(join(directory, 'settings.json')));
+    await assert.rejects(plugin.call({ action: 'snapshot' }, new AbortController().signal), /settings\.json/);
+    await writeFile(join(directory, 'settings.json'), JSON.stringify({ ...DEFAULT_SETTINGS, dailyReportLimit: 0 }));
+    const again = new OpenCodex(typertOnly(), { dataDirectory: directory }, { timers: fakeTimers().timers });
+    await assert.rejects(again[Service.init](), /dailyReportLimit/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('a check collects the sources, classifies the new candidates and keeps its result as lastCheck', async () => {
+  // The model leaves the first candidate of the batch out: that becomes a classify line among the check errors.
+  const f = await fixture({ llm: fakeLlm([ids => classifyAll(ids.slice(1))]) });
+  try {
+    const response = await f.call({ action: 'check' });
+    const check = response.lastCheck!;
+    assert.deepEqual([check.releases.added, check.files.added], [6, 1]);
+    assert.ok(check.rss > 0);
+    const total = 6 + 1 + check.rss;
+    assert.equal(response.candidates.length, total);
+    assert.ok(response.candidates.every(candidate => candidate.status === 'new'));
+    assert.equal(f.llm.requests.length, Math.ceil(total / 30));
+    assert.equal(response.candidates.filter(candidate => candidate.classification).length, total - 1);
+    assert.deepEqual(check.errors, [`classify: batch 1 of 1: 1 of ${total} candidates were not in the answer`]);
+    assert.deepEqual((await f.call({ action: 'snapshot' })).lastCheck, check, 'lastCheck stays for later snapshots');
+  } finally { await f.close(); }
+});
+
+test('classification runs every batch, saves what it got and reports failed batches, missing candidates and unreadable answers', async () => {
+  const llm = fakeLlm([
+    () => ({ kind: 'error', failure: { code: 'RATE_LIMITED', message: 'slow down' } }),
+    classifyAll,
+    () => '抱歉，这批我无法归类。',
+    ids => classifyAll(ids.slice(1)),
+  ]);
+  const f = await fixture({ llm });
+  try {
+    for (let n = 0; n < 31; n++) await seed(f.store, `pr:${50000 + n}`);
+    const classified = async () => (await f.call({ action: 'snapshot' })).candidates.filter(candidate => candidate.classification).length;
+    // Two batches: the first fails, the second (one candidate) is saved, and the call says what went wrong.
+    await assert.rejects(f.call({ action: 'classify' }), /batch 1 of 2 failed: classify: model finished with error RATE_LIMITED: slow down/);
+    assert.equal(await classified(), 1);
+    // The 30 left: an answer without a JSON array saves nothing and is quoted.
+    await assert.rejects(f.call({ action: 'classify' }), /batch 1 of 1: the answer held no JSON array.*抱歉，这批我无法归类。/);
+    assert.equal(await classified(), 1);
+    await assert.rejects(f.call({ action: 'classify' }), /batch 1 of 1: 1 of 30 candidates were not in the answer/);
+    assert.equal(await classified(), 30);
+    const last = await f.call({ action: 'classify' });
+    assert.equal(last.candidates.filter(candidate => candidate.classification).length, 31);
+    assert.equal(llm.requests.length, 5);
+    const statuses = new Set(last.candidates.map(candidate => candidate.status));
+    assert.deepEqual([...statuses], ['new'], 'classification never moves a status');
+  } finally { await f.close(); }
+});
+
+test('the snapshot lists evidence without excerpts, and candidate(id) returns the whole record', async () => {
+  const f = await fixture();
+  try {
+    const seeded = await seed(f.store, 'pr:50148', { evidence: [
+      { kind: 'pr', ref: '#50148', url: 'https://github.com/openai/codex/pull/50148', excerpt: 'PR 50148\n\nWhat it changes.' },
+      { kind: 'file', ref: 'docs/config.md', excerpt: '+ worktrees = true' },
+    ] });
+    const listed = find(await f.call({ action: 'snapshot' }), seeded.id)!;
+    assert.deepEqual(listed.evidence, [{ kind: 'pr', ref: '#50148', url: 'https://github.com/openai/codex/pull/50148' }, { kind: 'file', ref: 'docs/config.md' }]);
+    const detail = await f.call({ action: 'candidate', id: seeded.id });
+    assert.deepEqual(detail.candidate, seeded);
+    assert.equal(find(detail, seeded.id)!.evidence[0]!.excerpt, undefined, 'the list in the same response stays trimmed');
+    await assert.rejects(f.call({ action: 'candidate', id: UNKNOWN_ID }), /Unknown candidate/);
+  } finally { await f.close(); }
+});
+
+test('ignore and restore move the status, and a restored candidate keeps its old report', async () => {
+  const f = await fixture();
+  try {
+    const candidate = await asReported(f, await seed(f.store, 'pr:50148'));
+    const ignored = find(await f.call({ action: 'ignore', id: candidate.id }), candidate.id)!;
+    assert.equal(ignored.status, 'ignored');
+    await assert.rejects(f.call({ action: 'ignore', id: candidate.id }), /已经忽略/);
+    await assert.rejects(f.call({ action: 'report', id: candidate.id }), /已忽略/);
+    await assert.rejects(f.call({ action: 'start', id: candidate.id }), /已忽略/);
+    const restored = find(await f.call({ action: 'restore', id: candidate.id }), candidate.id)!;
+    assert.equal(restored.status, 'new');
+    assert.deepEqual(restored.report, candidate.report);
+    await assert.rejects(f.call({ action: 'restore', id: candidate.id }), /只有已忽略的候选可以恢复/);
+  } finally { await f.close(); }
+});
+
+test('settings are validated, saved to settings.json and read back on the next start', async () => {
+  const f = await fixture();
+  try {
+    const response = await f.call({ action: 'settings', patch: { dailyReportLimit: 3, reportModel: { provider: 'p', model: 'm' } } });
+    assert.equal(response.settings.dailyReportLimit, 3);
+    assert.deepEqual(response.settings.reportModel, { provider: 'p', model: 'm' });
+    const saved = JSON.parse(await readFile(join(f.directory, 'settings.json'), 'utf8')) as Settings;
+    assert.equal(saved.dailyReportLimit, 3);
+    await assert.rejects(f.call({ action: 'settings', patch: { dailyReportLimit: 0 } }), ValidationError);
+    await assert.rejects(f.call({ action: 'settings', patch: { bogus: true } } as never), ValidationError);
+    assert.equal(JSON.parse(await readFile(join(f.directory, 'settings.json'), 'utf8')).dailyReportLimit, 3, 'a refused patch writes nothing');
+    await f.unload();
+    const ctx = typertOnly();
+    const next = new OpenCodex(ctx, { dataDirectory: f.directory }, { timers: fakeTimers().timers });
+    assert.equal((await next.call({ action: 'snapshot' }, new AbortController().signal)).settings.dailyReportLimit, 3);
+    await ctx.fiber.dispose();
+  } finally { await f.close(); }
+});
+
+test('a new mirror path is indexed right away; a mirror that gives no index leaves the settings saved and says so', async () => {
+  const f = await fixture();
+  const empty = await mkdtemp(join(tmpdir(), 'oc-empty-mirror-'));
+  try {
+    const indexed = await f.call({ action: 'settings', patch: { dshMirrorPath: MIRROR } });
+    assert.ok(indexed.indexSummary && indexed.indexSummary.entries > 0);
+    await assert.rejects(f.call({ action: 'settings', patch: { dshMirrorPath: empty } }), /设置已保存，但用新的镜像路径建 DSH 索引失败：DSH index is empty/);
+    const after = await f.call({ action: 'snapshot' });
+    assert.equal(after.settings.dshMirrorPath, empty);
+    assert.deepEqual(after.indexSummary, indexed.indexSummary, 'the previous index stays in use');
+  } finally { await f.close(); await rm(empty, { recursive: true, force: true }); }
+});
+
+test('a check that stalls gives up at its deadline and does not hold the next one', async () => {
+  let calls = 0;
+  const stalled: GhRunner = (_args, signal) => { calls++; return whenAborted(signal!); };
+  const f = await fixture({ gh: stalled, checkTimeoutMs: 20 });
+  try {
+    await assert.rejects(f.call({ action: 'check' }), /检查超过 0 分钟还没结束，已停止/);
+    const first = calls;
+    await assert.rejects(f.call({ action: 'check' }), /已停止/);
+    assert.ok(calls > first, 'the second check ran on its own instead of joining the stalled one');
+    assert.equal(f.timers.log.at(-1)!.ms, 24 * HOUR, 'a check that gave up still re-arms the timer');
+  } finally { await f.close(); }
+});
+
+test('parseRequest accepts the listed actions only, with candidate UUIDs and settings of the right shape', () => {
+  const id = '9b2f3c1e-5d4a-4b6c-8e7f-0a1b2c3d4e5f';
+  assert.deepEqual(parseRequest({ action: 'snapshot' }), { action: 'snapshot' });
+  assert.deepEqual(parseRequest({ action: 'report', id }), { action: 'report', id });
+  assert.deepEqual(parseRequest({ action: 'settings', patch: { checkIntervalHours: 6, classifyModel: { provider: 'p', model: 'm' } } }),
+    { action: 'settings', patch: { checkIntervalHours: 6, classifyModel: { provider: 'p', model: 'm' } } });
+  const refused: unknown[] = [
+    null, [], 'snapshot', {}, { action: 'scan' }, { action: 'toString' }, { action: 'snapshot', id },
+    { action: 'report' }, { action: 'report', id: 'abc' }, { action: 'report', id: id.toUpperCase() }, { action: 'report', id: 7 },
+    { action: 'start', id: `${id}/../x` }, { action: 'readReport', id, path: '/etc/passwd' },
+    { action: 'settings' }, { action: 'settings', patch: [] }, { action: 'settings', patch: { bogus: 1 } }, { action: 'settings', patch: { __proto__: { x: 1 } } },
+    { action: 'settings', patch: JSON.parse('{"__proto__":{"dailyReportLimit":1}}') },
+    { action: 'settings', patch: { dailyReportLimit: '3' } }, { action: 'settings', patch: { dshMirrorPath: 7 } }, { action: 'settings', patch: { checkIntervalHours: Number.NaN } },
+    { action: 'settings', patch: { reportModel: { provider: 'p' } } }, { action: 'settings', patch: { reportModel: { provider: 'p', model: 'm', key: 'x' } } },
+    { action: 'settings', patch: { reportModel: 'p/m' } }, { action: 'settings', patch: {}, extra: 1 },
+  ];
+  for (const value of refused) assert.throws(() => parseRequest(value), ValidationError, JSON.stringify(value));
+});
+
+test('the result codec sends plain JSON and refuses more than 4 MB', () => {
+  const { result } = OPEN_CODEX_DESCRIPTOR;
+  assert.ok(result.mode === 'strict' && result.encode, 'the gateway calls encode on the Host; it never calls the result parse');
+  const writeBytes = () => null;
+  assert.deepEqual(result.encode({ at: new Date(0), gone: undefined }, writeBytes), { at: '1970-01-01T00:00:00.000Z' });
+  assert.throws(() => result.encode!({ text: 'x'.repeat(4_000_000) }, writeBytes), /4 MB/);
+});
+
+test('report: refused past the daily limit and while one runs; otherwise it writes the evidence pack and records the report', async () => {
+  const calls: string[][] = [];
+  const f = await fixture({ gh: codexGh(calls), settings: { dshMirrorPath: MIRROR, dailyReportLimit: 2 } });
+  try {
+    // A pull request reference without a URL is what a failed lookup leaves behind; the report repairs it first.
+    const bare = await seed(f.store, 'pr:50148', { title: 'Create a Git worktree for a task', evidence: [{ kind: 'pr', ref: '#50148' }] });
+    const rss = await seed(f.store, 'rss-item', { source: 'rss', title: 'Codex app update', evidence: [{ kind: 'rss', ref: 'Codex app update', excerpt: 'Worktrees in the app.' }] });
+    const index = await f.call({ action: 'rebuildIndex' });
+    assert.ok(index.indexSummary && index.indexSummary.entries > 0);
+
+    f.dsh.hold();
+    const running = f.call({ action: 'report', id: bare.id });
+    await new Promise(resolve => setImmediate(resolve));
+    await assert.rejects(f.call({ action: 'report', id: bare.id }), /正在生成报告/);
+    await assert.rejects(f.call({ action: 'start', id: bare.id }), /正在生成报告/);
+    await assert.rejects(f.call({ action: 'ignore', id: bare.id }), /正在生成报告/);
+    f.dsh.open();
+    const done = find(await running, bare.id)!;
+
+    assert.equal(done.status, 'reported');
+    assert.equal(done.report?.path, `reports/${bare.id}/report.md`);
+    assert.equal(done.report?.sessionId, 'analyst-1');
+    assert.deepEqual(done.report?.checks, { requiredSections: true, dshRefsTotal: 1, dshRefsResolved: 1 });
+    const reportDir = join(f.directory, 'reports', bare.id);
+    assert.deepEqual(f.dsh.created[0], { cwd: reportDir });
+    assert.deepEqual(f.dsh.selected.map(({ provider, model }) => ({ provider, model })), [DEFAULT_SETTINGS.reportModel]);
+    assert.deepEqual(f.dsh.defaults, [{ provider: 'deepseek-official', model: 'deepseek-flash' }], 'the user default model is put back');
+    assert.deepEqual(f.dsh.policies, ['never'], 'no approval waits for a person');
+    assert.equal(await readFile(join(reportDir, 'report.md'), 'utf8'), REPORT);
+    const index_md = await readFile(join(reportDir, 'evidence', 'INDEX.md'), 'utf8');
+    assert.match(index_md, new RegExp(`DSH 镜像根目录：${MIRROR.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.ok((await readdir(join(reportDir, 'evidence', 'sources'))).some(name => name.endsWith('.diff')), 'the pull request diff is in the pack');
+    assert.ok((await readdir(join(reportDir, 'evidence', 'dsh'))).length > 0, 'the index hits are in the pack');
+    // The bare reference was repaired on the candidate itself.
+    const repaired = (await f.call({ action: 'candidate', id: bare.id })).candidate!;
+    assert.deepEqual(repaired.evidence.map(({ kind, ref, url }) => ({ kind, ref, url })), [{ kind: 'pr', ref: '#50148', url: 'https://github.com/openai/codex/pull/50148' }]);
+    assert.match(repaired.evidence[0]!.excerpt ?? '', /^PR 50148\n\nWhat 50148 changes\./);
+    assert.equal((await f.call({ action: 'snapshot' })).checkpoints[COUNTER], '1');
+
+    const read = await f.call({ action: 'readReport', id: bare.id });
+    assert.deepEqual(read.report, { id: bare.id, markdown: REPORT });
+
+    // The second report of the day reaches the limit of two; a third, even a rerun, is refused before any session is made.
+    assert.equal(find(await f.call({ action: 'report', id: rss.id }), rss.id)!.status, 'reported');
+    assert.equal((await f.call({ action: 'snapshot' })).checkpoints[COUNTER], '2');
+    const sessions = f.dsh.created.length;
+    await assert.rejects(f.call({ action: 'report', id: bare.id }), /上限/);
+    assert.equal(f.dsh.created.length, sessions);
+  } finally { await f.close(); }
+});
+
+test('a report session that fails names the session in the error, and the candidate stays as it was', async () => {
+  const f = await fixture({ settings: { dshMirrorPath: MIRROR } });
+  try {
+    const candidate = await seed(f.store, 'rss-item', { source: 'rss', evidence: [{ kind: 'rss', ref: 'Codex app update' }] });
+    f.dsh.hooks.activationError = new Error('no agent for the session');
+    await assert.rejects(f.call({ action: 'report', id: candidate.id }), /no agent for the session.*analyst-1/);
+    const after = await f.store.get(candidate.id);
+    assert.deepEqual([after.status, after.report], ['new', undefined]);
+    assert.equal(await f.store.checkpoint(COUNTER), undefined, 'a failed report does not count');
+    // The failure freed the candidate: the next request runs.
+    f.dsh.hooks.activationError = undefined;
+    assert.equal(find(await f.call({ action: 'report', id: candidate.id }), candidate.id)!.status, 'reported');
+  } finally { await f.close(); }
+});
+
+test('report and start need the mirror path, and readReport says why a report is missing', async () => {
+  const f = await fixture();
+  try {
+    const candidate = await seed(f.store, 'pr:50148');
+    await assert.rejects(f.call({ action: 'report', id: candidate.id }), /dshMirrorPath/);
+    assert.deepEqual((await f.call({ action: 'readReport', id: candidate.id })).report, { id: candidate.id, markdown: '', notice: '这条候选还没有报告' });
+    await asReported(f, candidate);
+    await assert.rejects(f.call({ action: 'start', id: candidate.id }), /dshMirrorPath/);
+    assert.equal((await f.call({ action: 'readReport', id: candidate.id })).report?.markdown, REPORT);
+    await unlink(join(f.directory, 'reports', candidate.id, 'report.md'));
+    const missing = (await f.call({ action: 'readReport', id: candidate.id })).report!;
+    assert.equal(missing.markdown, '');
+    assert.match(missing.notice ?? '', /报告文件不存在/);
+    assert.equal(f.dsh.created.length, 0);
+  } finally { await f.close(); }
+});
+
+test('start opens a creator session for a reported candidate, records it, and refuses while the last one runs', async () => {
+  const f = await fixture({ settings: { dshMirrorPath: MIRROR } });
+  try {
+    const fresh = await seed(f.store, 'pr:51500');
+    await assert.rejects(f.call({ action: 'start', id: fresh.id }), /先生成报告再开工/);
+    const candidate = await asReported(f, await seed(f.store, 'pr:50148'));
+    const response = await f.call({ action: 'start', id: candidate.id });
+    assert.equal(response.startedSessionId, 'cordis-1');
+    const started = find(response, candidate.id)!;
+    assert.equal(started.status, 'started');
+    assert.deepEqual(started.started, { sessionId: 'cordis-1', at: NOW.toISOString() });
+    assert.deepEqual(f.dsh.created, [{ cwd: join(f.directory, 'work', candidate.id), agentPreset: 'cordis' }]);
+    const prompt = f.dsh.prompts[0]!.content[0]!;
+    assert.ok(prompt.type === 'text' && prompt.text.includes(REPORT), 'the report is the task');
+
+    f.dsh.statuses.set('cordis-1', 'running');
+    await assert.rejects(f.call({ action: 'start', id: candidate.id }), /上一个开工会话还在运行/);
+    f.dsh.statuses.set('cordis-1', 'idle');
+    const again = await f.call({ action: 'start', id: candidate.id });
+    assert.equal(again.startedSessionId, 'cordis-2', 'started -> started opens another session');
+    assert.equal(find(again, candidate.id)!.started?.sessionId, 'cordis-2');
+  } finally { await f.close(); }
+});
+
+test('a start whose record cannot be saved names the session it opened', async () => {
+  const f = await fixture({ settings: { dshMirrorPath: MIRROR } });
+  try {
+    const candidate = await asReported(f, await seed(f.store, 'pr:50148'));
+    // The candidate file breaks while the creator session takes its task, so the patch that records the session fails.
+    f.dsh.hooks.creatorPrompted = () => writeFile(join(f.directory, 'candidates', `${candidate.id}.json`), '{ damaged');
+    await assert.rejects(f.call({ action: 'start', id: candidate.id }), /开工会话 cordis-1 已经开始工作，但没能记到候选上：Corrupt JSON/);
+  } finally { await f.close(); }
+});
+
+test('the timer runs the first check after a short delay, re-arms after each check and after a settings change, and is cleared on unload', async () => {
+  const f = await fixture({ gh: offlineGh, feed: serve('gone', 404) });
+  try {
+    await f.call({ action: 'snapshot' });
+    assert.deepEqual(f.timers.log.map(entry => entry.ms), [60_000], 'no check at construction, one after a minute');
+    f.timers.fire();
+    const checked = await f.call({ action: 'check' }); // joins the check the timer started
+    assert.ok(checked.lastCheck && checked.lastCheck.errors.length > 0);
+    assert.deepEqual(f.timers.log.map(entry => entry.ms).slice(1).filter((ms, i, all) => all.indexOf(ms) === i), [24 * HOUR]);
+    assert.equal(f.timers.armed.size, 1);
+    await f.call({ action: 'settings', patch: { checkIntervalHours: 6 } });
+    assert.equal(f.timers.log.at(-1)!.ms, 6 * HOUR, 'the next check is due one new interval after the last one');
+    assert.equal(f.timers.armed.size, 1);
+    const armed = [...f.timers.armed.keys()];
+    await f.unload();
+    assert.equal(f.timers.armed.size, 0);
+    assert.ok(armed.every(handle => f.timers.cleared.includes(handle)));
+    await assert.rejects(f.call({ action: 'snapshot' }), /卸载/);
+  } finally { await f.close(); }
+});
+
+test('unloading aborts a running report and leaves the candidate as it was', async () => {
+  const f = await fixture({ settings: { dshMirrorPath: MIRROR } });
+  try {
+    const candidate = await seed(f.store, 'rss-item', { source: 'rss', evidence: [{ kind: 'rss', ref: 'Codex app update' }] });
+    f.dsh.hold();
+    const running = f.call({ action: 'report', id: candidate.id });
+    while (f.dsh.prompts.length === 0) await new Promise(resolve => setImmediate(resolve));
+    await f.unload();
+    await assert.rejects(running);
+    const after = await f.store.get(candidate.id);
+    assert.equal(after.status, 'new');
+    assert.equal(after.report, undefined);
+    assert.equal(await f.store.checkpoint(COUNTER), undefined, 'an aborted report does not count');
+    assert.equal(await exists(join(f.directory, 'reports', candidate.id, 'report.md')), false);
+  } finally { await f.close(); }
+});

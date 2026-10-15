@@ -196,7 +196,7 @@ function tidyBody(body: string, title: string): string {
 }
 
 /** The title, the description cut at a whole line, and the ranked paths, one section each; a path list that is cut says how many files it left out. */
-function excerptOf(pr: PullRequest): string {
+export function excerptOf(pr: PullRequest): string {
   const paths = rankedPaths(pr.files);
   const listed = paths.slice(0, EXCERPT_FILES);
   if (paths.length > EXCERPT_FILES) listed.push(`…另有 ${paths.length - EXCERPT_FILES} 个文件`);
