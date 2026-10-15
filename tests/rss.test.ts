@@ -58,15 +58,27 @@ test('rss keeps product announcements, drops model notices and iOS, lets only ru
   }
 });
 
-test('a release that lists nine bullets under its own title gives nine features, in the order of the notes', async () => {
+test('a release that lists nine bullets under its own title gives its intro and then nine features, in the order of the notes', async () => {
   const xml = await readFixture();
-  // The release is dated 2026-05-21; the other fixture items lie in the future of this date and are skipped.
+  // The release is dated 2026-05-21; the other fixture items lie in the future of this date, or too far in the past, and are skipped.
   const features = rssCandidates(xml, PAGE, new Date('2026-06-01T00:00:00Z')).filter(i => i.releaseTitle === 'Appshots, goal mode, and more');
-  assert.equal(features.length, 9);
-  assert.ok(features[0]!.title.startsWith('Goal mode is no longer an experimental feature'));
-  assert.equal(features[5]!.title, 'Codex can now download and extract all image assets from a page much more quickly.');
-  assert.ok(features[8]!.title.startsWith('Significantly improved reliability for browser use'));
+  assert.equal(features.length, 10);
+  assert.equal(features[0]!.title, 'Appshots, goal mode, and more');
+  assert.ok(features[0]!.description.startsWith('Appshots are now available in the Codex app on macOS. Press both Command keys'));
+  assert.ok(!features[0]!.description.includes('This launch also includes'));
+  assert.ok(features[1]!.title.startsWith('Goal mode is no longer an experimental feature'));
+  assert.equal(features[6]!.title, 'Codex can now download and extract all image assets from a page much more quickly.');
+  assert.ok(features[9]!.title.startsWith('Significantly improved reliability for browser use'));
   assert.ok(features.every(i => i.sourceUrl === 'https://developers.openai.com/codex/changelog/#codex-2026-05-21'));
+});
+
+test('option lists stay one feature each: the web search modes and the Team Config layers', async () => {
+  const xml = await readFixture();
+  const features = rssCandidates(xml, PAGE, new Date('2026-02-01T00:00:00Z'));
+  assert.deepEqual(features.map(i => i.title), ['Web search is now enabled by default', 'Team Config for shared configuration']);
+  assert.ok(features[0]!.description.startsWith('Codex now enables web search for local tasks in the Codex CLI and IDE Extension.'));
+  assert.ok(features[0]!.description.includes('web_search = "cached" (default; serves results from the web search cache)'));
+  assert.ok(features[1]!.description.includes('config.toml defaults rules/ for command controls outside the sandbox skills/ for reusable workflows'));
 });
 
 test('collectRss stores announcements once, skips an unchanged feed by hash, and only adds new items when the feed changes', async () => {

@@ -286,4 +286,27 @@ This launch also includes:
 - Significantly improved reliability for browser use. We fixed bugs on Windows,
   flaky availability of the plugin to non geo-blocked regions, and many other
   issues impacting performance.</content:encoded></item>
+<item><title>Web search is now enabled by default</title><link>https://developers.openai.com/codex/changelog/#codex-2026-01-28</link><guid>https://developers.openai.com/codex/changelog/#codex-2026-01-28</guid><description>Web search is now enabled by default</description><pubDate>Wed, 28 Jan 2026 00:00:00 GMT</pubDate><content:encoded># Web search is now enabled by default
+
+Codex now enables web search for local tasks in the Codex CLI and IDE Extension.
+By default, Codex uses a web search cache, which is an OpenAI-maintained index of web results. Cached mode returns pre-indexed results instead of fetching live pages, while live mode fetches the most recent data from the web. If you are using `--yolo` or another [full access sandbox setting](/codex/agent-approvals-security), web search defaults to live results. To disable this behavior or switch modes, use the `web_search` configuration option:
+
+- `web_search = &quot;cached&quot;` (default; serves results from the web search cache)
+- `web_search = &quot;live&quot;` (fetches the most recent data from the web; same as `--search`)
+- `web_search = &quot;disabled&quot;` to remove the tool
+
+To learn more, check out the [configuration documentation](/codex/config-file/config-basic).</content:encoded></item>
+<item><title>Team Config for shared configuration</title><link>https://developers.openai.com/codex/changelog/#codex-2026-01-23</link><guid>https://developers.openai.com/codex/changelog/#codex-2026-01-23</guid><description>Team Config for shared configuration</description><pubDate>Fri, 23 Jan 2026 00:00:00 GMT</pubDate><content:encoded># Team Config for shared configuration
+
+Team Config groups the files teams use to standardize Codex across repositories and machines. Use it to share:
+
+- `config.toml` defaults
+- `rules/` for command controls outside the sandbox
+- `skills/` for reusable workflows
+
+Codex loads these layers from `.codex/` folders in the current working directory, parent folders, and the repo root, plus user (`~/.codex/`) and system (`/etc/codex/`) locations. Higher-precedence locations override lower-precedence ones.
+
+Admins can still enforce constraints with `requirements.toml`, which overrides defaults regardless of location.
+
+Learn more in [Team Config](/codex/enterprise/admin-setup#step-4-standardize-local-configuration-with-team-config).</content:encoded></item>
 </channel></rss>

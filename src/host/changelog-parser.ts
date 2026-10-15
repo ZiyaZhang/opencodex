@@ -13,7 +13,7 @@ export interface ChangelogFeature {
 }
 export interface ChangelogOptions { now?: Date; maxReleases?: number; maxFeatures?: number; maxAgeDays?: number }
 /** Bump when the output for the same feed changes: the RSS source folds it into the hash that decides whether a feed was already read, so a parser fix takes effect on the next run. */
-export const PARSER_VERSION = '2';
+export const PARSER_VERSION = '3';
 /** `raw` is the block as written, link targets included; only the relevance gate reads it. `title` marks the heading that repeats the item title. */
 interface Block { kind: 'heading' | 'item' | 'text'; text: string; raw: string; anchor?: string; title?: true }
 interface Release { date: string; title: string; anchor?: string; url?: string; blocks: Block[] }
@@ -220,6 +220,12 @@ function rssReleases(content: string): Release[] {
   }
   return releases;
 }
+/** A bullet that reads as an option or a sub-point, not as an announcement: it opens with a code span or a path (`rules/`, `~/.codex/`, `config.toml`), or has an `=` among its first 30 characters. A slash command (`/init`) is not a path. */
+function readsAsOption(block: Block): boolean {
+  const first = block.text.match(/^[^\s,;:)]+/)?.[0] ?? '';
+  return block.raw.replace(LIST_ITEM, '').startsWith('`') || block.text.slice(0, 30).includes('=')
+    || /\/$|^(?:\.{1,2}|~)\/.|^\/[^/\s]+\/./.test(first) || /\.(?:toml|json|ya?ml|ini|cfg|conf|env)$/i.test(first);
+}
 function titleFor(text: string): string {
   return text.match(/^(.{4,85}?):\s/)?.[1] ?? text.split(/(?<=[.!?])\s+/)[0]!;
 }
@@ -253,25 +259,33 @@ export function parseChangelog(content: string, sourceUrl: string, options: Chan
       features.push({ title, description: clip(body, DESCRIPTION_LIMIT), sourceUrl: release.url ? (anchor ? linkFor(release.url, anchor) : release.url) : linkFor(sourceUrl, anchor ?? release.anchor), fingerprint, publishedAt, releaseTitle: release.title });
     };
     // `parts` holds paragraphs and bullets in the order they appear, for a section that becomes one feature.
-    let section = '', ownTitle = false, sectionAnchor: string | undefined, paragraphs: string[] = [], items: string[] = [], parts: string[] = [];
+    // `intro` is the paragraphs before the first bullet of the section; `options` says that some bullet reads as an option, not an announcement.
+    let section = '', ownTitle = false, options = false, sectionAnchor: string | undefined, paragraphs: string[] = [], items: string[] = [], parts: string[] = [], intro: string[] = [];
     const flush = () => {
       const name = ownTitle ? release.title : section.replace(/[\s:：]+$/u, '');
       if (!ownTitle && SKIP_SECTION.test(name)) {
         if (PERFORMANCE_SECTION.test(name)) for (const text of parts) if (RUNTIME_FEATURE.test(text)) append(titleFor(text), text, sectionAnchor);
         return;
       }
-      // The item's own title section with several bullets is a list of features, like "New features"; one bullet or plain paragraphs make one feature.
-      if (name && !GENERIC.test(name) && !(ownTitle && items.length >= 2)) {
+      // The item's own title section with several bullets is a list of features, like "New features", led by its intro.
+      // One bullet, plain paragraphs, or bullets that read as options make one feature.
+      const split = ownTitle && items.length >= 2 && !options;
+      if (name && !GENERIC.test(name) && !split) {
         if (parts.length) append(name, parts.join(' '), sectionAnchor);
       } else {
+        if (split) {
+          // The text before the bullets is the announcement itself; a last line that only leads into the list ("This launch also includes:") is not part of it.
+          const lead = intro.length > 1 && /[:：]$/.test(intro.at(-1)!) ? intro.slice(0, -1) : intro;
+          if (lead.length) append(release.title, lead.join(' '), sectionAnchor);
+        }
         for (const item of items) append(titleFor(item), item);
         if (!items.length && paragraphs.length && !/^(?:Codex|ChatGPT) (?:desktop )?app\s+[\d.]/i.test(release.title)) append(release.title, paragraphs.join(' '));
       }
     };
     for (const block of release.blocks) {
-      if (block.kind === 'heading') { flush(); section = block.text; ownTitle = !!block.title; sectionAnchor = block.anchor; paragraphs = []; items = []; parts = []; }
-      else if (block.kind === 'item') { items.push(block.text); parts.push(block.text); }
-      else if (!NON_FEATURE.test(block.text)) { paragraphs.push(block.text); parts.push(block.text); }
+      if (block.kind === 'heading') { flush(); section = block.text; ownTitle = !!block.title; options = false; sectionAnchor = block.anchor; paragraphs = []; items = []; parts = []; intro = []; }
+      else if (block.kind === 'item') { items.push(block.text); parts.push(block.text); if (readsAsOption(block)) options = true; }
+      else if (!NON_FEATURE.test(block.text)) { paragraphs.push(block.text); parts.push(block.text); if (!items.length) intro.push(block.text); }
     }
     flush();
     if (features.length > before && ++acceptedReleases >= maxReleases) break;

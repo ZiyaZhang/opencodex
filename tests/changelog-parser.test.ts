@@ -215,20 +215,59 @@ test('the heading that repeats the item title is the item itself: it is never sk
   assert.equal(feature?.description, 'More browsers: Chrome, Edge and Brave work with Codex tab mentions. Availability depends on rollout.');
 });
 
-test('a title section with two or more bullets yields one feature per bullet, as a "New features" section does; one bullet or plain paragraphs stay one feature', () => {
+test('a title section with several bullets keeps its intro as the first feature and gives each bullet a feature of its own; one bullet or plain paragraphs stay one feature', () => {
   const sentence = 'Does something useful with Codex in the desktop app.';
   const bullets = Array.from({ length: 9 }, (_, n) => `- **Feature ${n + 1}:** ${sentence} ${sentence} ${sentence}`);
-  const nine = parseChangelog(rss('Appshots, goal mode, and more', ['# Appshots, goal mode, and more', '', 'Intro paragraph about Codex.', '', ...bullets, '', 'Closing note.'].join('\n')), url, { now });
-  assert.deepEqual(nine.map(item => item.title), Array.from({ length: 9 }, (_, n) => `Feature ${n + 1}`));
-  assert.ok(nine.every(item => item.description.startsWith('Feature ') && item.description.endsWith(sentence)));
-  // Numbered items are bullets as well.
-  const numbered = parseChangelog(rss('Codex desktop update', '# Codex desktop update\n\n1. Added draft recovery for composers.\n2. Added question cards that keep input.'), url, { now });
-  assert.deepEqual(numbered.map(item => item.title), ['Added draft recovery for composers.', 'Added question cards that keep input.']);
+  const ten = parseChangelog(rss('Appshots, goal mode, and more', [
+    '# Appshots, goal mode, and more', '',
+    'Appshots are now available in the Codex app on macOS.', '',
+    'This launch also includes:', '',
+    ...bullets, '',
+    'Closing note.',
+  ].join('\n')), url, { now });
+  assert.deepEqual(ten.map(item => item.title), ['Appshots, goal mode, and more', ...Array.from({ length: 9 }, (_, n) => `Feature ${n + 1}`)]);
+  // The line that only leads into the list is not part of the intro, and a note after the list is dropped as in a "New features" section.
+  assert.equal(ten[0]!.description, 'Appshots are now available in the Codex app on macOS.');
+  assert.ok(ten.slice(1).every(item => item.description.startsWith('Feature ') && item.description.endsWith(sentence)));
+  // Without anything before the bullets there is no intro feature; an intro that is only a lead-in line is all there is, and stays.
+  const bare = parseChangelog(rss('Codex desktop update', '# Codex desktop update\n\n1. Added draft recovery for composers.\n2. Added question cards that keep input.'), url, { now });
+  assert.deepEqual(bare.map(item => item.title), ['Added draft recovery for composers.', 'Added question cards that keep input.']);
+  const lead = parseChangelog(rss('Codex desktop update', '# Codex desktop update\n\nMore Codex features are rolling out:\n\n- Added draft recovery for composers.\n- Added question cards that keep input.'), url, { now });
+  assert.deepEqual(lead.map(item => [item.title, item.description]), [
+    ['Codex desktop update', 'More Codex features are rolling out:'],
+    ['Added draft recovery for composers.', 'Added draft recovery for composers.'],
+    ['Added question cards that keep input.', 'Added question cards that keep input.'],
+  ]);
   // A single bullet, or paragraphs alone, are not split.
   const single = parseChangelog(rss('Codex desktop update', '# Codex desktop update\n\n- Added draft recovery for composers.'), url, { now });
   assert.deepEqual(single.map(item => item.title), ['Codex desktop update']);
   const paragraphs = parseChangelog(rss('Codex desktop update', '# Codex desktop update\n\nFirst paragraph.\n\nSecond paragraph.'), url, { now });
   assert.deepEqual(paragraphs.map(item => item.description), ['First paragraph. Second paragraph.']);
+});
+
+test('bullets that read as options or sub-points leave the title section in one piece', () => {
+  const titles = (...bullets: string[]) => parseChangelog(rss('Codex desktop update', ['# Codex desktop update', '', 'Codex changed how it is configured.', '', ...bullets.map(bullet => `- ${bullet}`)].join('\n')), url, { now }).map(item => item.title);
+  const announcements = ['**Quick chat:** Chat from the corner of the desktop.', '**Appshots:** Share an app window.'];
+  // The control: announcements are split, the intro first.
+  assert.deepEqual(titles(...announcements), ['Codex desktop update', 'Quick chat', 'Appshots']);
+  // One bullet of the list is enough: a code span first, an "=" among the first 30 characters, a path first.
+  const options = [
+    '`web_search = "live"` fetches live data',
+    'web_search = "live" fetches live data',
+    '`config.toml` defaults',
+    'config.toml defaults',
+    'rules/ for command controls',
+    '`/init` creates the AGENTS.md file',
+    '~/.codex/ holds the user settings',
+    '~/.codex holds the user settings',
+    './scripts/ holds the helpers',
+    './scripts holds the helpers',
+    '/etc/codex/config holds the system settings',
+  ];
+  for (const option of options) assert.deepEqual(titles(option, ...announcements), ['Codex desktop update'], option);
+  // Words that only look like these are announcements: "=" later in the line, product names with a dot or a slash.
+  const lookalikes = ['Added shortcuts for every pet action, a = b', 'Node.js 22 support arrives in the desktop app', 'CI/CD pipelines can now call Codex from the desktop app', '/review now works in the desktop app'];
+  for (const lookalike of lookalikes) assert.equal(titles(lookalike, ...announcements).length, 4, lookalike);
 });
 
 test('the Codex relevance gate reads link targets: an announcement whose only "codex" is a /codex/ link is kept, a foreign link is not', () => {
