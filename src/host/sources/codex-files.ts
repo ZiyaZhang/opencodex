@@ -1,13 +1,16 @@
-/** Source 2: the watched files that differ between two stable tags, one candidate per group of files.
+/** Source 2: what changed in the watched files between two stable tags, as candidates.
  * GitHub's compare API lists at most 300 files of a window, alphabetically, so `codex-rs/features/`, `codex-rs/config.md` and `docs/` never come up.
  * This source takes the recursive tree of each tag instead, keeps the watched paths and compares blob shas; only the files whose sha differs are read.
+ * It works out its own window from the tags and keeps its own checkpoint (`lastFilesTag`): the release source's checkpoint does not decide its window,
+ * and a failure here does not lose it.
  */
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
-import { fingerprintOf, type Evidence, type EvidenceKind } from '../../core/candidate.js';
+import { fingerprintOf, type Candidate, type Evidence, type EvidenceKind } from '../../core/candidate.js';
 import { check } from '../../core/check.js';
 import { writeJsonAtomic, type CandidateStore } from '../../core/store.js';
-import type { GitHubClient } from '../github.js';
-import { minor, type StableWindow } from './codex-releases.js';
+import { GitHubError, type GitHubClient } from '../github.js';
+import { minor, stableWindow, type StableWindow } from './codex-releases.js';
 
 // The feature-flag registry is the Rust source of the features crate. Its build files and test modules (`tests.rs`, `*_tests.rs`) say nothing about a new flag.
 const FEATURE_SOURCE = /^codex-rs\/features\/src\/.+\.rs$/;
@@ -20,27 +23,35 @@ export interface ChangedPath { path: string; status: 'added' | 'removed' | 'modi
 export interface ChangedFile extends ChangedPath {
   /** Lines of the new version that the old version does not have. Empty for a removed file and for a file that could not be read. */
   added: string[];
-  /** Why the content was not compared (a failed or refused request, or the fetch budget); `added` is then empty. */
+  /** Why the content was not compared (a failed or refused request, the rate limit, or the fetch budget); `added` is then empty. Never set for a removed file, which is not read. */
   error?: string;
 }
 export interface FileGroup { key: string; title: string; kind: EvidenceKind; files: ChangedFile[]; excerpt: string }
+/** What one check of this source did: the window it covered (none when there was nothing new), the candidates it created and the existing ones it added to. */
+export interface FilesCollection { window?: StableWindow; added: number; merged: number }
 
+/** The window is worked out from this many of the newest stable tags, as the release source does. */
+const RECENT_STABLE_TAGS = 12;
+const CHECKPOINT = 'lastFilesTag';
 /**
- * Files whose content is read in one run unless the caller passes another `budget`. It counts files, not requests: an added or removed file costs one request, a modified one two.
- * Through `gh` 60 is far below the authenticated limit; on the anonymous REST fallback (60 requests an hour) the host passes a smaller budget.
+ * Files whose content is read in one run unless the caller passes another `budget`. It counts files, not requests: an added file costs one request, a modified one two,
+ * a removed one none. Through `gh` 60 is far below the authenticated limit; on the anonymous REST fallback (60 requests an hour) the host passes a smaller budget.
  */
 const DEFAULT_BUDGET = 60;
-const OVER_BUDGET = 'skipped: over the per-run fetch budget';
-const EXCERPT_LIMIT = 6_000, SUMMARY_LIMIT = 1_000, EVIDENCE_LIMIT = 2_000, ERROR_LIMIT = 200;
+const OVER_BUDGET = '超出本次读取上限';
+const RATE_LIMITED = '已达 GitHub 速率限制';
+const EXCERPT_LIMIT = 6_000, SUMMARY_LIMIT = 1_000, EVIDENCE_LIMIT = 2_000, ERROR_LIMIT = 200, LONG_LINE = 200;
 const LINE_BREAK = /\r\n|\r|\n/;
 
-type Family = 'feature-flag' | 'schema' | 'config' | 'doc';
+type Family = 'feature-flag' | 'config' | 'doc' | 'schema';
 /** Only called for watched paths. */
 const familyOf = (path: string): Family => FEATURE_SOURCE.test(path) ? 'feature-flag' : SCHEMA_TYPE.test(path) ? 'schema' : path === CONFIG_DOC ? 'config' : 'doc';
-/** The order files are read in: what says most about a new capability first. */
-const PRIORITY: Record<Family, number> = { 'feature-flag': 0, schema: 1, config: 2, doc: 3 };
+/** The order files are read in. A generator change touches hundreds of one-line type files, so the types come last: they must not use up the budget the flags and docs need. */
+const PRIORITY: Record<Family, number> = { 'feature-flag': 0, config: 1, doc: 2, schema: 3 };
 const byPriority = (a: ChangedPath, b: ChangedPath): number =>
   PRIORITY[familyOf(a.path)] - PRIORITY[familyOf(b.path)] || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+/** `index.ts` and `v2/index.ts` only re-export the type files. */
+const isIndex = (path: string): boolean => familyOf(path) === 'schema' && path.split('/').at(-1) === 'index.ts';
 
 /** Paths in either tree whose blob sha differs, sorted by path. */
 export function changedWatched(before: Map<string, string>, after: Map<string, string>): ChangedPath[] {
@@ -52,10 +63,60 @@ export function changedWatched(before: Map<string, string>, after: Map<string, s
   });
 }
 
-/** Non-blank lines of `after` that `before` does not have, in order. Whole lines are compared as a set, not aligned (no longest common subsequence), and CRLF reads like LF. */
-export function addedLines(before: string, after: string): string[] {
-  const old = new Set(before.split(LINE_BREAK));
-  return after.split(LINE_BREAK).filter(line => line.trim() && !old.has(line));
+/** Lines of `after` beyond the copies `before` already has, in order. Occurrences are counted: a moved line is not new, but one more copy of a line is. */
+function newLines(before: string[], after: string[]): string[] {
+  const unused = new Map<string, number>();
+  for (const line of before) unused.set(line, (unused.get(line) ?? 0) + 1);
+  return after.filter(line => {
+    if (!line.trim()) return false;
+    const left = unused.get(line) ?? 0;
+    if (left === 0) return true;
+    unused.set(line, left - 1);
+    return false;
+  });
+}
+/** Non-blank lines of `after` that `before` does not have, in order. Whole lines are compared, counted and not aligned (no longest common subsequence), and CRLF reads like LF. */
+export const addedLines = (before: string, after: string): string[] => newLines(before.split(LINE_BREAK), after.split(LINE_BREAK));
+
+const CLOSER: Record<string, string> = { '}': '{', ']': '[', ')': '(', '>': '<' };
+/**
+ * A line longer than 200 characters cut after each top-level `, ` or `; `, so that one added field is one line. Top level is directly inside a `{`: the fields of the type,
+ * or of one variant of a union. Nested objects, generics, tuples and strings stay whole.
+ */
+function splitFields(line: string): string[] {
+  if (line.length <= LONG_LINE) return [line];
+  const pieces: string[] = [];
+  const open: string[] = [];
+  let start = 0, inString = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]!;
+    if (inString) {
+      if (ch === '\\') i++;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') inString = true;
+    else if ('{[(<'.includes(ch)) open.push(ch);
+    else if (CLOSER[ch] !== undefined) { if (open.at(-1) === CLOSER[ch]) open.pop(); }
+    else if ((ch === ',' || ch === ';') && line[i + 1] === ' ' && open.length === 1 && open[0] === '{') {
+      pieces.push(line.slice(start, i + 1));
+      start = i + 2;
+    }
+  }
+  pieces.push(line.slice(start));
+  return pieces;
+}
+/**
+ * The lines compared for a ts-rs generated file: without the leading `//` header and the `import type` lines, which change when the generator or an unrelated type does,
+ * and with a long type line cut into its fields. Blank lines are dropped.
+ */
+export function schemaLines(text: string): string[] {
+  const lines: string[] = [];
+  let header = true;
+  for (const line of text.split(LINE_BREAK)) {
+    if (header && (!line.trim() || line.startsWith('//'))) continue;
+    header = false;
+    if (line.trim() && !/^import type .*;\s*$/.test(line)) lines.push(...splitFields(line).filter(piece => piece.trim()));
+  }
+  return lines;
 }
 
 /** At most `limit` characters; a longer text ends in an ellipsis, and the cut never falls between the halves of a surrogate pair. */
@@ -66,17 +127,59 @@ function cutText(text: string, limit: number): string {
   if (last >= 0xd800 && last <= 0xdbff) end--;
   return `${text.slice(0, end)}…`;
 }
-/** The lines joined by newlines, whole lines from the top up to `limit` characters. Only a first line that is longer than the limit by itself is cut. */
-function clipLines(lines: string[], limit: number): string {
-  let length = 0, kept = 0;
-  for (const line of lines) {
-    const next = length + (kept > 0 ? 1 : 0) + line.length;
+const more = (count: number): string => `…另有 ${count} 行`;
+/**
+ * The lines joined by newlines: whole lines from the top, then a line that counts the ones left out, all within `limit` characters. `omitted` is the number of lines
+ * already left out before these. Only a first line that cannot fit by itself is cut.
+ */
+function clipLines(lines: string[], limit: number, omitted = 0): string {
+  const tail = (shown: number): string => (omitted + lines.length - shown > 0 ? more(omitted + lines.length - shown) : '');
+  let length = 0, shown = 0;
+  while (shown < lines.length) {
+    const next = length + (shown > 0 ? 1 : 0) + lines[shown]!.length;
     if (next > limit) break;
     length = next;
-    kept++;
+    shown++;
   }
-  return kept === 0 && lines.length > 0 ? cutText(lines[0]!, limit) : lines.slice(0, kept).join('\n');
+  // The count has to fit as well: give lines back until it does.
+  while (shown > 0 && length + (tail(shown) ? 1 + tail(shown).length : 0) > limit) {
+    shown--;
+    length -= lines[shown]!.length + (shown > 0 ? 1 : 0);
+  }
+  if (shown > 0) return [...lines.slice(0, shown), ...(tail(shown) ? [tail(shown)] : [])].join('\n');
+  if (lines.length === 0) return tail(0);
+  const rest = tail(1);
+  return rest ? `${cutText(lines[0]!, limit - rest.length - 1)}\n${rest}` : cutText(lines[0]!, limit);
 }
+/** Undoes `clipLines` for an excerpt read back from a stored candidate: the lines that were shown and the count that was left out. */
+function parseExcerpt(excerpt = ''): { lines: string[]; omitted: number } {
+  if (!excerpt) return { lines: [], omitted: 0 };
+  const lines = excerpt.split('\n');
+  const count = /^…另有 (\d+) 行$/.exec(lines.at(-1)!);
+  return count ? { lines: lines.slice(0, -1), omitted: Number(count[1]) } : { lines, omitted: 0 };
+}
+
+/** What names a file in an excerpt line: its path under `schema/typescript/` without `.ts` for a protocol type (`v2/SessionSource`), its file name for anything else (`lib.rs`). */
+function nameOf(path: string): string {
+  return familyOf(path) === 'schema' ? path.replace(SCHEMA_TYPE, '').replace(/\.ts$/, '') : path.split('/').at(-1)!;
+}
+/*
+ * Files whose content is not in hand, and what a candidate says about them:
+ * - A removed file is never read, since its lines are gone. It shows as `（文件已删除）`; a read error does not apply to it.
+ * - A file that could not be read (over 1 MB, a failed request, the rate limit, past the budget) shows as `（内容未读取：<reason>）`. The marker is a line of its excerpt, in the
+ *   evidence and in the summary, so that the candidate is not an empty shell. Such a file still makes a candidate: "not read" is not "nothing new", and the change would be
+ *   lost for good, because a window is collected once.
+ * - A modified file that gained no line (a reordering, blank lines, only removed lines, a generator header) has nothing to report and is left out.
+ */
+const DELETED = '（文件已删除）';
+const unread = (reason: string): string => `（内容未读取：${cutText(reason.replace(/\s+/g, ' ').trim(), ERROR_LIMIT)}）`;
+/** The lines a file contributes to an excerpt: its added lines, or the reason it has none. */
+function linesOf(file: ChangedFile): string[] {
+  if (file.added.length > 0) return file.added;
+  if (file.error) return [unread(file.error)];
+  return file.status === 'removed' ? [DELETED] : [];
+}
+const hasNews = (file: ChangedFile): boolean => file.status !== 'modified' || file.added.length > 0 || file.error !== undefined;
 
 function groupOf(path: string): Pick<FileGroup, 'key' | 'kind'> {
   const family = familyOf(path);
@@ -84,115 +187,157 @@ function groupOf(path: string): Pick<FileGroup, 'key' | 'kind'> {
   if (family === 'schema') return { key: 'schema', kind: 'schema' };
   return { key: `doc:${path}`, kind: 'doc' };
 }
-/** The protocol group is named by how many type files it holds. */
-const schemaTitle = (types: number): string => `协议类型有变化：${types} 个类型`;
-function titleOf(group: Pick<FileGroup, 'kind' | 'files'>): string {
-  if (group.kind === 'feature-flag') return '功能开关注册表有变化';
-  if (group.kind === 'schema') return schemaTitle(group.files.length);
-  return `文档有变化：${group.files[0]!.path}`; // a doc group is the one file it is named after
-}
-
-/** What names a file in an excerpt line: the type for a protocol file (`TurnStartParams`), the file name for anything else (`lib.rs`). */
-function nameOf(path: string): string {
-  const file = path.split('/').at(-1)!;
-  return familyOf(path) === 'schema' ? file.replace(/\.ts$/, '') : file;
-}
-
-/*
- * Two decisions about files whose content is not in hand:
- * - A removed file has no added lines, and neither has one that could not be read (over 1 MB, a failed request, past the budget). Each says so in the excerpt,
- *   `<name>: （文件已删除）` or `<name>: （内容未读取：<reason>）`, so that the candidate it makes is not an empty shell.
- * - A group with such a file is still a candidate (see `hasNews`): "not read" is not "nothing new", and the change would be lost for good, because a window is collected once.
- */
-/** `<name>: <line>` for each added line, or the reason a file has none. */
-function excerptLines(file: ChangedFile): string[] {
-  const name = nameOf(file.path);
-  if (file.added.length > 0) return file.added.map(line => `${name}: ${line}`);
-  if (file.error) return [`${name}: （内容未读取：${cutText(file.error.replace(/\s+/g, ' ').trim(), ERROR_LIMIT)}）`];
-  if (file.status === 'removed') return [`${name}: （文件已删除）`];
-  return [];
+const versionNote = (version?: string): string => (version ? `（${version}）` : '');
+/** `version` is the minor, or the full version of a candidate the user has already moved on from; `types` is how many type files the protocol candidate holds. */
+function titleOf(group: Pick<FileGroup, 'kind' | 'files'>, version?: string, types = group.files.length): string {
+  if (group.kind === 'feature-flag') return `功能开关注册表有变化${versionNote(version)}`;
+  if (group.kind === 'schema') return `协议类型有变化${versionNote(version)}：${types} 个类型`;
+  return `文档有变化${versionNote(version)}：${group.files[0]!.path}`; // a doc group is the one file it is named after
 }
 
 /**
- * The watched files grouped into what becomes one candidate each, in the order the groups first appear:
- * the feature-flag sources are one group (`feature-flags`), every protocol type of the window is one group (`schema`), a doc is one group per path (`doc:<path>`).
- * The excerpt is the group's added lines (a file without any gives the reason instead), capped at 6,000 characters and cut at a whole line.
+ * The watched files that have something to report, grouped into what becomes one candidate each, in the order the groups first appear:
+ * the feature-flag sources are one group (`feature-flags`), every protocol type of the window is one group (`schema`, without the `index.ts` re-exports), a doc is one group per path (`doc:<path>`).
+ * The excerpt is the group's added lines as `<name>: <line>`, or the reason a file has none, cut at a whole line within 6,000 characters. `version` goes into the titles.
  */
-export function groupWatchedFiles(files: ChangedFile[]): FileGroup[] {
+export function groupWatchedFiles(files: ChangedFile[], version?: string): FileGroup[] {
   const groups = new Map<string, FileGroup>();
   for (const file of files) {
-    if (!WATCHED(file.path)) continue;
+    if (!WATCHED(file.path) || isIndex(file.path) || !hasNews(file)) continue;
     const head = groupOf(file.path);
     const group = groups.get(head.key) ?? { ...head, title: '', files: [], excerpt: '' };
     group.files.push(file);
     groups.set(head.key, group);
   }
   for (const group of groups.values()) {
-    group.title = titleOf(group);
-    group.excerpt = clipLines(group.files.flatMap(excerptLines), EXCERPT_LIMIT);
+    group.title = titleOf(group, version);
+    group.excerpt = clipLines(group.files.flatMap(file => linesOf(file).map(line => `${nameOf(file.path)}: ${line}`)), EXCERPT_LIMIT);
   }
   return [...groups.values()];
 }
 
-/** False for a group whose files were all edited in place without gaining a line and were all read: nothing to report. A removal, an addition or an unread file is something to report. */
-const hasNews = (group: FileGroup): boolean => group.files.some(file => file.status !== 'modified' || file.added.length > 0 || file.error !== undefined);
+/** One file of a candidate in memory: the lines of its evidence entry, and how many more the stored excerpt had already left out. */
+interface Entry { ref: string; url?: string; lines: string[]; omitted: number }
+const entryOf = (evidence: Evidence): Entry => ({ ref: evidence.ref, url: evidence.url, ...parseExcerpt(evidence.excerpt) });
+/** GitHub's own anchor for one file of a compare page. */
+const compareUrl = (from: string, to: string, path: string): string =>
+  `https://github.com/openai/codex/compare/${from}...${to}#diff-${createHash('sha256').update(path).digest('hex')}`;
+/**
+ * The entries of a candidate after another window: those only an earlier window found stay in front, this window's follow. A file both found keeps the older lines first and gains the
+ * newer ones not yet in it (a read that failed adds its marker), and its link spans from the first window of the candidate to this one.
+ */
+function mergeEntries(old: Entry[], found: Entry[], from: string, to: string): Entry[] {
+  const earlier = new Map(old.map(entry => [entry.ref, entry]));
+  const refs = new Set(found.map(entry => entry.ref));
+  return [
+    ...old.filter(entry => !refs.has(entry.ref)),
+    ...found.map(entry => {
+      const before = earlier.get(entry.ref);
+      if (!before) return entry;
+      const present = new Set(before.lines);
+      return { ref: entry.ref, url: compareUrl(from, to, entry.ref), lines: [...before.lines, ...entry.lines.filter(line => !present.has(line))], omitted: before.omitted };
+    }),
+  ];
+}
+/** The summary of a candidate is rebuilt from all its entries, not only from the newest window. */
+function summaryOf(entries: Entry[]): string {
+  const lines = entries.flatMap(entry => entry.lines.map(line => `${nameOf(entry.ref)}: ${line}`));
+  return clipLines(lines, SUMMARY_LIMIT, entries.reduce((sum, entry) => sum + entry.omitted, 0));
+}
 
 /**
- * Both versions of one changed file (an added file only at `to`, a removed one only at `from`), compared line by line.
- * A file that cannot be read (over 1 MB, a failed request) is recorded with its error so that the rest of the run goes on; an abort ends the run.
+ * Where this window's findings of a group go. While the candidate of the minor is still `new` they are added to it; once the user has reported, started or ignored it they
+ * go to a candidate of the full version, so that they are seen. `stored` is true when an earlier attempt at this very window (the checkpoint did not move) already put the group
+ * into the candidate of the minor, whatever the user has done with it since, or into the one of the full version: it is then left as it is.
  */
-async function readChange(github: Pick<GitHubClient, 'fileAt'>, window: StableWindow, change: ChangedPath, signal?: AbortSignal): Promise<ChangedFile> {
+async function targetFor(store: CandidateStore, groupKey: string, to: string): Promise<{ key: string; version: string; existing?: Candidate; stored: boolean }> {
+  const minorKey = `${groupKey}:${minor(to)}`;
+  const forMinor = await store.findByFingerprint(fingerprintOf('codex-files', minorKey));
+  if (!forMinor || forMinor.status === 'new') return { key: minorKey, version: minor(to), existing: forMinor, stored: forMinor?.window?.toTag === to };
+  const version = to.replace(/^rust-v/, '');
+  const key = `${groupKey}:${version}`;
+  const forFull = await store.findByFingerprint(fingerprintOf('codex-files', key));
+  return { key, version, existing: forFull, stored: forMinor.window?.toTag === to || forFull?.window?.toTag === to };
+}
+
+/** A request the rate limit refused. Not every 403 is one: the contents API also answers 403 for a blob over 1 MB. */
+const isRateLimit = (error: unknown): boolean => error instanceof GitHubError && error.rateLimited;
+
+/**
+ * Both versions of one added or modified file, compared line by line (an added file has no old version). A file that cannot be read is recorded with its error so that the
+ * rest of the run goes on; an abort ends the run. `rateLimited` tells the caller to stop asking.
+ */
+async function readChange(github: Pick<GitHubClient, 'fileAt'>, window: StableWindow, change: ChangedPath, signal?: AbortSignal): Promise<{ file: ChangedFile; rateLimited: boolean }> {
   // An async wrapper, so that a call which throws instead of rejecting still leaves both reads for `Promise.all` to settle.
   const read = async (tag: string) => github.fileAt(tag, change.path, signal);
   try {
-    const [before, after] = await Promise.all([change.status === 'added' ? '' : read(window.from), change.status === 'removed' ? '' : read(window.to)]);
-    return { ...change, added: addedLines(before, after) };
+    const [before, after] = await Promise.all([change.status === 'added' ? '' : read(window.from), read(window.to)]);
+    const added = familyOf(change.path) === 'schema' ? newLines(schemaLines(before), schemaLines(after)) : addedLines(before, after);
+    return { file: { ...change, added }, rateLimited: false };
   } catch (error) {
     if (signal?.aborted) throw error;
-    return { ...change, added: [], error: (error instanceof Error ? error.message : String(error)) || 'unknown error' };
+    return { file: { ...change, added: [], error: (error instanceof Error ? error.message : String(error)) || 'unknown error' }, rateLimited: isRateLimit(error) };
   }
 }
 
 /**
- * Stores one `codex-files` candidate per group of watched files that changed from `window.from` to `window.to` and returns how many were new:
- * the feature-flag sources, all protocol types together, and each doc on its own.
- * The fingerprint carries the minor version, so a patch release lands on the candidate of its minor and adds to it: evidence entries (matched by `ref`) that an earlier window
- * found in other files stay in front, this window's entries follow and replace an older entry of the same file, `window.fromTag` stays where the first window put it, and the summary is this window's.
- * At most `options.budget` files are read (default 60), feature flags first, then protocol types, `codex-rs/config.md` and docs (alphabetical within each); the rest are recorded unread.
- * The result is also saved as `<snapshotDir>/codex-files/<from>__<to>.json`, which keeps the added lines of every changed file, candidate or not.
+ * Finds the window of stable releases this source has not covered yet (from `lastFilesTag`, the 12 newest stable tags), and stores one `codex-files` candidate per group of watched files
+ * that changed in it: the feature-flag sources, all protocol types together, and each doc on its own. `added` counts the candidates created, `merged` the existing ones added to.
+ * The checkpoint moves only after the snapshot and every candidate are stored: a failed tag or tree request, or a failed store, throws and the next check retries the window
+ * (a candidate the earlier attempt already stored is recognised by its `toTag` and left alone). A file that cannot be read is recorded and does not hold the checkpoint back.
+ * The candidate is keyed by the minor version, so a patch release adds to the candidate of its minor while that is still `new`: its evidence is kept (matched by `ref`, the lines of a
+ * file found by both windows are merged), `window.fromTag` stays at the first window's, and the summary is rebuilt from all of it. Once the user has moved the candidate on, the
+ * findings go to a candidate of the full version instead.
+ * At most `options.budget` files are read (default 60), flags first, then `codex-rs/config.md`, docs and protocol types (alphabetical within each); a removed file is not read and takes
+ * no slot; the rest are recorded unread, and so are all that follow a rate limit. The result is also saved as `<snapshotDir>/codex-files/<from>__<to>.json`, which keeps the added lines
+ * of every changed file, candidate or not.
  */
 export async function collectFileChanges(
-  store: CandidateStore, github: Pick<GitHubClient, 'treePaths' | 'fileAt'>, snapshotDir: string, window: StableWindow, signal?: AbortSignal, options: { budget?: number } = {},
-): Promise<number> {
+  store: CandidateStore, github: Pick<GitHubClient, 'stableTags' | 'treePaths' | 'fileAt'>, snapshotDir: string, signal?: AbortSignal, options: { budget?: number } = {},
+): Promise<FilesCollection> {
   const budget = options.budget ?? DEFAULT_BUDGET;
   check(Number.isInteger(budget) && budget >= 0, `budget must be a non-negative integer, got ${budget}`);
   signal?.throwIfAborted();
+  const window = stableWindow(await github.stableTags(RECENT_STABLE_TAGS, signal), await store.checkpoint(CHECKPOINT));
+  if (!window) return { added: 0, merged: 0 };
   const [before, after] = await Promise.all([github.treePaths(window.from, WATCHED, signal), github.treePaths(window.to, WATCHED, signal)]);
   const changes = changedWatched(before, after);
   const loaded = new Map<string, ChangedFile>();
-  for (const [index, change] of [...changes].sort(byPriority).entries()) {
+  let slots = budget, limited = false;
+  for (const change of [...changes].sort(byPriority)) {
     signal?.throwIfAborted();
-    loaded.set(change.path, index < budget ? await readChange(github, window, change, signal) : { ...change, added: [], error: OVER_BUDGET });
+    if (change.status === 'removed') loaded.set(change.path, { ...change, added: [] });
+    else if (slots === 0) loaded.set(change.path, { ...change, added: [], error: OVER_BUDGET });
+    else {
+      slots--;
+      if (limited) loaded.set(change.path, { ...change, added: [], error: RATE_LIMITED });
+      else {
+        const reading = await readChange(github, window, change, signal);
+        limited = reading.rateLimited;
+        loaded.set(change.path, reading.file);
+      }
+    }
   }
   const files = changes.map(change => loaded.get(change.path)!); // back in the order of the tree diff
   signal?.throwIfAborted();
   await writeJsonAtomic(join(snapshotDir, 'codex-files', `${window.from}__${window.to}.json`), { window, files });
-  const url = `https://github.com/openai/codex/compare/${window.from}...${window.to}`;
-  let added = 0;
-  for (const group of groupWatchedFiles(files).filter(hasNews)) {
-    const key = `${group.key}:${minor(window.to)}`;
-    const found = group.files.map((file): Evidence => ({ kind: group.kind, ref: file.path, url, excerpt: clipLines(file.added, EVIDENCE_LIMIT) }));
-    // Read here and written by `upsert` below: one Host runs one check at a time, so nothing writes this candidate in between.
-    const existing = await store.findByFingerprint(fingerprintOf('codex-files', key));
-    const refs = new Set(found.map(entry => entry.ref));
-    const evidence = [...(existing?.evidence ?? []).filter(entry => !refs.has(entry.ref)), ...found];
-    // The protocol title counts the types of the whole candidate, not only the ones this window found.
-    const title = group.kind === 'schema' ? schemaTitle(evidence.length) : group.title;
-    const { created } = await store.upsert({
-      source: 'codex-files', key, title, summary: clipLines(group.excerpt.split('\n'), SUMMARY_LIMIT), evidence,
-      window: { fromTag: existing?.window?.fromTag ?? window.from, toTag: window.to },
+
+  let added = 0, merged = 0;
+  for (const group of groupWatchedFiles(files)) {
+    const { key, version, existing, stored } = await targetFor(store, group.key, window.to);
+    // Merging a window again would count the lines its stored excerpt left out twice, and a candidate the user has moved on would get a copy.
+    if (stored) continue;
+    const from = existing?.window?.fromTag ?? window.from;
+    const found = group.files.map((file): Entry => ({ ref: file.path, url: compareUrl(window.from, window.to, file.path), lines: linesOf(file), omitted: 0 }));
+    const entries = existing ? mergeEntries(existing.evidence.map(entryOf), found, from, window.to) : found;
+    const result = await store.upsert({
+      source: 'codex-files', key, title: titleOf(group, version, entries.length), summary: summaryOf(entries),
+      evidence: entries.map((entry): Evidence => ({ kind: group.kind, ref: entry.ref, url: entry.url, excerpt: clipLines(entry.lines, EVIDENCE_LIMIT, entry.omitted) })),
+      window: { fromTag: from, toTag: window.to },
     });
-    if (created) added++;
+    if (result.created) added++;
+    else merged++; // the window's end differs from the one it had, so an existing candidate always changes
   }
-  return added;
+  await store.setCheckpoint(CHECKPOINT, window.to);
+  return { window, added, merged };
 }
