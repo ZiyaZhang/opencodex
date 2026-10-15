@@ -54,7 +54,7 @@ test('a listed entry is read without parsing the multi-megabyte header, a path s
 test('files kept outside the archive are not listed and do not shift the offsets of the packed ones', async () => {
   await withDir(async dir => {
     const path = join(dir, 'app.asar');
-    await writeFile(path, makeAsar({ 'native/addon.node': 'native', 'webview/a.js': 'first', 'native/other.node': 'native', 'webview/b.js': 'second' }, ['native/addon.node', 'native/other.node']));
+    await writeFile(path, makeAsar({ 'native/addon.node': 'native', 'webview/a.js': 'first', 'native/other.node': 'native', 'webview/b.js': 'second' }, { unpacked: ['native/addon.node', 'native/other.node'] }));
     const entries = await listAsar(path);
     assert.deepEqual(entries.map(e => e.path), ['/webview/a.js', '/webview/b.js']);
     assert.deepEqual(await Promise.all(entries.map(async e => (await readAsarEntry(path, e)).toString())), ['first', 'second']);
@@ -95,14 +95,58 @@ test('a header that is not an asar prefix is rejected before anything is read fr
   });
 });
 
-test('a missing entry, an oversized entry and an entry with a non-numeric offset are rejected', async () => {
+test('a missing entry and an oversized entry are rejected', async () => {
   await withDir(async dir => {
-    const path = join(dir, 'real.asar'), badOffset = join(dir, 'bad-offset.asar');
+    const path = join(dir, 'real.asar');
     await writeFile(path, makeAsar({ 'big.bin': 'x'.repeat(100) }));
-    await writeFile(badOffset, Buffer.from(makeAsar({ 'a.txt': 'hello' }).toString('latin1').replace('"offset":"0"', '"offset":"x"'), 'latin1'));
     await assert.rejects(readAsarEntry(path, '/missing.bin'), /not found/);
     await assert.rejects(readAsarEntry(path, '/big.bin', 99), /exceeds 99 bytes/);
     assert.equal((await readAsarEntry(path, '/big.bin', 100)).length, 100);
-    await assert.rejects(readAsarEntry(badOffset, '/a.txt'), /Invalid asar range/);
+  });
+});
+
+test('symlink nodes have no data of their own and are not listed', async () => {
+  await withDir(async dir => {
+    const path = join(dir, 'app.asar');
+    await writeFile(path, makeAsar({ 'lib/tool.js': 'tool' }, { links: { 'bin/tool': '../lib/tool.js' } }));
+    const entries = await listAsar(path);
+    assert.deepEqual(entries.map(e => e.path), ['/lib/tool.js']);
+    await assert.rejects(readAsarEntry(path, '/bin/tool'), /not found/);
+  });
+});
+
+test('an offset that is not a plain decimal string, or a size that is not a count, fails the listing instead of reading the wrong bytes', async () => {
+  await withDir(async dir => {
+    const damage: Array<[string, (node: Record<string, unknown>) => void, RegExp]> = [
+      ['letters', node => { node.offset = 'x'; }, /Invalid asar offset for \/a\.txt/],
+      ['negative', node => { node.offset = '-1'; }, /Invalid asar offset/],
+      ['fraction', node => { node.offset = '1.5'; }, /Invalid asar offset/],
+      ['hex', node => { node.offset = '0x10'; }, /Invalid asar offset/],
+      ['padded', node => { node.offset = ' 5'; }, /Invalid asar offset/],
+      ['empty', node => { node.offset = ''; }, /Invalid asar offset/],
+      ['beyond 2**53', node => { node.offset = '9007199254740993'; }, /Invalid asar offset/],
+      ['a number, not a string', node => { node.offset = 5; }, /Invalid asar offset/],
+      ['missing', node => { delete node.offset; }, /Invalid asar offset/],
+      ['size missing', node => { delete node.size; }, /Invalid asar size/],
+      ['size negative', node => { node.size = -1; }, /Invalid asar size/],
+      ['size fractional', node => { node.size = 1.5; }, /Invalid asar size/],
+      ['size a string', node => { node.size = '5'; }, /Invalid asar size/],
+    ];
+    for (const [name, edit, message] of damage) {
+      const path = join(dir, `${name.replace(/\W+/g, '-')}.asar`);
+      await writeFile(path, makeAsar({ 'a.txt': 'hello' }, { edit: tree => edit(tree.files['a.txt'] as Record<string, unknown>) }));
+      await assert.rejects(listAsar(path), message, name);
+      await assert.rejects(readAsarEntry(path, '/a.txt'), message, name);
+    }
+  });
+});
+
+test('an entry object with an impossible range is refused before any read', async () => {
+  await withDir(async dir => {
+    const path = join(dir, 'app.asar');
+    await writeFile(path, makeAsar({ 'a.txt': 'hello' }));
+    for (const entry of [{ path: '/a.txt', size: 5, offset: Number.NaN }, { path: '/a.txt', size: 5, offset: -1 }, { path: '/a.txt', size: 1.5, offset: 0 }, { path: '/a.txt', size: -2, offset: 0 }]) {
+      await assert.rejects(readAsarEntry(path, entry), /Invalid asar range/);
+    }
   });
 });

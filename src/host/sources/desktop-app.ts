@@ -7,10 +7,21 @@ import { readBundleVersion, type PlutilRunner } from './plist.js';
 
 export interface DesktopManifest {
   version: string; entries: string[]; keys: string[]; strings: string[];
-  /** Key to message from the current locale bundle. `snapshotDesktop` fills it; it is not written to the snapshot files. */
+  /** Key to message from the locale bundle that supplied `keys`. `snapshotDesktop` fills it; it is not written to the snapshot files. */
   messages?: ReadonlyMap<string, string>;
 }
+/** What `snapshotDesktop` found. `localeBundle` is the archive path the keys came from; null when no bundle of the locale had a single `codex.` key. */
+export interface DesktopSnapshot extends DesktopManifest { messages: ReadonlyMap<string, string>; localeBundle: string | null }
 export interface DesktopDiff { addedChunks: string[]; removedChunks: string[]; addedKeys: string[]; addedStrings: string[] }
+export interface DesktopCollection {
+  version: string; changed: boolean; added: number;
+  /** `codex.` keys in this version's own locale bundle. 0 means no bundle of the locale was found (or none had keys): report it as an error. */
+  keys: number;
+  /** Archive path of the bundle the keys came from; absent when `keys` is 0. */
+  localeBundle?: string;
+  /** More than half of the keys changed at once, which is a new bundle layout rather than that many features: the key baseline was reset and no key candidates were made. */
+  keysReset?: boolean;
+}
 
 const MAX_MESSAGE = 200, MAX_SUMMARY = 1_000;
 // Unrolled loops: linear time, and a backslash-escaped quote stays inside its literal.
@@ -18,7 +29,11 @@ const TEMPLATE = /`([^`\\]*(?:\\[\s\S][^`\\]*)*)`/g;
 const KEY = /"(codex\.[A-Za-z0-9_.-]{3,120})"\s*:/g;
 const MESSAGE = /"(codex\.[A-Za-z0-9_.-]{3,120})"\s*:\s*(?:`([^`\\]*(?:\\[\s\S][^`\\]*)*)`|"([^"\\]*(?:\\[\s\S][^"\\]*)*)")/g;
 
-export const stripHash = (path: string) => path.replace(/-[0-9a-f]{12}(\.[a-z0-9]+)$/i, '$1');
+/**
+ * `name-<hash>.ext` becomes `name.ext`. A hash is 8..16 alphanumerics: 12-hex and 16-hex content hashes, or base36 ones with a digit or an
+ * upper-case letter in them. That keeps a plain lowercase word, such as the `-explorer` of an unhashed `file-explorer.png`, from being taken for one.
+ */
+export const stripHash = (path: string) => path.replace(/-(?=[0-9A-Za-z]*[0-9A-Z]|[a-f]{8,16}\.)[0-9A-Za-z]{8,16}(\.[0-9A-Za-z]+)$/, '$1');
 const decodeQuoted = (raw: string): string => { try { return JSON.parse(`"${raw}"`) as string; } catch { return raw; } };
 
 /**
@@ -53,31 +68,46 @@ export function diffManifests(previous: DesktopManifest, current: DesktopManifes
 
 export const versionLabel = ({ version, build }: { version: string; build: string }) => `${version} (${build})`;
 
-/** The locale bundle is `/webview/assets/<locale>-<12 hex>.js`; the locale is compared as text, never built into a pattern. */
+/**
+ * `/webview/assets/<locale>-<hash>.js` with an 8..16 character alphanumeric hash; the locale is compared as text, never built into a pattern.
+ * A false match costs one extra read, a missed one loses the locale, so this stays wide and the key count decides which sibling is used.
+ */
 function isLocaleBundle(path: string, locale: string): boolean {
   const prefix = `/webview/assets/${locale}-`;
-  return path.startsWith(prefix) && /^[0-9a-f]{12}\.js$/.test(path.slice(prefix.length));
+  return path.startsWith(prefix) && /^[0-9a-z]{8,16}\.js$/i.test(path.slice(prefix.length));
 }
+const byPath = (a: { path: string }, b: { path: string }) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
 
 /** Reads the archive once; call only after the plist version changed. `run` replaces the plutil process, for tests off macOS. */
-export async function snapshotDesktop(plistPath: string, locale: string, run?: PlutilRunner): Promise<DesktopManifest> {
-  const label = versionLabel(await readBundleVersion(plistPath, run));
+export async function snapshotDesktop(plistPath: string, locale: string, run?: PlutilRunner, signal?: AbortSignal): Promise<DesktopSnapshot> {
+  signal?.throwIfAborted();
+  const label = versionLabel(await readBundleVersion(plistPath, run, signal));
+  signal?.throwIfAborted();
   // plistPath is <App>.app/Contents/Info.plist; the archive sits next to it in Contents/Resources.
   const asar = join(dirname(plistPath), 'Resources', 'app.asar');
   const listed = await listAsar(asar);
-  const localeEntry = listed.find(e => isLocaleBundle(e.path, locale));
-  const { strings, keys, messages } = localeEntry
-    ? extractStrings((await readAsarEntry(asar, localeEntry)).toString('utf8'))
-    : { strings: [], keys: [], messages: new Map<string, string>() };
+  // Some locales ship a second chunk under the same name pattern that has no Codex keys, and the header lists chunks by name, so either
+  // one can come first. Read them all and keep the one with the most keys; on a tie the lower path wins, so the header order never matters.
+  let best: ({ path: string } & ReturnType<typeof extractStrings>) | undefined;
+  for (const entry of listed.filter(e => isLocaleBundle(e.path, locale)).sort(byPath)) {
+    signal?.throwIfAborted();
+    const found = extractStrings((await readAsarEntry(asar, entry)).toString('utf8'));
+    if (found.keys.length > (best?.keys.length ?? 0)) best = { path: entry.path, ...found };
+  }
+  signal?.throwIfAborted();
   // An update swaps Info.plist and app.asar one after the other. A label that moved while we read means the two may not belong
   // together, and recording them as one version would hide that release's whole diff, so fail and let the next run retry.
-  if (versionLabel(await readBundleVersion(plistPath, run)) !== label) throw new Error('ChatGPT.app changed while it was being read');
-  return { version: label, entries: listed.map(e => e.path).sort(), keys, strings, messages };
+  if (versionLabel(await readBundleVersion(plistPath, run, signal)) !== label) throw new Error('ChatGPT.app changed while it was being read');
+  return {
+    version: label, entries: listed.map(e => e.path).sort(), keys: best?.keys ?? [], strings: best?.strings ?? [],
+    messages: best?.messages ?? new Map<string, string>(), localeBundle: best?.path ?? null,
+  };
 }
 
 const snapshotPath = (snapshotDir: string, label: string) => join(snapshotDir, 'desktop', label.replace(/[^\w.()-]/g, '_'));
 const keyGroup = (key: string) => key.split('.').slice(0, 3).join('.');
-const asRecord = (value: unknown) => (typeof value === 'object' && value !== null ? value : {}) as Partial<DesktopManifest>;
+const asRecord = (value: unknown): Record<string, unknown> => (typeof value === 'object' && value !== null && !Array.isArray(value) ? value : {}) as Record<string, unknown>;
+const isTexts = (value: unknown): value is string[] => Array.isArray(value) && value.every(item => typeof item === 'string');
 
 async function exists(path: string): Promise<boolean> {
   try { await stat(path); return true; } catch (error) {
@@ -87,61 +117,113 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-/** A missing, unparsable or misshapen snapshot reads as undefined, so one bad file re-baselines instead of failing every later run. */
-async function readSnapshot(dir: string): Promise<DesktopManifest | undefined> {
-  try {
-    const { version, entries } = asRecord(JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf8')));
-    const { keys, strings } = asRecord(JSON.parse(await readFile(join(dir, 'strings.json'), 'utf8')));
-    if (typeof version !== 'string' || !Array.isArray(entries) || !Array.isArray(keys) || !Array.isArray(strings)) return undefined;
-    return { version, entries, keys, strings };
-  } catch (error) {
+/** `strings.json`. `locale` is what the snapshot was taken for, and it answers for that locale only. `localeBundle` null marks keys carried over from an earlier version because this one had none. */
+interface StoredStrings { version: string; locale: string; keys: string[]; strings: string[]; localeBundle: string | null }
+type StoredSnapshot = StoredStrings & { entries: string[] };
+
+/** The parsed file, or undefined when it is missing or not JSON; other failures (permissions, I/O) still throw. */
+async function readJsonFile(path: string): Promise<unknown> {
+  try { return JSON.parse(await readFile(path, 'utf8')); } catch (error) {
     if (error instanceof SyntaxError || (error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
 }
+/** A missing, unparsable or misshapen file reads as undefined, so one bad file re-baselines instead of failing every later run. */
+async function readStrings(dir: string): Promise<StoredStrings | undefined> {
+  const { version, locale, keys, strings, localeBundle } = asRecord(await readJsonFile(join(dir, 'strings.json')));
+  if (typeof version !== 'string' || typeof locale !== 'string' || !isTexts(keys) || !isTexts(strings) || !(localeBundle === null || typeof localeBundle === 'string')) return undefined;
+  return { version, locale, keys, strings, localeBundle };
+}
+async function readSnapshot(dir: string): Promise<StoredSnapshot | undefined> {
+  const stored = await readStrings(dir);
+  const { version, entries } = asRecord(await readJsonFile(join(dir, 'manifest.json')));
+  return stored && typeof version === 'string' && isTexts(entries) ? { ...stored, version, entries } : undefined;
+}
+
+const collator = new Intl.Collator('en', { numeric: true });
+const buildOf = (label: string) => /\((\d+)\)$/.exec(label)?.[1];
+/** Whether `label` names an older build than `than`: by build number when both have one, otherwise by natural-order text. */
+function isOlderBuild(label: string, than: string): boolean {
+  const a = buildOf(label), b = buildOf(than);
+  return a !== undefined && b !== undefined ? BigInt(a) < BigInt(b) : collator.compare(label, than) < 0;
+}
+
+/** The part of the result that tells whether the locale bundle was found: its key count and path, or 0 and nothing. */
+const bundleReport = (snapshot: { keys: string[]; localeBundle: string | null }): { keys: number; localeBundle?: string } =>
+  snapshot.localeBundle === null ? { keys: 0 } : { keys: snapshot.keys.length, localeBundle: snapshot.localeBundle };
 
 function clip(text: string): string {
   const flat = [...text.replace(/\s+/g, ' ').trim()];
   return flat.length > MAX_MESSAGE ? `${flat.slice(0, MAX_MESSAGE - 1).join('')}…` : flat.join('');
 }
-/** Whole lines up to MAX_SUMMARY characters, then a count of what was left out. */
+/** Whole lines up to MAX_SUMMARY characters, then a "…另有 N 项" tail for the rest; the tail counts against the limit. */
 function clipLines(lines: string[]): string {
+  const whole = lines.join('\n');
+  if (whole.length <= MAX_SUMMARY) return whole;
+  const tail = (left: number) => `…另有 ${left} 项`;
   let used = 0, kept = 0;
-  for (const line of lines) { if (used + line.length + 1 > MAX_SUMMARY) break; used += line.length + 1; kept++; }
-  return kept === lines.length ? lines.join('\n') : `${lines.slice(0, kept).join('\n')}\n…另有 ${lines.length - kept} 项`;
+  for (const line of lines) {
+    const next = used + (kept > 0 ? 1 : 0) + line.length;
+    // Keep a line only if it still fits together with the tail for everything after it.
+    if (next + 1 + tail(lines.length - kept - 1).length > MAX_SUMMARY) break;
+    used = next; kept++;
+  }
+  return [...lines.slice(0, kept), tail(lines.length - kept)].join('\n');
 }
 
-export async function collectDesktop(store: CandidateStore, snapshotDir: string, plistPath: string, locale: string, run?: PlutilRunner): Promise<{ version: string; changed: boolean; added: number }> {
+export async function collectDesktop(store: CandidateStore, snapshotDir: string, plistPath: string, locale: string, run?: PlutilRunner, signal?: AbortSignal): Promise<DesktopCollection> {
+  signal?.throwIfAborted();
   // No ChatGPT.app on this machine: nothing to report. Any other failure to look is a real error.
-  if (!await exists(plistPath)) return { version: '', changed: false, added: 0 };
+  if (!await exists(plistPath)) return { version: '', changed: false, added: 0, keys: 0 };
   const last = await store.checkpoint('lastDesktopVersion');
-  // The plist read is cheap; the archive is not opened at all while the version is unchanged.
-  if (last === versionLabel(await readBundleVersion(plistPath, run))) return { version: last, changed: false, added: 0 };
-  const current = await snapshotDesktop(plistPath, locale, run);
-  // `last` names the previous snapshot directory. Without a readable one this is a first run: baseline only.
+  const label = versionLabel(await readBundleVersion(plistPath, run, signal));
+  signal?.throwIfAborted();
+  if (last === label) {
+    // The plist read is cheap and the archive stays closed while the version is unchanged: the stored snapshot says what this locale yielded.
+    const stored = await readStrings(snapshotPath(snapshotDir, last));
+    if (stored?.locale === locale) return { version: last, changed: false, added: 0, ...bundleReport(stored) };
+    // The snapshot is gone, damaged, or was taken for another locale: take it again below.
+  }
+  const current = await snapshotDesktop(plistPath, locale, run, signal);
+  signal?.throwIfAborted();
+  // `last` names the previous snapshot directory. Without a readable one this is a first run: baseline only. A build older than
+  // the checkpoint is a downgrade, where everything the newer one dropped would look new, so there is no base then either.
   const previous = last ? await readSnapshot(snapshotPath(snapshotDir, last)) : undefined;
+  const base = last && previous && !isOlderBuild(current.version, last) ? previous : undefined;
+  // Keys only compare within one locale.
+  const keyBase = base?.locale === locale ? base.keys : [];
   const dir = snapshotPath(snapshotDir, current.version);
   await writeJsonAtomic(join(dir, 'manifest.json'), { version: current.version, entries: current.entries });
-  await writeJsonAtomic(join(dir, 'strings.json'), { version: current.version, keys: current.keys, strings: current.strings });
-  let added = 0;
-  if (last && previous) {
-    const diff = diffManifests(previous, current);
+  signal?.throwIfAborted();
+  // A version without keys hands the last non-empty list on as the base for the next diff; `localeBundle: null` marks it as carried over.
+  await writeJsonAtomic(join(dir, 'strings.json'), {
+    version: current.version, locale, keys: current.keys.length > 0 ? current.keys : keyBase, strings: current.strings, localeBundle: current.localeBundle,
+  });
+  signal?.throwIfAborted();
+  let added = 0, keysReset = false;
+  if (last && base) {
+    const diff = diffManifests({ ...base, keys: keyBase }, current);
     for (const chunk of diff.addedChunks) {
+      signal?.throwIfAborted();
+      // `ref` is the stable hash-free name; the excerpt names the real archive path(s) of this version, so nothing has to be re-matched.
+      const realPaths = current.entries.filter(path => stripHash(path) === chunk);
       const { created } = await store.upsert({
         source: 'desktop', key: `chunk:${chunk}:${current.version}`, title: `桌面端新模块 ${chunk.split('/').at(-1)}`,
-        summary: `ChatGPT.app ${last} → ${current.version} 新增前端模块。`, evidence: [{ kind: 'chunk', ref: chunk }], window: { version: current.version },
+        summary: `ChatGPT.app ${last} → ${current.version} 新增前端模块。`, evidence: [{ kind: 'chunk', ref: chunk, excerpt: realPaths.join('\n') }], window: { version: current.version },
       });
       if (created) added++;
     }
-    // A previous snapshot without keys (no locale bundle then) gives no baseline: every key would look new.
+    // Without a base key list every key would look new, and a list that turns over by more than half is a new bundle layout, not that many features.
+    keysReset = keyBase.length > 0 && diff.addedKeys.length * 2 > keyBase.length;
     const groups = new Map<string, string[]>();
-    for (const key of previous.keys.length > 0 ? diff.addedKeys : []) {
+    for (const key of keyBase.length > 0 && !keysReset ? diff.addedKeys : []) {
       const group = keyGroup(key), members = groups.get(group);
       if (members) members.push(key); else groups.set(group, [key]);
     }
     for (const [group, keys] of groups) {
+      signal?.throwIfAborted();
       const evidence = keys.map((key): Evidence => {
-        const text = current.messages?.get(key);
+        const text = current.messages.get(key);
         return text ? { kind: 'i18n', ref: key, excerpt: clip(text) } : { kind: 'i18n', ref: key };
       });
       const { created } = await store.upsert({
@@ -151,6 +233,7 @@ export async function collectDesktop(store: CandidateStore, snapshotDir: string,
       if (created) added++;
     }
   }
+  signal?.throwIfAborted();
   await store.setCheckpoint('lastDesktopVersion', current.version);
-  return { version: current.version, changed: true, added };
+  return { version: current.version, changed: true, added, ...bundleReport(current), ...(keysReset ? { keysReset: true as const } : {}) };
 }

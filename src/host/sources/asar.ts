@@ -1,7 +1,7 @@
 import { open, type FileHandle } from 'node:fs/promises';
 
 export interface AsarEntry { path: string; size: number; offset: number }
-interface Node { files?: Record<string, Node>; size?: number; offset?: string; unpacked?: boolean }
+interface Node { files?: Record<string, Node>; size?: number; offset?: string; unpacked?: boolean; link?: string }
 
 const MAX_HEADER_BYTES = 64 * 1024 * 1024;
 
@@ -31,13 +31,26 @@ async function readTree(handle: FileHandle, jsonLength: number): Promise<Node> {
   return JSON.parse((await readExact(handle, jsonLength, 16, 'the header')).toString('utf8')) as Node;
 }
 
+/** Offsets are decimal strings in the header (they can pass 2**53 in theory); anything else would read the wrong bytes, so it fails the listing. */
+function strictOffset(value: unknown, path: string): number {
+  const offset = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : Number.NaN;
+  if (!Number.isSafeInteger(offset)) throw new Error(`Invalid asar offset for ${path}`);
+  return offset;
+}
+function strictSize(value: unknown, path: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new Error(`Invalid asar size for ${path}`);
+  return value;
+}
+
 function flatten(tree: Node): AsarEntry[] {
   const out: AsarEntry[] = [];
   const walk = (node: Node, prefix: string) => {
     for (const [name, child] of Object.entries(node.files ?? {})) {
       const full = `${prefix}/${name}`;
       if (child.files) walk(child, full);
-      else if (!child.unpacked) out.push({ path: full, size: child.size ?? 0, offset: Number(child.offset ?? 0) });
+      // Files kept in app.asar.unpacked and symlinks have no data in the archive itself.
+      else if (child.unpacked || child.link !== undefined) continue;
+      else out.push({ path: full, size: strictSize(child.size, full), offset: strictOffset(child.offset, full) });
     }
   };
   walk(tree, '');
@@ -61,6 +74,8 @@ export async function readAsarEntry(path: string, entry: string | AsarEntry, lim
     const found = typeof entry === 'string' ? flatten(await readTree(handle, jsonLength)).find(e => e.path === entry) : entry;
     if (!found) throw new Error(`asar entry not found: ${String(entry)}`);
     if (found.size > limit) throw new Error(`asar entry exceeds ${limit} bytes: ${found.path}`);
+    // An entry object may be hand-made: its own offset has to be sane, not just the position it adds up to.
+    if (!Number.isSafeInteger(found.offset) || found.offset < 0) throw new Error(`Invalid asar range for ${found.path}`);
     return await readExact(handle, found.size, base + found.offset, found.path);
   } finally { await handle.close(); }
 }
