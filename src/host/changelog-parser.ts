@@ -13,7 +13,7 @@ export interface ChangelogFeature {
 }
 export interface ChangelogOptions { now?: Date; maxReleases?: number; maxFeatures?: number; maxAgeDays?: number }
 /** Bump when the output for the same feed changes: the RSS source folds it into the hash that decides whether a feed was already read, so a parser fix takes effect on the next run. */
-export const PARSER_VERSION = '1';
+export const PARSER_VERSION = '2';
 /** `raw` is the block as written, link targets included; only the relevance gate reads it. `title` marks the heading that repeats the item title. */
 interface Block { kind: 'heading' | 'item' | 'text'; text: string; raw: string; anchor?: string; title?: true }
 interface Release { date: string; title: string; anchor?: string; url?: string; blocks: Block[] }
@@ -30,7 +30,7 @@ const SKIP_SECTION = new RegExp(`^(?:${[
 /** The skipped sections whose runtime-feature bullets still count. */
 const PERFORMANCE_SECTION = /^(?:performance(?: improvements?)?|性能)$/i;
 const RELEVANT = /\bCodex\b|desktop|桌面/i;
-const SKIP_RELEASE = /\b(?:mobile|iOS|Android)\b|\b(?:deprecated|removed|retired|security update)\b|^(?:introducing\s+)?GPT[-\s]|\b(?:model|models)\b.*\b(?:retir|available|release)|\bultrafast\b.*\b(?:Codex|ChatGPT)\b/i;
+const SKIP_RELEASE = /\b(?:mobile|iOS|Android)\b|\b(?:deprecated|removed|retired|security update)\b|^(?:introducing\s+)?GPT[-\s]|\b(?:model|models)\b.*\b(?:retir|availab|release)|\bultrafast\b.*\b(?:Codex|ChatGPT)\b/i;
 const RUNTIME_SURFACE = /\b(?:CLI|SDK|API)\b/i;
 const RUNTIME_FEATURE = /\b(?:compaction|checkpoint|context (?:compression|management)|background (?:compression|compaction)|async(?:hronous)? (?:compaction|tools?|execution)|tool cancellation)\b|异步压缩|后台压缩|上下文压缩|检查点/i;
 const NON_FEATURE = /^(?:(?:additional|various|general)\s+)?(?:performance improvements?|bug fixes?|stability improvements?)\b|^(?:fixed?|fixes|resolved?|corrected)\b|^(?:support for|introducing|added support for)\s+GPT[-\s]|^(?:full changelog|learn more|view details|download|npm install|\$ npm)/i;
@@ -43,20 +43,23 @@ const PR_REFS = /\s*\(#\d+(?:\s*,\s*#\d+)*\)(\.?)\s*$/;
 const CODE_SPAN = /(?<!`)(`+)(?!`)([\s\S]+?)(?<!`)\1(?!`)/g;
 const WORD_CHAR = /[\p{L}\p{N}]/u;
 const TITLE_LIMIT = 150, DESCRIPTION_LIMIT = 1000;
+/** How far back from its limit `clip` looks for a space before it cuts in the middle of a word. */
+const CLIP_REACH = 40;
 /** An item body is cut here before it is parsed: some of the patterns below still take time quadratic in the length of malformed input. Characters, not bytes. */
 const ITEM_BODY_LIMIT = 64 * 1024;
 
 /**
- * At most `limit` code points. A longer text is cut at a word boundary and ends in `…`, which counts toward the limit.
- * A single token longer than the limit is cut where it stands, never inside a surrogate pair.
+ * At most `limit` code points. A longer text ends in `…`, which counts toward the limit, and is cut at a space if one lies within `CLIP_REACH` code points
+ * of the limit. Otherwise (CJK text, a long URL) it is cut at the limit, never inside a surrogate pair, so it does not collapse to its first word.
  */
 export function clip(text: string, limit: number): string {
   const chars = Array.from(text);
   if (chars.length <= limit) return text;
   let end = limit - 1;
   if (!/\s/u.test(chars[end]!)) {
-    const space = chars.slice(0, end).findLastIndex(char => /\s/u.test(char));
-    if (space > 0) end = space;
+    const from = Math.max(1, end - CLIP_REACH);
+    const space = chars.slice(from, end).findLastIndex(char => /\s/u.test(char));
+    if (space >= 0) end = from + space;
   }
   const kept = chars.slice(0, end).join('').replace(/[\s,;:([{\-–—]+$/u, '');
   return `${kept || chars.slice(0, limit - 1).join('')}…`;
@@ -257,7 +260,8 @@ export function parseChangelog(content: string, sourceUrl: string, options: Chan
         if (PERFORMANCE_SECTION.test(name)) for (const text of parts) if (RUNTIME_FEATURE.test(text)) append(titleFor(text), text, sectionAnchor);
         return;
       }
-      if (name && !GENERIC.test(name)) {
+      // The item's own title section with several bullets is a list of features, like "New features"; one bullet or plain paragraphs make one feature.
+      if (name && !GENERIC.test(name) && !(ownTitle && items.length >= 2)) {
         if (parts.length) append(name, parts.join(' '), sectionAnchor);
       } else {
         for (const item of items) append(titleFor(item), item);

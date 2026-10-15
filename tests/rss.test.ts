@@ -50,14 +50,23 @@ test('rss keeps product announcements, drops model notices and iOS, lets only ru
   const browser = items.find(i => /Browser extensions/.test(i.releaseTitle));
   assert.ok(browser?.description.includes('More browsers: Use the ChatGPT browser extension in Microsoft Edge, Brave, Opera, and Vivaldi, as well as Chrome.'));
   assert.ok(items.every(i => !/[,(]$/.test(i.title)));
-  // The browser release stays one feature, in source order: the first bullet leads and the closing note about rollout comes last.
-  assert.equal(items.filter(i => /Browser extensions/.test(i.releaseTitle)).length, 1);
-  assert.ok(browser?.description.startsWith('More browsers: Use the ChatGPT browser extension'));
-  assert.ok(browser!.description.indexOf('Cloud browser sign-in') < browser!.description.indexOf('Availability depends on rollout'));
+  // Several bullets under the item's own title are one feature each.
+  assert.deepEqual(items.filter(i => /Browser extensions/.test(i.releaseTitle)).map(i => i.title), ['More browsers', 'Site tools (WebMCP)', 'Cloud browser sign-in']);
   // Announcements whose only "codex" is a /codex/ link, a section named "Install the ..." and a title that says "availability" are kept.
   for (const title of ['Trigger scheduled tasks from Gmail, Slack, and GitHub events', 'Public plugin catalog CSV export', 'Record & Replay expands to the EU, UK, and Switzerland', 'Install the ChatGPT desktop app on Linux', 'Codex Remote reaches general availability']) {
     assert.ok(items.some(i => i.title === title), title);
   }
+});
+
+test('a release that lists nine bullets under its own title gives nine features, in the order of the notes', async () => {
+  const xml = await readFixture();
+  // The release is dated 2026-05-21; the other fixture items lie in the future of this date and are skipped.
+  const features = rssCandidates(xml, PAGE, new Date('2026-06-01T00:00:00Z')).filter(i => i.releaseTitle === 'Appshots, goal mode, and more');
+  assert.equal(features.length, 9);
+  assert.ok(features[0]!.title.startsWith('Goal mode is no longer an experimental feature'));
+  assert.equal(features[5]!.title, 'Codex can now download and extract all image assets from a page much more quickly.');
+  assert.ok(features[8]!.title.startsWith('Significantly improved reliability for browser use'));
+  assert.ok(features.every(i => i.sourceUrl === 'https://developers.openai.com/codex/changelog/#codex-2026-05-21'));
 });
 
 test('collectRss stores announcements once, skips an unchanged feed by hash, and only adds new items when the feed changes', async () => {

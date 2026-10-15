@@ -251,4 +251,39 @@ it to the Codex App as a remote workspace.
 
 See [Remote connections](/codex/remote-connections) for setup and
 troubleshooting.</content:encoded></item>
+<item><title>Appshots, goal mode, and more</title><link>https://developers.openai.com/codex/changelog/#codex-2026-05-21</link><guid>https://developers.openai.com/codex/changelog/#codex-2026-05-21</guid><description>Appshots, goal mode, and more</description><pubDate>Thu, 21 May 2026 00:00:00 GMT</pubDate><content:encoded># Appshots, goal mode, and more
+
+[Appshots](/codex/appshots) are now available in the Codex app on macOS. Press
+both Command keys to send the frontmost app window to Codex with a screenshot
+and available text, so Codex can work from context in another app without you
+copying, pasting, or describing it manually.
+
+This launch also includes:
+
+- [Goal mode](/codex/prompting#goal-mode) is no longer an experimental feature
+  and is available in the Codex app, IDE extension, and CLI. With Goal mode, you
+  can have Codex drive toward a specific objective for hours or even days.
+- [Remote computer use](/codex/computer-use#locked-use), so Codex can use
+  desktop apps after your Mac locks, including remotely via Codex Mobile. Codex
+  scopes locked use to active, trusted computer use turns and includes
+  safeguards such as short-lived authorization, covered displays, relock on
+  local input, and manual-unlock fallback.
+- [Plugin sharing](/plugins/build/plugins#share-a-local-plugin-with-your-workspace)
+  through marketplace sources is available for ChatGPT Business. Enterprise
+  support is coming soon. Teams can distribute reusable plugin bundles that
+  include skills, MCP servers, and lifecycle hooks.
+- [Advanced in-app browser annotations](/codex/browser?surface=app#app-styling-feedback)
+  let you tweak styling such as font size, colors, and spacing directly using
+  annotations. This gives Codex a clearer signal for changes.
+- Browser-use improvements across in-app browser &amp; Chrome:
+  - Codex can now download and extract all image assets from a page much more
+    quickly.
+  - Codex can now extract structured data from pages more effectively and find
+    information more quickly with a read-only JS sandbox.
+- Chrome extension will create less clutter when using it. Codex will no longer
+  create tab groups when taking over existing tabs, and at the end of a task for
+  handoff. Instead, it uses tab icons to indicate status.
+- Significantly improved reliability for browser use. We fixed bugs on Windows,
+  flaky availability of the plugin to non geo-blocked regions, and many other
+  issues impacting performance.</content:encoded></item>
 </channel></rss>

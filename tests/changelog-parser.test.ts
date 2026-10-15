@@ -202,18 +202,33 @@ test('the heading that repeats the item title is the item itself: it is never sk
   const body = (heading: string) => [`# ${heading}`, '', 'Codex cloud tasks now cost less.'].join('\n');
   for (const title of ['Pricing', 'Installation', 'Changelog']) assert.deepEqual(parseChangelog(rss(title, body(title)), url, { now }).map(item => item.title), [title], title);
   assert.deepEqual(parseChangelog(rss('Codex cloud tasks', body('Pricing')), url, { now }), []);
-  // Case does not matter for the repeat; its bullets and closing note stay one feature, in source order.
+  // Case does not matter for the repeat; one bullet and a closing note stay one feature, in source order.
   const [feature, ...rest] = parseChangelog(rss('Browser extensions and site tools', [
     '# BROWSER EXTENSIONS AND SITE TOOLS',
     '',
     '- **More browsers:** Chrome, Edge and Brave work with Codex tab mentions.',
-    '- **Site tools:** WebMCP tools for Codex.',
     '',
     'Availability depends on rollout.',
   ].join('\n')), url, { now });
   assert.equal(rest.length, 0);
   assert.equal(feature?.title, 'Browser extensions and site tools');
-  assert.equal(feature?.description, 'More browsers: Chrome, Edge and Brave work with Codex tab mentions. Site tools: WebMCP tools for Codex. Availability depends on rollout.');
+  assert.equal(feature?.description, 'More browsers: Chrome, Edge and Brave work with Codex tab mentions. Availability depends on rollout.');
+});
+
+test('a title section with two or more bullets yields one feature per bullet, as a "New features" section does; one bullet or plain paragraphs stay one feature', () => {
+  const sentence = 'Does something useful with Codex in the desktop app.';
+  const bullets = Array.from({ length: 9 }, (_, n) => `- **Feature ${n + 1}:** ${sentence} ${sentence} ${sentence}`);
+  const nine = parseChangelog(rss('Appshots, goal mode, and more', ['# Appshots, goal mode, and more', '', 'Intro paragraph about Codex.', '', ...bullets, '', 'Closing note.'].join('\n')), url, { now });
+  assert.deepEqual(nine.map(item => item.title), Array.from({ length: 9 }, (_, n) => `Feature ${n + 1}`));
+  assert.ok(nine.every(item => item.description.startsWith('Feature ') && item.description.endsWith(sentence)));
+  // Numbered items are bullets as well.
+  const numbered = parseChangelog(rss('Codex desktop update', '# Codex desktop update\n\n1. Added draft recovery for composers.\n2. Added question cards that keep input.'), url, { now });
+  assert.deepEqual(numbered.map(item => item.title), ['Added draft recovery for composers.', 'Added question cards that keep input.']);
+  // A single bullet, or paragraphs alone, are not split.
+  const single = parseChangelog(rss('Codex desktop update', '# Codex desktop update\n\n- Added draft recovery for composers.'), url, { now });
+  assert.deepEqual(single.map(item => item.title), ['Codex desktop update']);
+  const paragraphs = parseChangelog(rss('Codex desktop update', '# Codex desktop update\n\nFirst paragraph.\n\nSecond paragraph.'), url, { now });
+  assert.deepEqual(paragraphs.map(item => item.description), ['First paragraph. Second paragraph.']);
 });
 
 test('the Codex relevance gate reads link targets: an announcement whose only "codex" is a /codex/ link is kept, a foreign link is not', () => {
@@ -380,4 +395,31 @@ test('an item body is cut at 64 KiB before parsing, and hostile shapes cannot st
   parseChangelog(rss('Codex desktop hostile', '![ '.repeat(87_381)), url, { now });
   assert.throws(() => parseChangelog(`<rss><channel>${'<item>'.repeat(200_000)}</channel></rss>`, url, { now }), /format was not recognized/);
   assert.ok(performance.now() - started < 5000, `hostile input took ${Math.round(performance.now() - started)} ms`);
+});
+
+test('a model availability notice is skipped like the other model notices, a title that only says availability is not', () => {
+  const titles = (title: string) => parseChangelog(rss(title, `# ${title}\n\nGPT-5.5 is now available to every Codex user.`), url, { now }).map(item => item.title);
+  assert.deepEqual(titles('Codex model availability update'), []);
+  assert.deepEqual(titles('New models available in Codex'), []);
+  assert.deepEqual(titles('Codex Remote reaches general availability'), ['Codex Remote reaches general availability']);
+});
+
+test('clip backs up to a space only when one is close to the limit; a long unbroken run is cut at the limit', () => {
+  assert.equal(clip('x'.repeat(1600), 1000), `${'x'.repeat(999)}…`);
+  assert.equal(clip('新功能'.repeat(600), 1000), `${'新功能'.repeat(333)}…`);
+  assert.equal(clip(`See the guide ${'u'.repeat(300)}`, 150), `See the guide ${'u'.repeat(135)}…`);
+  // A space within 40 code points of the limit is a word boundary worth using; one farther back is not.
+  assert.equal(clip(`${'a'.repeat(79)} ${'b'.repeat(100)}`, 120), `${'a'.repeat(79)}…`);
+  assert.equal(clip(`${'a'.repeat(78)} ${'b'.repeat(100)}`, 120), `${'a'.repeat(78)} ${'b'.repeat(40)}…`);
+  assert.equal(clip(`${'a'.repeat(10)} ${'b'.repeat(200)}`, 120), `${'a'.repeat(10)} ${'b'.repeat(108)}…`);
+});
+
+test('a title with a long URL and a description of unbroken text keep their length instead of collapsing to the first word', () => {
+  const link = `https://example.com/${'guide/'.repeat(40)}`;
+  const [bullet] = parseChangelog(rss('Codex desktop app 26.1011', `### New features\n\n- See the guide ${link}`), url, { now });
+  assert.equal(Array.from(bullet!.title).length, 150);
+  assert.ok(bullet!.title.startsWith('See the guide https://example.com/guide/guide/') && bullet!.title.endsWith('…'));
+  const [section] = parseChangelog(rss('Codex desktop app 26.1011', `### 新功能说明\n\n${'新功能'.repeat(600)}`), url, { now });
+  assert.equal(Array.from(section!.description).length, 1000);
+  assert.ok(section!.description.endsWith('新功能…'));
 });
