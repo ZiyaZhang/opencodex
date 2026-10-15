@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { GitHubClient, GitHubError, defaultGhRunner, ghEnvironment, type GhRunner } from '../src/host/github.ts';
+import { publicNetwork } from '../src/host/public-network.ts';
 
 test('stableTags reads the tags listing through gh api, newest semver first, honoring the limit', async () => {
   const calls: string[][] = [];
@@ -360,10 +361,12 @@ test('the real gh runner rejects with ENOENT when gh is not on PATH', async () =
 });
 
 test('ghEnvironment overrides what a login shell may have exported and keeps everything else', () => {
-  const login = { PATH: '/usr/bin:/bin', HTTPS_PROXY: 'http://127.0.0.1:7897', HOME: '/Users/x', CLICOLOR_FORCE: '1', GH_FORCE_TTY: '120', NO_COLOR: '', GH_HOST: 'ghe.example.com', GH_PAGER: 'less -R', GH_PROMPT_DISABLED: '' };
-  assert.deepEqual(ghEnvironment(login), { PATH: '/usr/bin:/bin', HTTPS_PROXY: 'http://127.0.0.1:7897', HOME: '/Users/x', GH_PAGER: 'cat', CLICOLOR_FORCE: '0', NO_COLOR: '1', GH_FORCE_TTY: '', GH_PROMPT_DISABLED: '1', GH_HOST: 'github.com' });
+  // DEBUG=1 and GH_DEBUG=api make gh print `* Request at ...` trace lines ahead of its error line; on gh 2.88 GH_DEBUG=0 beats both
+  const login = { PATH: '/usr/bin:/bin', HTTPS_PROXY: 'http://127.0.0.1:7897', HOME: '/Users/x', CLICOLOR_FORCE: '1', GH_FORCE_TTY: '120', NO_COLOR: '', GH_HOST: 'ghe.example.com', GH_PAGER: 'less -R', GH_PROMPT_DISABLED: '', DEBUG: '1', GH_DEBUG: 'api' };
+  assert.deepEqual(ghEnvironment(login), { PATH: '/usr/bin:/bin', HTTPS_PROXY: 'http://127.0.0.1:7897', HOME: '/Users/x', DEBUG: '1', GH_PAGER: 'cat', CLICOLOR_FORCE: '0', NO_COLOR: '1', GH_FORCE_TTY: '', GH_PROMPT_DISABLED: '1', GH_HOST: 'github.com', GH_DEBUG: '0' });
   assert.equal(login.CLICOLOR_FORCE, '1', 'the input is left alone');
-  assert.deepEqual(ghEnvironment({}), { GH_PAGER: 'cat', CLICOLOR_FORCE: '0', NO_COLOR: '1', GH_FORCE_TTY: '', GH_PROMPT_DISABLED: '1', GH_HOST: 'github.com' });
+  assert.equal(login.GH_DEBUG, 'api', 'the input is left alone');
+  assert.deepEqual(ghEnvironment({}), { GH_PAGER: 'cat', CLICOLOR_FORCE: '0', NO_COLOR: '1', GH_FORCE_TTY: '', GH_PROMPT_DISABLED: '1', GH_HOST: 'github.com', GH_DEBUG: '0' });
   assert.equal(ghEnvironment().PATH, process.env.PATH, 'defaults to the process environment');
 });
 
@@ -371,11 +374,11 @@ test('the default runner starts gh with that environment and the arguments exact
   const dir = await mkdtemp(join(tmpdir(), 'opencodex-fake-gh-'));
   try {
     // A stand-in `gh` that reports what it was started with: no GitHub, no network.
-    const report = ['GH_PAGER', 'CLICOLOR_FORCE', 'NO_COLOR', 'GH_FORCE_TTY', 'GH_PROMPT_DISABLED', 'GH_HOST'].map(name => `echo "${name}=$${name}"`);
+    const report = ['GH_PAGER', 'CLICOLOR_FORCE', 'NO_COLOR', 'GH_FORCE_TTY', 'GH_PROMPT_DISABLED', 'GH_HOST', 'GH_DEBUG'].map(name => `echo "${name}=$${name}"`);
     await writeFile(join(dir, 'gh'), ['#!/bin/sh', ...report, 'for arg in "$@"; do echo "arg:$arg"; done', ''].join('\n'), { mode: 0o755 });
-    await withEnv({ PATH: dir, CLICOLOR_FORCE: '1', GH_FORCE_TTY: '120', NO_COLOR: undefined, GH_HOST: 'ghe.example.com', GH_PAGER: 'less -R' }, async () => {
+    await withEnv({ PATH: dir, CLICOLOR_FORCE: '1', GH_FORCE_TTY: '120', NO_COLOR: undefined, GH_HOST: 'ghe.example.com', GH_PAGER: 'less -R', GH_DEBUG: 'api' }, async () => {
       const out = await defaultGhRunner(['release', 'view', '--repo', 'openai/codex', '--', '--web']);
-      assert.equal(out, ['GH_PAGER=cat', 'CLICOLOR_FORCE=0', 'NO_COLOR=1', 'GH_FORCE_TTY=', 'GH_PROMPT_DISABLED=1', 'GH_HOST=github.com', 'arg:release', 'arg:view', 'arg:--repo', 'arg:openai/codex', 'arg:--', 'arg:--web', ''].join('\n'));
+      assert.equal(out, ['GH_PAGER=cat', 'CLICOLOR_FORCE=0', 'NO_COLOR=1', 'GH_FORCE_TTY=', 'GH_PROMPT_DISABLED=1', 'GH_HOST=github.com', 'GH_DEBUG=0', 'arg:release', 'arg:view', 'arg:--repo', 'arg:openai/codex', 'arg:--', 'arg:--web', ''].join('\n'));
     });
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
@@ -642,4 +645,35 @@ test('responses of an unexpected shape fail with a plain Error that names the pa
   await shape(rest([{ nom: 'rust-v0.162.0' }]).stableTags(1), /repos\/openai\/codex\/tags.*"name" is not a string/);
   await shape(rest([null]).stableTags(1), /not a JSON object/);
   await shape(gh(null).fileAt('rust-v0.162.1', 'docs/a.md'), /not a JSON object/);
+});
+
+/** No proxy variable but one that is no URL: the real publicNetwork rejects on it, before anything is sent. */
+const brokenProxy = { HTTPS_PROXY: 'not a url', https_proxy: undefined, HTTP_PROXY: undefined, http_proxy: undefined };
+
+test('a failure while setting up the proxied network is wrapped like a request failure', async () => {
+  await withEnv(brokenProxy, async () => {
+    // The premise, checked first: if the real publicNetwork ever stops rejecting here, the test fails before the client below can send anything.
+    await assert.rejects(publicNetwork(new AbortController().signal), TypeError);
+    const client = new GitHubClient({ gh: null }); // no fetch option, so the real publicNetwork is set up first
+    const error = await failure(client.stableTags(1));
+    assert.ok(error instanceof GitHubError, String(error));
+    assert.ok(error.cause instanceof TypeError, 'the original error is the cause');
+    assert.equal(error.message, `GitHub request for repos/openai/codex/tags?per_page=100&page=1 failed (proxy setup): ${error.cause.message}`);
+    assert.equal(error.path, 'repos/openai/codex/tags?per_page=100&page=1');
+    assert.equal(error.status, undefined);
+    assert.equal(client.route, 'rest');
+    // the diff request sets the network up the same way and names its own path
+    const diff = await failure(client.pullRequestDiff(7));
+    assert.ok(diff instanceof GitHubError);
+    assert.match(diff.message, /^GitHub request for repos\/openai\/codex\/pulls\/7 failed \(proxy setup\): .+/);
+    assert.equal(diff.path, 'repos/openai/codex/pulls/7');
+  });
+});
+
+test('an abort that lands while the network is being set up is rethrown as it came', async () => {
+  const controller = new AbortController();
+  controller.abort(new Error('shutting down'));
+  const error = await failure(new GitHubClient({ gh: null }).stableTags(1, controller.signal)); // publicNetwork throws the signal's reason before it does anything
+  assert.equal(error, controller.signal.reason);
+  assert.ok(!(error instanceof GitHubError));
 });

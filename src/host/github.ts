@@ -39,11 +39,12 @@ const STABLE_TAG = /^rust-v(\d+)\.(\d+)\.(\d+)$/;
 
 /**
  * The environment gh runs in. The Host inherits the user's login-shell variables and some of them wreck machine-readable output: CLICOLOR_FORCE or
- * GH_FORCE_TTY make `gh api` and `--json` print ANSI-coloured JSON and colour `pr diff`, GH_HOST can point gh at another server, a pager or a prompt can
- * stall a call. Everything else (PATH, proxies, tokens) passes through.
+ * GH_FORCE_TTY make `gh api` and `--json` print ANSI-coloured JSON and colour `pr diff`, DEBUG=1 or GH_DEBUG put `* Request at ...` trace lines ahead of gh's
+ * error line (GH_DEBUG=0 wins over DEBUG on gh 2.88), GH_HOST can point gh at another server, a pager or a prompt can stall a call.
+ * Everything else (PATH, proxies, tokens) passes through.
  */
 export function ghEnvironment(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  return { ...base, GH_PAGER: 'cat', CLICOLOR_FORCE: '0', NO_COLOR: '1', GH_FORCE_TTY: '', GH_PROMPT_DISABLED: '1', GH_HOST: 'github.com' };
+  return { ...base, GH_PAGER: 'cat', CLICOLOR_FORCE: '0', NO_COLOR: '1', GH_FORCE_TTY: '', GH_PROMPT_DISABLED: '1', GH_HOST: 'github.com', GH_DEBUG: '0' };
 }
 
 export const defaultGhRunner: GhRunner = async (args, signal) => {
@@ -77,7 +78,7 @@ function reasonOf(error: unknown): string {
   return String(inner);
 }
 
-/** A fetch that failed before GitHub answered (proxy down, DNS, TLS, a dropped connection). An abort is not a network failure and passes through unchanged. */
+/** A request that failed before GitHub answered (the proxy could not be set up, proxy down, DNS, TLS, a dropped connection). An abort is not a network failure and passes through unchanged. */
 function networkFailure(error: unknown, path: string, route: string, signal?: AbortSignal): unknown {
   if (signal?.aborted || isAbort(error)) return error;
   return new GitHubError(`GitHub request for ${path} failed (${route}): ${reasonOf(error)}`, path, { cause: error });
@@ -225,9 +226,12 @@ export class GitHubClient {
       throw ghFailure(error, path);
     }
   }
-  private async withFetch<T>(signal: AbortSignal | undefined, use: (rest: Rest) => Promise<T>): Promise<T> {
+  /** Sets the REST network up for the request to `path` (`publicNetwork` can throw, e.g. on an invalid proxy setting: that is wrapped like a request failure) and tears it down after `use`. */
+  private async withFetch<T>(path: string, signal: AbortSignal | undefined, use: (rest: Rest) => Promise<T>): Promise<T> {
     this.lastRoute = 'rest';
-    const network: Rest & { close(): Promise<void> } = this.fetchImpl ? { fetch: this.fetchImpl, route: 'custom fetch', close: async () => {} } : await publicNetwork(signal ?? new AbortController().signal);
+    let network: Rest & { close(): Promise<void> };
+    try { network = this.fetchImpl ? { fetch: this.fetchImpl, route: 'custom fetch', close: async () => {} } : await publicNetwork(signal ?? new AbortController().signal); }
+    catch (error) { throw networkFailure(error, path, 'proxy setup', signal); }
     try { return await use(network); } finally { await network.close(); }
   }
   private async restText(rest: Rest, path: string, accept: string, signal?: AbortSignal): Promise<string> {
@@ -243,7 +247,7 @@ export class GitHubClient {
   private async json<T>(path: string, signal?: AbortSignal): Promise<T> {
     const out = await this.tryGh(['api', '-H', `Accept: ${JSON_ACCEPT}`, '--', path], path, signal);
     if (out !== undefined) return parseJson<T>(out, path);
-    return this.withFetch(signal, async rest => parseJson<T>(await this.restText(rest, path, JSON_ACCEPT, signal), path));
+    return this.withFetch(path, signal, async rest => parseJson<T>(await this.restText(rest, path, JSON_ACCEPT, signal), path));
   }
   /**
    * Reads a JSON-array endpoint a page of 100 at a time (`path?per_page=100&page=N`, through `json`: gh and REST alike) and hands each page to `take`,
@@ -314,7 +318,7 @@ export class GitHubClient {
   async pullRequestDiff(number: number, signal?: AbortSignal): Promise<string> {
     const path = `repos/${REPO}/pulls/${number}`;
     const diff = await this.tryGh(['pr', 'diff', '--repo', REPO, '--', String(number)], path, signal);
-    return diff ?? this.withFetch(signal, rest => this.restText(rest, path, DIFF_ACCEPT, signal));
+    return diff ?? this.withFetch(path, signal, rest => this.restText(rest, path, DIFF_ACCEPT, signal));
   }
   /** Blob paths and shas at one tag, restricted by a path predicate. The recursive tree of this repo is far below GitHub's 100k-entry limit; a truncated answer is an error, never a partial result. */
   async treePaths(tag: string, keep: (path: string) => boolean, signal?: AbortSignal): Promise<Map<string, string>> {
