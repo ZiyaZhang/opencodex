@@ -177,4 +177,78 @@ and choose which chat receives it in settings.
 
 Availability depends on rollout and workspace settings. Website-access and
 action-confirmation requirements still apply.</content:encoded></item>
+<item><title>Trigger scheduled tasks from Gmail, Slack, and GitHub events</title><link>https://developers.openai.com/codex/changelog/#codex-2026-08-25-event-triggers</link><guid>https://developers.openai.com/codex/changelog/#codex-2026-08-25-event-triggers</guid><description>Run ChatGPT scheduled tasks from supported app activity instead of polling.</description><pubDate>Tue, 25 Aug 2026 00:00:00 GMT</pubDate><content:encoded># Trigger scheduled tasks from Gmail, Slack, and GitHub events
+
+ChatGPT scheduled tasks can now run when supported events occur in Gmail, Slack,
+or GitHub. Filter Gmail messages by sender or subject, watch selected Slack
+channels, or respond to pull request activity such as reviews, comments, commit
+updates, and merges.
+
+Event-triggered tasks are available in ChatGPT on the web and mobile for
+eligible plans. Connect the relevant app and approve its requested access before
+creating a task.
+The ChatGPT Slack app must be a member of each watched channel, and the
+connected GitHub app must have access to each watched repository.
+
+An event-triggered task can&apos;t also use a time-based schedule. When matching
+events arrive close together, ChatGPT may combine them in one run.
+Open **Scheduled** to review pending events or choose **Run now**.
+
+[Learn how to trigger scheduled tasks from app
+events](/codex/automations?surface=web#web-trigger-tasks-from-app-events).</content:encoded></item>
+<item><title>Public plugin catalog CSV export</title><link>https://developers.openai.com/codex/changelog/#codex-2026-08-17-admin-csv</link><guid>https://developers.openai.com/codex/changelog/#codex-2026-08-17-admin-csv</guid><description>Download public plugin, app, and skill metadata for workspace security and governance reviews.</description><pubDate>Mon, 17 Aug 2026 00:00:00 GMT</pubDate><content:encoded># Public plugin catalog CSV export
+
+Eligible ChatGPT Enterprise workspace owners and admins can download a CSV of
+the public plugins visible to their workspace. The export includes plugin, app,
+and Chat skill names and descriptions, along with developer, version, date
+added in UTC, and OpenAI verification metadata.
+
+Open [Admin &gt; Plugins](https://chatgpt.com/admin/plugins), select **Public**, and
+then select the download icon (**Export CSV**). The export uses a public-catalog
+snapshot that can be up to 48 hours old and does not include plugins created for
+the workspace.
+It isn&apos;t available in FedRAMP workspaces.
+
+Learn more about [plugin controls](/codex/enterprise/apps-and-connectors).</content:encoded></item>
+<item><title>Linux desktop preview and agent imports</title><link>https://developers.openai.com/codex/changelog/#codex-2026-08-11-app</link><guid>https://developers.openai.com/codex/changelog/#codex-2026-08-11-app</guid><description>Install ChatGPT on Linux, import existing agent setup, and keep desktop imports up to date.</description><pubDate>Tue, 11 Aug 2026 00:00:00 GMT</pubDate><content:encoded># Linux desktop preview and agent imports
+
+### Install the ChatGPT desktop app on Linux
+
+The [ChatGPT desktop app for Linux](/codex/linux/linux-app) is available in
+preview for supported Ubuntu, Debian, and Fedora desktop distributions on x64
+and ARM64 processors. Download the `.deb` or `.rpm` package for your
+distribution, then sign in to work with projects, local files, and Codex.
+
+### Import setup and recent work from other agents
+
+The desktop app supports **Claude Code**, **Claude Cowork**, and
+**Cursor**. [Import instructions, settings, skills, plugins, projects, and
+recent work](/codex/import), then turn on automatic updates in
+**Settings &gt; Import** to keep imported work in sync.
+
+Codex CLI can also import supported setup and recent chats from Claude Code
+and Cursor with `/import`.</content:encoded></item>
+<item><title>Record &amp; Replay expands to the EU, UK, and Switzerland</title><link>https://developers.openai.com/codex/changelog/#codex-2026-07-31-app</link><guid>https://developers.openai.com/codex/changelog/#codex-2026-07-31-app</guid><description>Turn demonstrated workflows into reusable skills in more regions.</description><pubDate>Fri, 31 Jul 2026 00:00:00 GMT</pubDate><content:encoded># Record &amp; Replay expands to the EU, UK, and Switzerland
+
+[Record &amp; Replay](/codex/extend/record-and-replay) is now available in the
+European Union, the United Kingdom, and Switzerland. On macOS, demonstrate a
+workflow and turn it into a reusable skill. Computer Use must also be available
+and enabled.</content:encoded></item>
+<item><title>Codex Remote reaches general availability</title><link>https://developers.openai.com/codex/changelog/#codex-2026-06-25</link><guid>https://developers.openai.com/codex/changelog/#codex-2026-06-25</guid><description>Start, track, and approve Codex tasks from your phone with secure one-to-one remote pairing.</description><pubDate>Thu, 25 Jun 2026 00:00:00 GMT</pubDate><content:encoded># Codex Remote reaches general availability
+
+Codex Remote has reached general availability. Use Codex from the ChatGPT mobile
+app to start or continue work on a connected Mac or Windows host, review
+progress, and approve actions from your phone.
+
+Remote Control now uses authenticated one-to-one QR pairing between each iOS or
+Android device and each host. Update the ChatGPT mobile app and Codex App to the
+latest versions before connecting. Connections used since June 8, 2026, remain
+paired; older inactive connections need to pair again.
+
+The new [DigitalOcean plugin](https://chatgpt.com/plugins/share/5dc672c7116c44ff92595d48e72df522)
+lets Codex provision a DigitalOcean Droplet, configure SSH access, and connect
+it to the Codex App as a remote workspace.
+
+See [Remote connections](/codex/remote-connections) for setup and
+troubleshooting.</content:encoded></item>
 </channel></rss>

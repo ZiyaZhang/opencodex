@@ -3,7 +3,7 @@
  */
 import { createHash } from 'node:crypto';
 import type { CandidateStore } from '../../core/store.js';
-import { parseChangelog, type ChangelogFeature } from '../changelog-parser.js';
+import { PARSER_VERSION, clip, parseChangelog, type ChangelogFeature } from '../changelog-parser.js';
 import { publicNetwork } from '../public-network.js';
 
 // Answers 308 and redirects to https://learn.chatgpt.com/docs/changelog/rss.xml; fetch follows it.
@@ -38,7 +38,8 @@ async function readCapped(response: Response): Promise<string> {
 
 /**
  * Fetches the feed, stores each announcement as an `rss` candidate and returns how many were new.
- * A body whose sha256 matches the saved `rssHash` is skipped before parsing; the hash is saved only after every upsert succeeded, so a failed run is retried whole.
+ * A body whose hash matches the saved `rssHash` is skipped before parsing; the hash covers the parser version too, so a parser fix reads an unchanged feed again.
+ * It is saved only after every upsert succeeded, so a failed run is retried whole.
  * `fetcher` replaces the proxy-aware public network (tests); `now` anchors the parser's 120-day window.
  */
 export async function collectRss(store: CandidateStore, signal: AbortSignal, fetcher?: typeof fetch, now = new Date()): Promise<number> {
@@ -50,13 +51,15 @@ export async function collectRss(store: CandidateStore, signal: AbortSignal, fet
       throw new Error(`RSS HTTP ${response.status}`);
     }
     const xml = await readCapped(response);
-    const hash = createHash('sha256').update(xml).digest('hex');
+    const hash = createHash('sha256').update(`${PARSER_VERSION}\n${xml}`).digest('hex');
     if (await store.checkpoint('rssHash') === hash) return 0;
     let added = 0;
-    for (const item of rssCandidates(xml, PAGE_URL, now)) {
+    // Oldest first, as the release source does: the store lists the latest write first, so the newest announcement ends up on top and, within a release, its first feature.
+    for (const item of [...rssCandidates(xml, PAGE_URL, now)].reverse()) {
+      const date = item.publishedAt.slice(0, 10);
       const { created } = await store.upsert({
         source: 'rss', key: item.fingerprint, title: item.title, summary: item.description,
-        evidence: [{ kind: 'rss', ref: item.releaseTitle, url: item.sourceUrl, excerpt: item.description.slice(0, 1_000) }],
+        evidence: [{ kind: 'rss', ref: `${date} ${item.releaseTitle}`, url: item.sourceUrl, excerpt: clip(`${date}\n${item.description}`, 1_000) }],
       });
       if (created) added++;
     }

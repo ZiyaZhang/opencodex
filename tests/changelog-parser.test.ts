@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseChangelog } from '../src/host/changelog-parser.ts';
+import { clip, parseChangelog } from '../src/host/changelog-parser.ts';
 
 const url = 'https://learn.chatgpt.com/docs/changelog';
 const now = new Date('2026-10-14T12:00:00.000Z');
@@ -129,9 +129,9 @@ test('RSS bullets and paragraphs that were hard-wrapped come back as whole sente
   assert.equal(items[2]!.description, 'Use PR Chat to review GitHub pull requests and ask Codex about changes in context. Read the PR Chat guide first.');
 });
 
-test('a section made of wrapped bullets starts with its first bullet, not with a continuation line', () => {
-  const [feature, ...rest] = parseChangelog(rss('Browser extensions, site tools, and cloud sign-in', [
-    '# Browser extensions, site tools, and cloud sign-in',
+test('a named section made of wrapped bullets starts with its first bullet, not with a continuation line', () => {
+  const [feature, ...rest] = parseChangelog(rss('Codex desktop tools', [
+    '### Browser extensions, site tools, and cloud sign-in',
     '',
     '- **More browsers:** Use the [ChatGPT browser extension](/codex/chrome-extension)',
     '  in Microsoft Edge, Brave, Opera, and Vivaldi, as well as Chrome. Set up',
@@ -196,4 +196,188 @@ test('GitHub release bullets keep their whole sentence: data-id is no anchor and
     ['Tune remote compaction for custom providers.', 'Tune remote compaction for custom providers.'],
     ['Add checkpoint listing to the agent Command Center', 'Add checkpoint listing to the agent Command Center'],
   ]);
+});
+
+test('the heading that repeats the item title is the item itself: it is never skipped as a section name, and a different heading still is a section', () => {
+  const body = (heading: string) => [`# ${heading}`, '', 'Codex cloud tasks now cost less.'].join('\n');
+  for (const title of ['Pricing', 'Installation', 'Changelog']) assert.deepEqual(parseChangelog(rss(title, body(title)), url, { now }).map(item => item.title), [title], title);
+  assert.deepEqual(parseChangelog(rss('Codex cloud tasks', body('Pricing')), url, { now }), []);
+  // Case does not matter for the repeat; its bullets and closing note stay one feature, in source order.
+  const [feature, ...rest] = parseChangelog(rss('Browser extensions and site tools', [
+    '# BROWSER EXTENSIONS AND SITE TOOLS',
+    '',
+    '- **More browsers:** Chrome, Edge and Brave work with Codex tab mentions.',
+    '- **Site tools:** WebMCP tools for Codex.',
+    '',
+    'Availability depends on rollout.',
+  ].join('\n')), url, { now });
+  assert.equal(rest.length, 0);
+  assert.equal(feature?.title, 'Browser extensions and site tools');
+  assert.equal(feature?.description, 'More browsers: Chrome, Edge and Brave work with Codex tab mentions. Site tools: WebMCP tools for Codex. Availability depends on rollout.');
+});
+
+test('the Codex relevance gate reads link targets: an announcement whose only "codex" is a /codex/ link is kept, a foreign link is not', () => {
+  const body = (link: string) => [
+    '# Trigger scheduled tasks from Gmail, Slack, and GitHub events',
+    '',
+    'ChatGPT scheduled tasks can now run when supported events occur in Gmail, Slack,',
+    'or GitHub. Filter Gmail messages by sender or subject.',
+    '',
+    link,
+  ].join('\n');
+  const wrapped = '[Learn how to trigger scheduled tasks from app\nevents](/codex/automations?surface=web#web-trigger-tasks-from-app-events).';
+  const oneLine = '[Learn how to trigger scheduled tasks from app events](/codex/automations?surface=web#web-trigger-tasks-from-app-events).';
+  const foreign = '[Learn how to trigger scheduled tasks from app events](/chatgpt/tasks).';
+  const titles = (link: string) => parseChangelog(rss('Trigger scheduled tasks from Gmail, Slack, and GitHub events', body(link)), url, { now }).map(item => item.title);
+  assert.deepEqual(titles(wrapped), ['Trigger scheduled tasks from Gmail, Slack, and GitHub events']);
+  assert.deepEqual(titles(oneLine), ['Trigger scheduled tasks from Gmail, Slack, and GitHub events']);
+  assert.deepEqual(titles(foreign), []);
+});
+
+test('only whole section names are boilerplate: bug fixes, chores, changelog, installation, pricing and availability are skipped, announcements that contain those words are kept', () => {
+  const titles = (name: string) => parseChangelog(rss('Codex desktop app 26.1011', `### ${name}\n\nSomething about Codex that changed.`), url, { now }).map(item => item.title);
+  const skipped = ['Bug fixes', 'Bug fixes:', 'Chores', 'Changelog', 'Installation', 'Install', 'Pricing', 'Availability', 'Availability and pricing updates', 'Fixes & improvements',
+    'Improvements and bug fixes', 'Other improvements and bug fixes', 'Performance improvements and bug fixes', 'Bug fixes and improvements', 'Security fixes'];
+  const kept = ['Install the ChatGPT desktop app on Linux', 'Install plugins per-user or per-repo', 'Pricing for Codex cloud tasks', 'Codex Remote availability in Europe', 'Changelog export in the desktop app'];
+  for (const name of skipped) assert.deepEqual(titles(name), [], name);
+  for (const name of kept) assert.deepEqual(titles(name), [name], name);
+  // A performance section may still announce a runtime feature; one that also covers bug fixes may not.
+  const runtime = (name: string) => parseChangelog(rss('Codex desktop app 26.1011', `### ${name}\n\n- Async compaction: prepare a summary in the background.`), url, { now }).map(item => item.title);
+  assert.deepEqual(runtime('Performance'), ['Async compaction']);
+  assert.deepEqual(runtime('Performance improvements'), ['Async compaction']);
+  assert.deepEqual(runtime('Performance improvements and bug fixes'), []);
+});
+
+test('an install section and a title that says "availability" are announcements, not boilerplate', () => {
+  const linux = parseChangelog(rss('Linux desktop preview and agent imports', [
+    '# Linux desktop preview and agent imports',
+    '',
+    '### Install the ChatGPT desktop app on Linux',
+    '',
+    'The [ChatGPT desktop app for Linux](/codex/linux/linux-app) is available in',
+    'preview for supported Ubuntu, Debian, and Fedora desktop distributions.',
+    '',
+    '### Other improvements and bug fixes',
+    '',
+    '- Fixed a crash.',
+  ].join('\n')), url, { now });
+  assert.deepEqual(linux.map(item => item.title), ['Install the ChatGPT desktop app on Linux']);
+  assert.equal(linux[0]?.description, 'The ChatGPT desktop app for Linux is available in preview for supported Ubuntu, Debian, and Fedora desktop distributions.');
+  const remote = parseChangelog(rss('Codex Remote reaches general availability', '# Codex Remote reaches general availability\n\nCodex Remote has reached general availability.'), url, { now });
+  assert.deepEqual(remote.map(item => item.title), ['Codex Remote reaches general availability']);
+});
+
+test('clip cuts at a word boundary, keeps the ellipsis inside the limit, counts code points and leaves short text alone', () => {
+  assert.equal(clip('one two three', 13), 'one two three');
+  assert.equal(clip('one two three four', 12), 'one two…');
+  assert.equal(clip('one two three', 8), 'one two…');
+  assert.equal(clip('alpha, beta gamma', 8), 'alpha…');
+  assert.equal(clip('😀'.repeat(10), 5), '😀😀😀😀…');
+  assert.equal(Array.from(clip('word '.repeat(100), 50)).length <= 50, true);
+});
+
+test('titles are cut at 150 and descriptions at 1000 code points, at whole words, with an ellipsis', () => {
+  const [bullet] = parseChangelog(rss('Codex desktop app 26.1011', `### New features\n\n- ${'word '.repeat(60)}`), url, { now });
+  assert.ok(Array.from(bullet!.title).length <= 150);
+  assert.match(bullet!.title, /^(?:word )*word…$/);
+  const [section] = parseChangelog(rss('Codex desktop app 26.1011', `### Big news\n\n${'alpha '.repeat(400)}`), url, { now });
+  assert.ok(Array.from(section!.description).length <= 1000);
+  assert.match(section!.description, /^(?:alpha )*alpha…$/);
+  const [emoji] = parseChangelog(rss('Codex desktop app 26.1011', `### Big news\n\n${'😀'.repeat(1200)}`), url, { now });
+  assert.equal(Array.from(emoji!.description).length, 1000);
+  assert.doesNotThrow(() => encodeURIComponent(emoji!.description), 'no lone surrogate');
+});
+
+test('code spans keep identifiers and angle-bracket placeholders; only emphasis markers and tags outside them are stripped', () => {
+  const items = parseChangelog(rss('Codex desktop app 26.1012', [
+    '### New features',
+    '',
+    '- Tune scrolling with `tui.mouse_scroll_speed` and resume with `codex resume <session-id>`.',
+    '- Match **bold** and _italic_ and snake_case words, but also a `*.md` glob, not <b>tags</b> or an unclosed ` tick.',
+    '- Run `codex exec &apos;fix tests&apos;` and `web_search = &quot;live&quot;` or `/side &lt;prompt&gt;`.',
+  ].join('\n')), url, { now });
+  assert.deepEqual(items.map(item => item.description), [
+    'Tune scrolling with tui.mouse_scroll_speed and resume with codex resume <session-id>.',
+    'Match bold and italic and snake_case words, but also a *.md glob, not tags or an unclosed tick.',
+    'Run codex exec \'fix tests\' and web_search = "live" or /side <prompt>.',
+  ]);
+});
+
+test('a trailing PR reference goes whole with its period kept; one that is not at the end of the line stays', () => {
+  const items = parseChangelog(rss('Codex desktop app 26.1011', [
+    '### New features',
+    '',
+    '- Added draft recovery. (#123)',
+    '- Added question cards (#12, #34).',
+    '- Added thread chips (#56,#78)',
+    '- Added a sidebar (#90) that keeps drafts.',
+    '- Added shortcuts (#91 and more).',
+  ].join('\n')), url, { now });
+  assert.deepEqual(items.map(item => item.description), [
+    'Added draft recovery.',
+    'Added question cards.',
+    'Added thread chips',
+    'Added a sidebar (#90) that keeps drafts.',
+    'Added shortcuts (#91 and more).',
+  ]);
+});
+
+test('a section keeps its paragraphs and bullets in source order', () => {
+  const [feature] = parseChangelog(rss('Codex desktop app 26.1011', [
+    '### Pets in the corner',
+    '',
+    'Pets live in the corner of the Codex desktop app.',
+    '',
+    '- Press Option+Space to chat.',
+    '- Hide a pet from Settings.',
+    '',
+    'Availability depends on your plan.',
+  ].join('\n')), url, { now });
+  assert.equal(feature?.description, 'Pets live in the corner of the Codex desktop app. Press Option+Space to chat. Hide a pet from Settings. Availability depends on your plan.');
+});
+
+test('lines inside a code fence are never headings or bullets', () => {
+  const fence = '`'.repeat(3);
+  const items = parseChangelog(rss('Codex desktop app 26.1011', [
+    '### New features',
+    '',
+    '- Added a shell helper',
+    `${fence}sh`,
+    '# list sessions',
+    '- not a bullet',
+    'codex resume --last',
+    fence,
+    '- Another feature.',
+  ].join('\n')), url, { now });
+  assert.deepEqual(items.map(item => item.title), ['Added a shell helper', 'Another feature.']);
+});
+
+test('numbered list items are features like bullets, also in a "Codex desktop app N" release', () => {
+  const items = parseChangelog(rss('Codex desktop app 26.1011', [
+    '1. Added draft recovery for interrupted composers.',
+    '2) Added question cards that keep input available',
+    '   while a question waits.',
+  ].join('\n')), url, { now });
+  assert.deepEqual(items.map(item => item.description), [
+    'Added draft recovery for interrupted composers.',
+    'Added question cards that keep input available while a question waits.',
+  ]);
+});
+
+test('an inline anchor inside a list item does not cut the bullet', () => {
+  const html = '<ul><li>Added <a name="drafts"></a>draft recovery for interrupted composers.</li><li><a id="cards"></a>Added question cards.</li></ul>';
+  const items = parseChangelog(rss('Codex desktop app 26.1011', html.replace(/</g, '&lt;').replace(/>/g, '&gt;')), url, { now });
+  assert.deepEqual(items.map(item => item.title), ['Added draft recovery for interrupted composers.', 'Added question cards.']);
+});
+
+test('an item body is cut at 64 KiB before parsing, and hostile shapes cannot stall the parser', () => {
+  const padding = 'filler line\n'.repeat(8000);
+  const kept = parseChangelog(rss('Codex desktop app 26.1011', `### New features\n\n- Kept before the cap.\n\n${padding}- Past the cap.`), url, { now });
+  assert.deepEqual(kept.map(item => item.title), ['Kept before the cap.']);
+  const started = performance.now();
+  parseChangelog(rss('Codex desktop hostile', '[ '.repeat(131_072)), url, { now });
+  parseChangelog(rss('Codex desktop hostile', '<h1 '.repeat(65_536)), url, { now });
+  parseChangelog(rss('Codex desktop hostile', '![ '.repeat(87_381)), url, { now });
+  assert.throws(() => parseChangelog(`<rss><channel>${'<item>'.repeat(200_000)}</channel></rss>`, url, { now }), /format was not recognized/);
+  assert.ok(performance.now() - started < 5000, `hostile input took ${Math.round(performance.now() - started)} ms`);
 });

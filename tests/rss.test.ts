@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CandidateStore } from '../src/core/store.ts';
+import { CandidateStore, type UpsertInput } from '../src/core/store.ts';
 import { RSS_URL, collectRss, rssCandidates } from '../src/host/sources/rss.ts';
 
 const PAGE = 'https://developers.openai.com/codex/changelog';
@@ -15,12 +16,17 @@ interface FetchCall { url: string; init: RequestInit | undefined }
 function feed(body: string, calls: FetchCall[] = []): typeof fetch {
   return async (input: string | URL | Request, init?: RequestInit) => { calls.push({ url: String(input), init }); return new Response(body, { status: 200 }); };
 }
+/** Counts the upserts it is asked for: a feed that was skipped by its hash shows no new call, a feed that was parsed shows one per item. */
+class CountingStore extends CandidateStore {
+  upserts = 0;
+  override upsert(input: UpsertInput) { this.upserts++; return super.upsert(input); }
+}
 /** A store whose clock advances one second per read, so any write shows up as a changed `updatedAt`. */
-async function withStore(run: (store: CandidateStore) => Promise<void>): Promise<void> {
+async function withStore(run: (store: CountingStore) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), 'oc-rss-'));
   try {
     let seconds = 0;
-    await run(new CandidateStore(dir, () => new Date(Date.UTC(2026, 9, 15, 0, 0, seconds++))));
+    await run(new CountingStore(dir, () => new Date(Date.UTC(2026, 9, 15, 0, 0, seconds++))));
   } finally { await rm(dir, { recursive: true, force: true }); }
 }
 
@@ -44,6 +50,14 @@ test('rss keeps product announcements, drops model notices and iOS, lets only ru
   const browser = items.find(i => /Browser extensions/.test(i.releaseTitle));
   assert.ok(browser?.description.includes('More browsers: Use the ChatGPT browser extension in Microsoft Edge, Brave, Opera, and Vivaldi, as well as Chrome.'));
   assert.ok(items.every(i => !/[,(]$/.test(i.title)));
+  // The browser release stays one feature, in source order: the first bullet leads and the closing note about rollout comes last.
+  assert.equal(items.filter(i => /Browser extensions/.test(i.releaseTitle)).length, 1);
+  assert.ok(browser?.description.startsWith('More browsers: Use the ChatGPT browser extension'));
+  assert.ok(browser!.description.indexOf('Cloud browser sign-in') < browser!.description.indexOf('Availability depends on rollout'));
+  // Announcements whose only "codex" is a /codex/ link, a section named "Install the ..." and a title that says "availability" are kept.
+  for (const title of ['Trigger scheduled tasks from Gmail, Slack, and GitHub events', 'Public plugin catalog CSV export', 'Record & Replay expands to the EU, UK, and Switzerland', 'Install the ChatGPT desktop app on Linux', 'Codex Remote reaches general availability']) {
+    assert.ok(items.some(i => i.title === title), title);
+  }
 });
 
 test('collectRss stores announcements once, skips an unchanged feed by hash, and only adds new items when the feed changes', async () => {
@@ -56,6 +70,7 @@ test('collectRss stores announcements once, skips an unchanged feed by hash, and
     assert.ok(first > 0);
     assert.equal(first, rssCandidates(xml, PAGE, NOW).length);
     assert.equal(stored.length, first);
+    assert.equal(store.upserts, first);
     assert.match(await store.checkpoint('rssHash') ?? '', /^[0-9a-f]{64}$/);
     assert.equal(calls[0]?.url, RSS_URL);
     assert.equal(calls[0]?.init?.signal, signal);
@@ -72,6 +87,7 @@ test('collectRss stores announcements once, skips an unchanged feed by hash, and
     // The same body again: fetched, recognised by its hash, nothing written.
     assert.equal(await collectRss(store, signal, feed(xml, calls), NOW), 0);
     assert.equal(calls.length, 2);
+    assert.equal(store.upserts, first, 'an unchanged feed is not parsed again');
     assert.deepEqual(await store.list({ source: 'rss' }), stored);
 
     // A changed body is processed again; only the unseen item is new.
@@ -79,9 +95,43 @@ test('collectRss stores announcements once, skips an unchanged feed by hash, and
     const changed = xml.replace('<item>', `${extra}<item>`);
     const hash = await store.checkpoint('rssHash');
     assert.equal(await collectRss(store, signal, feed(changed), NOW), 1);
+    assert.equal(store.upserts, first + first + 1);
     assert.equal((await store.list({ source: 'rss' })).length, first + 1);
     assert.notEqual(await store.checkpoint('rssHash'), hash);
     assert.equal(await collectRss(store, signal, feed(changed), NOW), 0);
+    assert.equal(store.upserts, first + first + 1);
+  });
+});
+
+test('collectRss writes oldest first, so list() reads like the feed with the newest on top, and each candidate carries its publication date', async () => {
+  const xml = await readFixture();
+  await withStore(async store => {
+    await collectRss(store, new AbortController().signal, feed(xml), NOW);
+    const listed = await store.list({ source: 'rss' });
+    assert.deepEqual(listed.map(c => c.title), rssCandidates(xml, PAGE, NOW).map(i => i.title));
+    const dates = listed.map(c => c.evidence[0]!.ref.slice(0, 10));
+    assert.deepEqual(dates, [...dates].sort().reverse());
+    assert.equal(dates[0], '2026-10-08');
+    const appshot = listed.find(c => c.title === 'Share an app window on Windows')!;
+    assert.equal(appshot.evidence[0]!.ref, '2026-09-11 Quick chats with Pets and Appshots on Windows');
+    const [dateLine, firstLine] = appshot.evidence[0]!.excerpt!.split('\n');
+    assert.equal(dateLine, '2026-09-11');
+    assert.ok(firstLine!.startsWith('Appshots are now available'));
+  });
+});
+
+test('collectRss reads an unchanged feed again when the saved hash predates the parser version', async () => {
+  const xml = await readFixture();
+  await withStore(async store => {
+    const signal = new AbortController().signal;
+    const bodyOnly = createHash('sha256').update(xml).digest('hex');
+    await store.setCheckpoint('rssHash', bodyOnly);
+    const added = await collectRss(store, signal, feed(xml), NOW);
+    assert.ok(added > 0);
+    assert.equal(store.upserts, added);
+    assert.notEqual(await store.checkpoint('rssHash'), bodyOnly);
+    assert.equal(await collectRss(store, signal, feed(xml), NOW), 0);
+    assert.equal(store.upserts, added);
   });
 });
 
