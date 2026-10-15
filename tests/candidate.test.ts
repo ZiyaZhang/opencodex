@@ -10,6 +10,7 @@ const base = (): Candidate => ({
 test('fingerprint is stable per source and key', () => {
   assert.equal(fingerprintOf('codex-release', 'pr:50148'), 'codex-release:pr:50148');
   assert.equal(fingerprintOf('desktop', 'i18n:codex.command.composer'), 'desktop:i18n:codex.command.composer');
+  assert.throws(() => fingerprintOf('rss', 'a\rb'), /one line/);
 });
 
 test('only forward transitions and ignore are allowed', () => {

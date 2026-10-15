@@ -25,7 +25,7 @@ const TRANSITIONS: Record<Status, readonly Status[]> = {
   new: ['reported', 'ignored'], reported: ['started', 'ignored', 'reported'], started: ['ignored'], ignored: ['new'],
 };
 export function fingerprintOf(source: Source, key: string): string {
-  check(key.trim().length > 0 && !key.includes('\n'), 'fingerprint key must be one line');
+  check(key.trim().length > 0 && !/[\r\n]/.test(key), 'fingerprint key must be one line');
   return `${source}:${key}`;
 }
 export function transition(candidate: Candidate, status: Status, at: string): Candidate {
