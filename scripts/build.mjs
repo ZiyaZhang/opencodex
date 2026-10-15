@@ -1,7 +1,8 @@
 import { build } from 'esbuild';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 
+await rm('dist', { recursive: true, force: true });
 await mkdir('dist/host', { recursive: true });
 await build({
   entryPoints: ['src/host/index.ts'], outfile: 'dist/host/index.js',

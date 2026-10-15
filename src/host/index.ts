@@ -1,7 +1,10 @@
+import { createRequire } from 'node:module';
 import { Context } from '@deepseek-ai/cordis';
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 import type {} from '@deepseek-ai/dsh-typert-registry';
 import { OPEN_CODEX_DESCRIPTOR, type OpenCodexRequest, type OpenCodexResponse } from './remote.js';
+
+const { version } = createRequire(import.meta.url)('../../package.json') as { version: string };
 
 export interface Config { dataDirectory?: string }
 declare module '@deepseek-ai/cordis' { interface Context { opencodex: OpenCodex } }
@@ -15,6 +18,6 @@ export default class OpenCodex extends TypertRemoteService {
   async call(request: OpenCodexRequest, signal: AbortSignal): Promise<OpenCodexResponse> {
     signal.throwIfAborted();
     if (request.action !== 'snapshot') throw new Error('Unknown OpenCodex request');
-    return { version: '0.3.0-dev' };
+    return { version };
   }
 }

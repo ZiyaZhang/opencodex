@@ -132,4 +132,4 @@ npm run build
 
 ## 致谢与许可
 
-MIT。打包图标的许可见 [第三方声明](docs/third-party-notices.md)。研究方法借鉴 [REA](https://github.com/morluto/rea) 的按需指南、证据链和版本化调查思路，以及 [Eigent 的 REA 介绍](https://www.eigent.ai/zh-CN/blog/rea-reverse-engineer-anything)。本仓库的代码与资料说明为独立实现；不分发 Codex 解包代码、私有 prompt、聊天数据或素材。
+MIT。打包图标的许可见 [第三方声明](THIRD_PARTY_NOTICES.md)。研究方法借鉴 [REA](https://github.com/morluto/rea) 的按需指南、证据链和版本化调查思路，以及 [Eigent 的 REA 介绍](https://www.eigent.ai/zh-CN/blog/rea-reverse-engineer-anything)。本仓库的代码与资料说明为独立实现；不分发 Codex 解包代码、私有 prompt、聊天数据或素材。
