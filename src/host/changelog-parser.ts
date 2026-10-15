@@ -21,6 +21,12 @@ const RUNTIME_SURFACE = /\b(?:CLI|SDK|API)\b/i;
 const RUNTIME_FEATURE = /\b(?:compaction|checkpoint|context (?:compression|management)|background (?:compression|compaction)|async(?:hronous)? (?:compaction|tools?|execution)|tool cancellation)\b|异步压缩|后台压缩|上下文压缩|检查点/i;
 const NON_FEATURE = /^(?:(?:additional|various|general)\s+)?(?:performance improvements?|bug fixes?|stability improvements?)\b|^(?:fixed?|fixes|resolved?|corrected)\b|^(?:support for|introducing|added support for)\s+GPT[-\s]|^(?:full changelog|learn more|view details|download|npm install|\$ npm)/i;
 
+const HEADING = /^#{1,6}\s+(.+)$/;
+const LIST_ITEM = /^(?:[-*]|\d+[.)])\s+/;
+const FENCE = /^(?:```|~~~)/;
+/** A trailing pull request reference such as `(#123)` or `(#12, #34)`: stripped whole from RSS text so no length cap can leave half of it. */
+const PR_REFS = /\s*\(#\d+(?:\s*,\s*#\d+)*\)\s*$/;
+
 function plain(value: string): string {
   return value.replace(/!\[[^\]]*\]\([^)]*\)/g, '')
     .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').replace(/<[^>]*>/g, '')
@@ -31,7 +37,8 @@ function plain(value: string): string {
     .replace(/[*`_]/g, '').replace(/\s+/g, ' ').trim();
 }
 function attribute(tag: string, name: string): string | undefined {
-  return tag.match(new RegExp(`\\b${name}\\s*=\\s*["']([^"']+)["']`, 'i'))?.[1];
+  // The name must start a token: `data-id="5"` is not an `id`.
+  return tag.match(new RegExp(`(?:^|\\s)${name}\\s*=\\s*["']([^"']+)["']`, 'i'))?.[1];
 }
 function linesFor(content: string): string[] {
   // RSS fragments commonly contain only paragraphs and lists, without a document or heading.
@@ -69,7 +76,7 @@ function releasesFor(content: string): Release[] {
       releases.push(current); anchor = undefined; continue;
     }
     if (!current) continue;
-    const heading = line.match(/^#{1,6}\s+(.+)$/);
+    const heading = line.match(HEADING);
     if (heading) {
       // Markdown may supply an explicit ID. This is source data, not an inferred slug.
       const explicit = heading[1]!.match(/\s*\{#([^}]+)\}\s*$/);
@@ -84,6 +91,21 @@ function releasesFor(content: string): Release[] {
     anchor = undefined;
   }
   return releases.filter(release => release.title);
+}
+/**
+ * RSS bodies are hard-wrapped Markdown, so one bullet or paragraph spans several physical lines.
+ * A line continues the one before it, joined with one space, unless it is blank, a heading, a code fence, a `@@` marker line from `linesFor`, or the start of a new list item.
+ */
+function unwrap(lines: string[]): string[] {
+  const out: string[] = [];
+  let open = false;
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line || line.startsWith('@@') || HEADING.test(line) || FENCE.test(line)) { out.push(line); open = false; }
+    else if (open && !LIST_ITEM.test(line)) out[out.length - 1] += ` ${line}`;
+    else { out.push(line); open = true; }
+  }
+  return out;
 }
 function rssReleases(content: string): Release[] {
   const releases: Release[] = [];
@@ -100,11 +122,11 @@ function rssReleases(content: string): Release[] {
     const body = rawBody.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
     const blocks: Block[] = [];
     let anchor: string | undefined;
-    for (const raw of linesFor(body)) {
+    for (const raw of unwrap(linesFor(body))) {
       const line = raw.trim();
       if (line.startsWith('@@anchor:')) { anchor = line.slice(9); continue; }
-      const heading = line.match(/^#{1,6}\s+(.+)$/);
-      const text = plain((heading?.[1] ?? line).replace(/^[-*]\s+/, ''));
+      const heading = line.match(HEADING);
+      const text = plain((heading?.[1] ?? line).replace(/^[-*]\s+/, '')).replace(PR_REFS, '');
       if (text) blocks.push({ kind: heading ? 'heading' : /^[-*]\s+/.test(line) ? 'item' : 'text', text, ...(heading && anchor ? { anchor } : {}) });
       anchor = undefined;
     }

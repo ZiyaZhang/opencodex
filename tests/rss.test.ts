@@ -39,6 +39,11 @@ test('rss keeps product announcements, drops model notices and iOS, lets only ru
   // Nothing is appended to the source text.
   const appshots = items.find(i => i.title === 'Share an app window on Windows');
   assert.ok(appshots?.description.endsWith('choose which chat receives it in settings.'));
+  // Wrapped bullets come back whole, and a GitHub bullet ends at its sentence.
+  assert.equal(cli[0]!.description, 'Configure live web access and remote compaction capabilities for custom Responses-compatible model providers.');
+  const browser = items.find(i => /Browser extensions/.test(i.releaseTitle));
+  assert.ok(browser?.description.includes('More browsers: Use the ChatGPT browser extension in Microsoft Edge, Brave, Opera, and Vivaldi, as well as Chrome.'));
+  assert.ok(items.every(i => !/[,(]$/.test(i.title)));
 });
 
 test('collectRss stores announcements once, skips an unchanged feed by hash, and only adds new items when the feed changes', async () => {

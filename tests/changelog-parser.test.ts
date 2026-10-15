@@ -99,3 +99,101 @@ test('runtime capabilities in CLI and performance notes remain candidates withou
   assert.equal(items[0]!.description, 'Async compaction: prepare a history summary in the background.');
   assert.equal(items[1]!.description, 'Background compaction: preserve foreground work.');
 });
+
+const rss = (title: string, body: string) => `<rss><channel><item><title>${title}</title><pubDate>Thu, 08 Oct 2026 12:30:00 GMT</pubDate><link>${url}#wrapped</link><content:encoded>${body}</content:encoded></item></channel></rss>`;
+
+test('RSS bullets and paragraphs that were hard-wrapped come back as whole sentences, wrapped links included', () => {
+  const items = parseChangelog(rss('Codex joins the ChatGPT desktop app', [
+    '# Codex joins the ChatGPT desktop app',
+    '',
+    'Codex is now part of the ChatGPT desktop app on macOS and Windows. Existing',
+    'Codex app users can update as usual.',
+    '',
+    '### New features',
+    '',
+    '- Edit Markdown and code directly in the app, use inline annotations, and ask',
+    '  Codex to revise selected content.',
+    '- Use PR Chat to review GitHub pull requests and ask Codex about changes in',
+    '  context. Read the [PR Chat',
+    '  guide](/codex/pr-chat) first.',
+    '- Connect custom domains to published Sites.',
+  ].join('\n')), url, { now });
+  assert.deepEqual(items.map(item => item.title), [
+    'Codex joins the ChatGPT desktop app',
+    'Edit Markdown and code directly in the app, use inline annotations, and ask Codex to revise selected content.',
+    'Use PR Chat to review GitHub pull requests and ask Codex about changes in context.',
+    'Connect custom domains to published Sites.',
+  ]);
+  assert.equal(items[0]!.description, 'Codex is now part of the ChatGPT desktop app on macOS and Windows. Existing Codex app users can update as usual.');
+  assert.equal(items[1]!.description, 'Edit Markdown and code directly in the app, use inline annotations, and ask Codex to revise selected content.');
+  assert.equal(items[2]!.description, 'Use PR Chat to review GitHub pull requests and ask Codex about changes in context. Read the PR Chat guide first.');
+});
+
+test('a section made of wrapped bullets starts with its first bullet, not with a continuation line', () => {
+  const [feature, ...rest] = parseChangelog(rss('Browser extensions, site tools, and cloud sign-in', [
+    '# Browser extensions, site tools, and cloud sign-in',
+    '',
+    '- **More browsers:** Use the [ChatGPT browser extension](/codex/chrome-extension)',
+    '  in Microsoft Edge, Brave, Opera, and Vivaldi, as well as Chrome. Set up',
+    '  your browser in **Settings &gt; Computer Use** in the ChatGPT desktop app.',
+    '',
+    '- **Site tools (WebMCP):** In the desktop app&apos;s built-in browser, ChatGPT Work',
+    '  and Codex can use [tools provided by a website](/codex/webmcp) to work with',
+    '  the page.',
+  ].join('\n')), url, { now });
+  assert.equal(rest.length, 0);
+  assert.equal(feature?.title, 'Browser extensions, site tools, and cloud sign-in');
+  assert.equal(feature?.description, "More browsers: Use the ChatGPT browser extension in Microsoft Edge, Brave, Opera, and Vivaldi, as well as Chrome. Set up your browser in Settings > Computer Use in the ChatGPT desktop app. Site tools (WebMCP): In the desktop app's built-in browser, ChatGPT Work and Codex can use tools provided by a website to work with the page.");
+});
+
+test('list items, blank lines, code fences and headings end a wrapped line instead of being joined into it', () => {
+  const fence = '`'.repeat(3);
+  const items = parseChangelog(rss('Codex desktop app 26.1011', [
+    '### New features',
+    '',
+    '- First bullet wraps',
+    '  onto a second line.',
+    '- Second bullet is short.',
+    '',
+    'A paragraph after a blank line.',
+    '- Third bullet is followed by code',
+    `${fence}sh`,
+    'codex --help',
+    fence,
+    '- Fourth bullet is followed by a heading',
+    '### Bug fixes',
+    '',
+    '- Fixed something.',
+  ].join('\n')), url, { now });
+  assert.deepEqual(items.map(item => item.description), [
+    'First bullet wraps onto a second line.',
+    'Second bullet is short.',
+    'Third bullet is followed by code',
+    'Fourth bullet is followed by a heading',
+  ]);
+});
+
+test('an anchor in the middle of an RSS sentence stays out of the text and out of the way of the heading anchor', () => {
+  const html = '<h3 id="preview-attachments">Preview attachments</h3><p>Open image <a name="inline"></a>attachments beside the chat.</p>';
+  const [feature] = parseChangelog(rss('Codex desktop tools', html.replace(/</g, '&lt;').replace(/>/g, '&gt;')), url, { now });
+  assert.equal(feature?.title, 'Preview attachments');
+  assert.equal(feature?.description, 'Open image attachments beside the chat.');
+  assert.equal(feature?.sourceUrl, `${url}#preview-attachments`);
+});
+
+test('data-id and data-name attributes are not anchors, while a real id still is', () => {
+  const page = (attributes: string) => `<main><article ${attributes}><time datetime="2026-10-10">Oct 10</time><h3>Codex desktop app 26.1010</h3><h3>New features</h3><ul><li>Added a keyboard shortcut for drafts.</li></ul></article></main>`;
+  assert.equal(parseChangelog(page('data-id="5671996645" data-name="decoy"'), url, { now })[0]?.sourceUrl, url);
+  assert.equal(parseChangelog(page('data-id="5671996645" id="actual-release-id"'), url, { now })[0]?.sourceUrl, `${url}#actual-release-id`);
+});
+
+test('GitHub release bullets keep their whole sentence: data-id is no anchor and a (#123) tail is stripped whole', () => {
+  const pull = (number: number) => `(<a class="issue-link js-issue-link" data-error-text="Failed to load title" data-id="5671996645" data-permission-text="Title is private" data-url="https://github.com/openai/codex/issues/${number}" data-hovercard-type="pull_request" data-hovercard-url="/openai/codex/pull/${number}/hovercard" href="https://github.com/openai/codex/pull/${number}">#${number}</a>)`;
+  const html = `<h2>New Features</h2>\n<ul>\n<li>Tune remote compaction for custom providers. ${pull(50148)}</li>\n<li>Add checkpoint listing to the agent Command Center ${pull(51500)}</li>\n</ul>`;
+  const escaped = html.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const items = parseChangelog(rss('Codex CLI Release: 1.2.3', escaped), url, { now });
+  assert.deepEqual(items.map(item => [item.title, item.description]), [
+    ['Tune remote compaction for custom providers.', 'Tune remote compaction for custom providers.'],
+    ['Add checkpoint listing to the agent Command Center', 'Add checkpoint listing to the agent Command Center'],
+  ]);
+});

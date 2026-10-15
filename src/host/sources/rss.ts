@@ -6,6 +6,7 @@ import type { CandidateStore } from '../../core/store.js';
 import { parseChangelog, type ChangelogFeature } from '../changelog-parser.js';
 import { publicNetwork } from '../public-network.js';
 
+// Answers 308 and redirects to https://learn.chatgpt.com/docs/changelog/rss.xml; fetch follows it.
 export const RSS_URL = 'https://developers.openai.com/codex/changelog/rss.xml';
 const PAGE_URL = 'https://developers.openai.com/codex/changelog';
 const USER_AGENT = 'dsh-opencodex/0.3';
