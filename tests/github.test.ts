@@ -2,15 +2,49 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { GitHubClient, defaultGhRunner, type GhRunner } from '../src/host/github.ts';
 
-test('stableTags lists stable releases through gh, newest semver first, honoring the limit', async () => {
+test('stableTags reads the tags listing through gh api, newest semver first, honoring the limit', async () => {
   const calls: string[][] = [];
   // Scrambled on purpose, and with the odd names GitHub really has next to the stable tags.
   const names = ['rust-v0.9.0', 'rust-v0.10.0', 'rust-v0.162.0', 'rust-v0.162.1', 'rust-v0.163.0-alpha.1', 'rust-v0.161.0-rc.1', 'rust-vv0.99.0', 'winget-test-rust-v0.106.0', 'rusty-v8-v152.2.0', 'v0.1.0', 'rust-v0.162.1-hotfix', 'rust-v0.161.0'];
-  const runner: GhRunner = async args => { calls.push(args); return JSON.stringify(names.map(tagName => ({ tagName }))); };
+  const runner: GhRunner = async args => { calls.push(args); return JSON.stringify(names.map(name => ({ name }))); };
   const client = new GitHubClient({ gh: runner });
   assert.deepEqual(await client.stableTags(10), ['rust-v0.162.1', 'rust-v0.162.0', 'rust-v0.161.0', 'rust-v0.10.0', 'rust-v0.9.0'], 'numeric semver order (0.10.0 above 0.9.0); alphas and look-alikes dropped');
   assert.deepEqual(await client.stableTags(2), ['rust-v0.162.1', 'rust-v0.162.0']);
-  assert.deepEqual(calls[0], ['release', 'list', '--repo', 'openai/codex', '--exclude-pre-releases', '--exclude-drafts', '--limit', '100', '--json', 'tagName']);
+  const page1 = ['api', '-H', 'Accept: application/vnd.github+json', 'repos/openai/codex/tags?per_page=100&page=1'];
+  assert.deepEqual(calls, [page1, page1], 'one plain `gh api` read of page 1 per call (no --paginate, no `gh release list`); the page is short, so nothing more is asked');
+});
+
+test('gh stableTags pages like REST: on while a full page leaves tags missing, stop once enough, never past five pages', async () => {
+  /** A gh runner that answers `gh api repos/openai/codex/tags?per_page=100&page=N` from `pageOf(N)` and records every N asked for. */
+  const tagsViaGh = (pageOf: (page: number) => Array<{ name: string }>) => {
+    const asked: number[] = [];
+    const runner: GhRunner = async args => {
+      const page = /^repos\/openai\/codex\/tags\?per_page=100&page=(\d+)$/.exec(args.at(-1)!)?.[1];
+      if (page === undefined || args[0] !== 'api' || args.includes('--paginate')) throw new Error(`unexpected gh call: ${args.join(' ')}`);
+      asked.push(Number(page));
+      return JSON.stringify(pageOf(Number(page)));
+    };
+    return { client: new GitHubClient({ gh: runner }), asked };
+  };
+  const full = (stable: string[]) => [...stable.map(name => ({ name })), ...Array.from({ length: 100 - stable.length }, (_, i) => ({ name: `rust-v0.163.0-alpha.${i}` }))];
+
+  const short = tagsViaGh(page => page === 1 ? full(['rust-v0.9.0', 'rust-v0.162.1']) : [{ name: 'rust-v0.10.0' }, { name: 'rust-v0.162.0' }]);
+  assert.deepEqual(await short.client.stableTags(10), ['rust-v0.162.1', 'rust-v0.162.0', 'rust-v0.10.0', 'rust-v0.9.0']);
+  assert.deepEqual(short.asked, [1, 2], 'a full page 1 asks for page 2; the short page 2 ends the listing');
+
+  const enough = tagsViaGh(page => page === 1 ? full(['rust-v0.162.1', 'rust-v0.162.0', 'rust-v0.161.0']) : []);
+  assert.deepEqual(await enough.client.stableTags(3), ['rust-v0.162.1', 'rust-v0.162.0', 'rust-v0.161.0']);
+  assert.deepEqual(enough.asked, [1], 'three stable tags are in hand after page 1');
+
+  const endless = tagsViaGh(page => full([`rust-v0.${page}.0`, 'rust-v0.1.0']));
+  assert.deepEqual(await endless.client.stableTags(50), ['rust-v0.5.0', 'rust-v0.4.0', 'rust-v0.3.0', 'rust-v0.2.0', 'rust-v0.1.0'], 'rust-v0.1.0 is on every page but listed once');
+  assert.deepEqual(endless.asked, [1, 2, 3, 4, 5], 'five pages is the cap');
+});
+
+test('a tags page that is not a JSON array is an error, not an empty listing', async () => {
+  await assert.rejects(new GitHubClient({ gh: async () => JSON.stringify({ message: 'oops' }) }).stableTags(3), /tags page 1 is not a JSON array/);
+  const stub = stubFetch(() => json({ message: 'oops' }));
+  await assert.rejects(new GitHubClient({ gh: null, fetch: stub.fetch }).stableTags(3), /tags page 1 is not a JSON array/);
 });
 
 test('REST stableTags pages through the tags listing and stops at the first short page', async () => {
@@ -111,7 +145,7 @@ test('without gh the client reads api.github.com and reports HTTP errors', async
 });
 
 test('invalid JSON names the request it came from', async () => {
-  await assert.rejects(new GitHubClient({ gh: async () => '<html>bad gateway</html>' }).stableTags(1), /invalid JSON for release list/);
+  await assert.rejects(new GitHubClient({ gh: async () => '<html>bad gateway</html>' }).stableTags(1), /invalid JSON for repos\/openai\/codex\/tags\?per_page=100&page=1/);
   const stub = stubFetch(() => new Response('oops', { status: 200 }));
   await assert.rejects(new GitHubClient({ gh: null, fetch: stub.fetch }).treePaths('rust-v0.162.1', () => true), /invalid JSON for repos\/openai\/codex\/git\/trees\/rust-v0\.162\.1/);
 });

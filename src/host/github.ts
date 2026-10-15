@@ -14,7 +14,8 @@ const DIFF_ACCEPT = 'application/vnd.github.diff';
 const USER_AGENT = 'dsh-opencodex/0.3';
 /** GitHub lists at most 3000 files per pull request: 30 pages of 100. Pages are read until a short one, so ordinary pull requests cost one. */
 const MAX_FILE_PAGES = 30;
-/** REST tags listing: at most this many pages of 100. The first page already holds the newest stable tags; five reach back to about rust-v0.135 (55 stable tags on 2026-10-15). */
+/** The tags listing is read in pages of this many tags, at most this many pages. The first page already holds the newest stable tags; five reach back to about rust-v0.135 (55 stable tags on 2026-10-15). */
+const TAGS_PER_PAGE = 100;
 const MAX_TAG_PAGES = 5;
 const STABLE_TAG = /^rust-v(\d+)\.(\d+)\.(\d+)$/;
 
@@ -43,8 +44,6 @@ function isGhUnusable(error: unknown): boolean {
   return code === 'ENOENT' || code === 4 || /not logged into/i.test(text);
 }
 
-/** The distinct plain `rust-vX.Y.Z` names among `names`: no alphas, release candidates or look-alike tags. */
-const stableOf = (names: string[]): string[] => [...new Set(names.filter(name => STABLE_TAG.test(name)))];
 const versionOf = (tag: string): number[] => STABLE_TAG.exec(tag)!.slice(1).map(Number);
 /** Compares the three version numbers, not the text: rust-v0.10.0 is newer than rust-v0.9.0. */
 function newestFirst(a: string, b: string): number {
@@ -105,15 +104,11 @@ export class GitHubClient {
   /**
    * At most `maxPages` pages of a JSON-array endpoint, one array per page.
    * gh: `--paginate --slurp` (needs gh >= 2.50) always fetches every page; the surplus is dropped here.
-   * REST: see `restPages`.
+   * REST: one request per page, ending at the first page that is empty or shorter than `per_page`.
    */
   private async jsonPages<T>(path: string, maxPages: number, signal?: AbortSignal): Promise<T[][]> {
     const out = await this.tryGh(['api', '--paginate', '--slurp', '-H', `Accept: ${JSON_ACCEPT}`, path], signal);
     if (out !== undefined) return parseJson<T[][]>(out, path).slice(0, maxPages);
-    return this.restPages<T>(path, maxPages, signal);
-  }
-  /** One request per page, ending at the first page that is empty or shorter than `per_page`, at `maxPages`, or as soon as `enough(pages)` holds. */
-  private async restPages<T>(path: string, maxPages: number, signal: AbortSignal | undefined, enough?: (pages: T[][]) => boolean): Promise<T[][]> {
     const perPage = Number(new URLSearchParams(path.split('?')[1]).get('per_page')) || 30; // 30 is GitHub's default page size
     return this.withFetch(signal, async request => {
       const pages: T[][] = [];
@@ -122,7 +117,7 @@ export class GitHubClient {
         const body = parseJson<unknown>(await this.restText(request, pagePath, JSON_ACCEPT, signal), pagePath);
         if (!Array.isArray(body)) throw new Error(`GitHub page ${page} of ${path} is not a JSON array`);
         pages.push(body as T[]);
-        if (body.length < perPage || enough?.(pages)) break;
+        if (body.length < perPage) break;
       }
       return pages;
     });
@@ -130,16 +125,19 @@ export class GitHubClient {
 
   /**
    * The newest stable `rust-vX.Y.Z` tags, newest first by version number; GitHub's own order is not trusted for the result.
-   * gh: `gh release list`, the newest 100 stable releases. Slow (9 to 10 s) but a few KB and reliable; GitHub has already dropped prereleases and drafts.
-   * REST: the tags listing, pages of 100 (about 1 s each). GitHub lists tags in descending version order, so reading stops as soon as `limit` stable tags
-   * are in hand (five pages at most). A tag has no prerelease flag, so a prerelease with a plain-looking tag can get through on this path: `release(tag).prerelease` is the authority.
+   * Reads the tags listing one page of 100 at a time (about 1 s each): through `gh api` when gh is usable, anonymous REST otherwise.
+   * GitHub lists tags in descending version order, so reading stops as soon as `limit` stable tags are in hand, at a short page, or after five pages.
+   * A tag has no prerelease flag, so a prerelease with a plain-looking tag can get through: `release(tag).prerelease` is the authority.
    */
   async stableTags(limit: number, signal?: AbortSignal): Promise<string[]> {
-    const listed = await this.tryGh(['release', 'list', '--repo', REPO, '--exclude-pre-releases', '--exclude-drafts', '--limit', '100', '--json', 'tagName'], signal);
-    const names = listed !== undefined
-      ? parseJson<Array<{ tagName: string }>>(listed, 'release list').map(r => r.tagName)
-      : (await this.restPages<{ name: string }>(`repos/${REPO}/tags?per_page=100`, MAX_TAG_PAGES, signal, pages => stableOf(pages.flat().map(t => t.name)).length >= limit)).flat().map(t => t.name);
-    return stableOf(names).sort(newestFirst).slice(0, limit);
+    const found = new Set<string>();
+    for (let page = 1; page <= MAX_TAG_PAGES; page++) {
+      const tags = await this.json<Array<{ name: string }>>(`repos/${REPO}/tags?per_page=${TAGS_PER_PAGE}&page=${page}`, signal);
+      if (!Array.isArray(tags)) throw new Error(`GitHub tags page ${page} is not a JSON array`);
+      for (const { name } of tags) if (STABLE_TAG.test(name)) found.add(name);
+      if (found.size >= limit || tags.length < TAGS_PER_PAGE) break;
+    }
+    return [...found].sort(newestFirst).slice(0, limit);
   }
   /** One release by tag. The REST answer lists every binary asset (about 300 KB), which is fine for the few tags of one check window. */
   async release(tag: string, signal?: AbortSignal): Promise<Release> {
