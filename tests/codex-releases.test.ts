@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CandidateStore } from '../src/core/store.ts';
-import type { GitHubClient, PullRequest, Release } from '../src/host/github.ts';
+import { GitHubError, type GitHubClient, type PullRequest, type Release } from '../src/host/github.ts';
 import { collectReleases, parseReleaseBody, stableWindow } from '../src/host/sources/codex-releases.ts';
 
 const readFixture = () => readFile(new URL('./fixtures/release-0.162.0.md', import.meta.url), 'utf8');
@@ -166,25 +166,36 @@ const pullRequest = (n: number, fileCount: number): PullRequest => ({
 const excerptOf = (n: number): string => [`PR ${n} title`, ...pathsOf(n, 2)].join('\n');
 /** `n` characters that tell their position apart, so a cut in the wrong place shows. */
 const digits = (n: number): string => Array.from({ length: n }, (_, i) => String(i % 10)).join('');
+const pullPath = (n: number): string => `repos/openai/codex/pulls/${n}`;
+const releasePath = (tag: string): string => `repos/openai/codex/releases/tags/${tag}`;
 
 type ReleasesGitHub = Pick<GitHubClient, 'stableTags' | 'release' | 'pullRequest'>;
 type Signals = Array<AbortSignal | undefined>;
-/** `state` can be changed between runs (a new release, a failing PR, a large PR); `calls` records what the collector asked for and `signals` the signal it passed along. */
+/**
+ * `state` can be changed between runs: `releases` holds the published releases (a tag without one answers `undefined`, like GitHub's 404),
+ * `failingReleases` and `failing` make a fetch fail, `pullError` picks the error of a pull request lookup from the pull request number and
+ * the 1-based number of the call, `fileCount` sizes the stub pull requests. `calls` records what the collector asked for and `signals`
+ * the signal it passed along.
+ */
 function stubGitHub(tags: string[], releases: Release[]) {
-  const state = { tags, releases: new Map(releases.map(r => [r.tag, r])), failing: new Set<number>(), fileCount: 2 };
+  const state = {
+    tags, releases: new Map(releases.map(r => [r.tag, r])), failingReleases: new Set<string>(), failing: new Set<number>(), fileCount: 2,
+    pullError: undefined as ((n: number, call: number) => Error | undefined) | undefined,
+  };
   const calls = { stableTags: [] as number[], release: [] as string[], pullRequest: [] as number[] };
   const signals = { stableTags: [] as Signals, release: [] as Signals, pullRequest: [] as Signals };
   const github: ReleasesGitHub = {
     stableTags: async (limit, signal) => { calls.stableTags.push(limit); signals.stableTags.push(signal); return state.tags.slice(0, limit); },
     release: async (tag, signal) => {
       calls.release.push(tag); signals.release.push(signal);
-      const found = state.releases.get(tag);
-      if (!found) throw new Error(`no release ${tag}`);
-      return found;
+      if (state.failingReleases.has(tag)) throw new GitHubError(`GitHub HTTP 500 for ${releasePath(tag)}`, releasePath(tag), { status: 500 });
+      return state.releases.get(tag);
     },
     pullRequest: async (n, signal) => {
       calls.pullRequest.push(n); signals.pullRequest.push(signal);
-      if (state.failing.has(n)) throw new Error(`GitHub HTTP 404 for repos/openai/codex/pulls/${n}`);
+      const error = state.pullError?.(n, calls.pullRequest.length);
+      if (error) throw error;
+      if (state.failing.has(n)) throw new Error(`GitHub HTTP 404 for ${pullPath(n)}`);
       return pullRequest(n, state.fileCount);
     },
   };
@@ -210,7 +221,7 @@ test('collectReleases: the first run covers the releases since the previous mino
     ]);
 
     const first = await collectReleases(store, stub.github, snapshotDir);
-    assert.deepEqual(first, { window: { from: 'rust-v0.161.0', to: 'rust-v0.162.1', releases: ['rust-v0.162.1', 'rust-v0.162.0'] }, added: 3, gap: false, prLookupFailures: 0 });
+    assert.deepEqual(first, { window: { from: 'rust-v0.161.0', to: 'rust-v0.162.1', releases: ['rust-v0.162.1', 'rust-v0.162.0'] }, added: 3, gap: false, prLookupFailures: 0, unreleased: [] });
     assert.deepEqual(stub.calls.stableTags, [12]);
     // Oldest first, and the starting point 0.161.0 was seen before the window opened: it is neither fetched nor collected.
     assert.deepEqual(stub.calls.release, ['rust-v0.162.0', 'rust-v0.162.1']);
@@ -246,6 +257,7 @@ test('collectReleases: the first run covers the releases since the previous mino
     assert.equal(second.added, 0);
     assert.equal(second.gap, false);
     assert.equal(second.prLookupFailures, 0);
+    assert.deepEqual(second.unreleased, []);
     assert.deepEqual(stub.calls.stableTags, [12, 12]);
     assert.equal(stub.calls.release.length, releaseCalls);
     assert.equal(stub.calls.pullRequest.length, pullCalls);
@@ -255,7 +267,7 @@ test('collectReleases: the first run covers the releases since the previous mino
     stub.state.tags.unshift('rust-v0.163.0');
     stub.state.releases.set('rust-v0.163.0', release('rust-v0.163.0', notes('Add delta pane. (#60030)')));
     const third = await collectReleases(store, stub.github, snapshotDir);
-    assert.deepEqual(third, { window: { from: 'rust-v0.162.1', to: 'rust-v0.163.0', releases: ['rust-v0.163.0'] }, added: 1, gap: false, prLookupFailures: 0 });
+    assert.deepEqual(third, { window: { from: 'rust-v0.162.1', to: 'rust-v0.163.0', releases: ['rust-v0.163.0'] }, added: 1, gap: false, prLookupFailures: 0, unreleased: [] });
     assert.equal(await store.checkpoint('lastStableTag'), 'rust-v0.163.0');
     assert.equal((await store.list({ source: 'codex-release' }))[0]!.title, 'Add delta pane.');
   });
@@ -271,7 +283,7 @@ test('collectReleases: a checkpoint covers every stable release since it, across
       release('rust-v0.162.0', notes('Already seen. (#60010)')),
     ]);
     const result = await collectReleases(store, stub.github, snapshotDir);
-    assert.deepEqual(result, { window: { from: 'rust-v0.162.0', to: 'rust-v0.164.0', releases: ['rust-v0.164.0', 'rust-v0.163.0', 'rust-v0.162.1'] }, added: 3, gap: false, prLookupFailures: 0 });
+    assert.deepEqual(result, { window: { from: 'rust-v0.162.0', to: 'rust-v0.164.0', releases: ['rust-v0.164.0', 'rust-v0.163.0', 'rust-v0.162.1'] }, added: 3, gap: false, prLookupFailures: 0, unreleased: [] });
     assert.deepEqual(stub.calls.release, ['rust-v0.162.1', 'rust-v0.163.0', 'rust-v0.164.0']);
     const stored = await store.list({ source: 'codex-release' });
     assert.deepEqual(stored.map(c => c.window?.toTag), ['rust-v0.164.0', 'rust-v0.163.0', 'rust-v0.162.1']);
@@ -295,6 +307,85 @@ test('collectReleases: a release the API marks as prerelease is skipped whole', 
   });
 });
 
+test('collectReleases: a tag without a release yet is skipped and the checkpoint stays before it, until the release is published', async () => {
+  await withStore(async (store, snapshotDir) => {
+    await store.setCheckpoint('lastStableTag', 'rust-v0.161.0');
+    // rust-v0.163.0 is tagged, but its release is not published yet.
+    const stub = stubGitHub(['rust-v0.163.0', 'rust-v0.162.1', 'rust-v0.162.0', 'rust-v0.161.0'], [
+      release('rust-v0.162.1', notes('Add alpha tool. (#60001)')),
+      release('rust-v0.162.0', notes('Add beta view. (#60010)')),
+    ]);
+    const first = await collectReleases(store, stub.github, snapshotDir);
+    assert.deepEqual(first, {
+      window: { from: 'rust-v0.161.0', to: 'rust-v0.163.0', releases: ['rust-v0.163.0', 'rust-v0.162.1', 'rust-v0.162.0'] },
+      added: 2, gap: false, prLookupFailures: 0, unreleased: ['rust-v0.163.0'],
+    });
+    assert.deepEqual(stub.calls.release, ['rust-v0.162.0', 'rust-v0.162.1', 'rust-v0.163.0']);
+    assert.equal(await store.checkpoint('lastStableTag'), 'rust-v0.162.1');
+    await assert.rejects(stat(snapshotPath(snapshotDir, 'rust-v0.163.0')), { code: 'ENOENT' });
+    assert.equal((await store.list({ source: 'codex-release' })).length, 2);
+
+    // Still unpublished: the window is that tag alone, nothing is collected and the checkpoint does not move.
+    const second = await collectReleases(store, stub.github, snapshotDir);
+    assert.deepEqual(second, {
+      window: { from: 'rust-v0.162.1', to: 'rust-v0.163.0', releases: ['rust-v0.163.0'] },
+      added: 0, gap: false, prLookupFailures: 0, unreleased: ['rust-v0.163.0'],
+    });
+    assert.equal(await store.checkpoint('lastStableTag'), 'rust-v0.162.1');
+
+    // The release is published: the next run collects it, and only it.
+    stub.state.releases.set('rust-v0.163.0', release('rust-v0.163.0', notes('Add delta pane. (#60030)')));
+    const third = await collectReleases(store, stub.github, snapshotDir);
+    assert.deepEqual(third, {
+      window: { from: 'rust-v0.162.1', to: 'rust-v0.163.0', releases: ['rust-v0.163.0'] },
+      added: 1, gap: false, prLookupFailures: 0, unreleased: [],
+    });
+    assert.equal(await store.checkpoint('lastStableTag'), 'rust-v0.163.0');
+    await stat(snapshotPath(snapshotDir, 'rust-v0.163.0'));
+    assert.equal((await store.list({ source: 'codex-release' }))[0]!.title, 'Add delta pane.');
+  });
+});
+
+test('collectReleases: when no tag of the window has a release yet, nothing is collected and the checkpoint is left as it was', async () => {
+  await withStore(async (store, snapshotDir) => {
+    await store.setCheckpoint('lastStableTag', 'rust-v0.162.0');
+    const stub = stubGitHub(['rust-v0.163.1', 'rust-v0.163.0', 'rust-v0.162.0'], []);
+    const result = await collectReleases(store, stub.github, snapshotDir);
+    // `unreleased` lists the tags newest first, like the window.
+    assert.deepEqual(result, {
+      window: { from: 'rust-v0.162.0', to: 'rust-v0.163.1', releases: ['rust-v0.163.1', 'rust-v0.163.0'] },
+      added: 0, gap: false, prLookupFailures: 0, unreleased: ['rust-v0.163.1', 'rust-v0.163.0'],
+    });
+    assert.equal(await store.checkpoint('lastStableTag'), 'rust-v0.162.0');
+    assert.deepEqual(await store.list(), []);
+    assert.deepEqual(stub.calls.pullRequest, []);
+  });
+  // On a first run there is no checkpoint, and none is invented.
+  await withStore(async (store, snapshotDir) => {
+    const stub = stubGitHub(['rust-v0.163.0', 'rust-v0.162.1', 'rust-v0.162.0'], []);
+    const result = await collectReleases(store, stub.github, snapshotDir);
+    assert.deepEqual(result.unreleased, ['rust-v0.163.0']);
+    assert.equal(await store.checkpoint('lastStableTag'), undefined);
+  });
+});
+
+test('collectReleases: the checkpoint moves to the newest tag that has a release, a prerelease-flagged one included', async () => {
+  await withStore(async (store, snapshotDir) => {
+    await store.setCheckpoint('lastStableTag', 'rust-v0.161.0');
+    // 0.164.0 is flagged as prerelease: seen, not collected. 0.163.0 has no release at all and sits between releases that do.
+    const stub = stubGitHub(['rust-v0.164.0', 'rust-v0.163.0', 'rust-v0.162.1', 'rust-v0.162.0', 'rust-v0.161.0'], [
+      release('rust-v0.164.0', notes('Add epsilon. (#60040)'), true),
+      release('rust-v0.162.1', notes('Add alpha tool. (#60001)')),
+      release('rust-v0.162.0', notes('Add beta view. (#60010)')),
+    ]);
+    const result = await collectReleases(store, stub.github, snapshotDir);
+    assert.equal(result.added, 2);
+    assert.deepEqual(result.unreleased, ['rust-v0.163.0']);
+    assert.equal(await store.checkpoint('lastStableTag'), 'rust-v0.164.0');
+    assert.deepEqual((await store.list({ source: 'codex-release' })).map(c => c.fingerprint).sort(), ['codex-release:pr:60001', 'codex-release:pr:60010']);
+  });
+});
+
 test('collectReleases: a checkpoint older than the fetched tags reports a gap and falls back to the previous minor', async () => {
   await withStore(async (store, snapshotDir) => {
     await store.setCheckpoint('lastStableTag', 'rust-v0.100.0');
@@ -303,7 +394,7 @@ test('collectReleases: a checkpoint older than the fetched tags reports a gap an
       release('rust-v0.162.0', notes('Add beta view. (#60010)')),
     ]);
     const result = await collectReleases(store, stub.github, snapshotDir);
-    assert.deepEqual(result, { window: { from: 'rust-v0.161.0', to: 'rust-v0.162.1', releases: ['rust-v0.162.1', 'rust-v0.162.0'] }, added: 2, gap: true, prLookupFailures: 0 });
+    assert.deepEqual(result, { window: { from: 'rust-v0.161.0', to: 'rust-v0.162.1', releases: ['rust-v0.162.1', 'rust-v0.162.0'] }, added: 2, gap: true, prLookupFailures: 0, unreleased: [] });
     // The checkpoint moves into the list, so the next run no longer reports a gap.
     assert.equal(await store.checkpoint('lastStableTag'), 'rust-v0.162.1');
     assert.equal((await collectReleases(store, stub.github, snapshotDir)).gap, false);
@@ -344,6 +435,49 @@ test('collectReleases: prLookupFailures counts every lookup that fell back to a 
   });
 });
 
+test('collectReleases: after a 403 or 429 no further pull requests are looked up, and the rest keep a bare reference', async () => {
+  for (const status of [403, 429]) {
+    await withStore(async (store, snapshotDir) => {
+      // The bullet that is looked up first has two pull requests: the second must not be asked either.
+      const stub = stubGitHub(['rust-v0.162.1', 'rust-v0.162.0', 'rust-v0.161.0'], [
+        release('rust-v0.162.1', notes('Add alpha tool. (#60001)')),
+        release('rust-v0.162.0', notes('Add beta view. (#60010)', 'Add gamma flag. (#60020, #60021)')),
+      ]);
+      // Only the first lookup is refused. Any later one would succeed, so a lookup after the limit would show up in the calls and the evidence.
+      stub.state.pullError = (n, call) => call === 1 ? new GitHubError('rate limited', pullPath(n), { status }) : undefined;
+      const result = await collectReleases(store, stub.github, snapshotDir);
+      assert.equal(stub.calls.pullRequest.length, 1, `status ${status}`);
+      assert.equal(result.added, 3, `status ${status}`);
+      assert.equal(result.prLookupFailures, 4, `status ${status}`); // the refused lookup and the three that were not made
+      const stored = await store.list({ source: 'codex-release' });
+      assert.equal(stored.length, 3);
+      const evidence = stored.flatMap(c => c.evidence);
+      assert.deepEqual(evidence.map(e => e.ref).sort(), ['#60001', '#60010', '#60020', '#60021']);
+      assert.ok(evidence.every(e => e.url === undefined && e.excerpt === undefined), `status ${status}`);
+      assert.equal(await store.checkpoint('lastStableTag'), 'rust-v0.162.1'); // the run itself went through
+    });
+  }
+});
+
+test('collectReleases: a failed lookup that is not a rate limit costs only its own pull request', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const stub = stubGitHub(['rust-v0.162.0', 'rust-v0.161.0'], [release('rust-v0.162.0', notes('Add beta view. (#60010, #60011, #60012, #60013, #60014)'))]);
+    // Each kind of failure is followed by another lookup, so a version that stopped on it would show in the calls.
+    const errors = new Map<number, Error>([
+      [60010, new GitHubError('not found', pullPath(60010), { status: 404 })],
+      [60011, new GitHubError('no answer', pullPath(60011))], // a request that never got an answer has no status
+      [60012, new GitHubError('server error', pullPath(60012), { status: 500 })],
+      [60013, Object.assign(new Error('forbidden'), { status: 403 })], // not a GitHubError, so not taken for a rate limit
+    ]);
+    stub.state.pullError = n => errors.get(n);
+    const result = await collectReleases(store, stub.github, snapshotDir);
+    assert.deepEqual(stub.calls.pullRequest, [60010, 60011, 60012, 60013, 60014]); // every lookup was made
+    assert.equal(result.prLookupFailures, 4);
+    const [beta] = await store.list({ source: 'codex-release' });
+    assert.deepEqual(beta!.evidence.map(e => e.url !== undefined), [false, false, false, false, true]);
+  });
+});
+
 test('collectReleases: an abort is not swallowed as a missing pull request', async () => {
   await withStore(async (store, snapshotDir) => {
     const controller = new AbortController();
@@ -361,13 +495,12 @@ test('collectReleases: a failed release fetch fails the run and keeps the checkp
       release('rust-v0.162.1', notes('Add alpha tool. (#60001)')),
       release('rust-v0.162.0', notes('Add beta view. (#60010)')),
     ]);
-    const missing = stub.state.releases.get('rust-v0.162.1')!;
-    stub.state.releases.delete('rust-v0.162.1');
-    await assert.rejects(collectReleases(store, stub.github, snapshotDir), /no release rust-v0\.162\.1/);
+    stub.state.failingReleases.add('rust-v0.162.1');
+    await assert.rejects(collectReleases(store, stub.github, snapshotDir), (error: unknown) => error instanceof GitHubError && error.status === 500);
     assert.equal(await store.checkpoint('lastStableTag'), undefined);
     assert.equal((await store.list({ source: 'codex-release' })).length, 1); // 0.162.0 went first and is already stored
 
-    stub.state.releases.set('rust-v0.162.1', missing);
+    stub.state.failingReleases.delete('rust-v0.162.1');
     const retry = await collectReleases(store, stub.github, snapshotDir);
     assert.equal(retry.added, 1); // only 0.162.1 is new; the stored 0.162.0 candidate is refreshed to the same content
     assert.equal(await store.checkpoint('lastStableTag'), 'rust-v0.162.1');

@@ -4,7 +4,7 @@
 import { join } from 'node:path';
 import type { Evidence } from '../../core/candidate.js';
 import { writeJsonAtomic, type CandidateStore } from '../../core/store.js';
-import type { GitHubClient } from '../github.js';
+import { GitHubError, type GitHubClient, type PullRequest } from '../github.js';
 
 export interface ReleaseFeature { text: string; prs: number[] }
 
@@ -77,8 +77,10 @@ export interface ReleaseCollection {
   window?: StableWindow; added: number;
   /** The checkpoint is older than the fetched tags; intermediate releases were not collected. */
   gap: boolean;
-  /** Pull request lookups of this run that failed. Each left only a bare `#N` reference as evidence, and nothing retries them. */
+  /** Pull request lookups of this run that failed, or were not made because GitHub had answered 403 or 429. Each left only a bare `#N` reference as evidence, and nothing retries them. */
   prLookupFailures: number;
+  /** Tags of the window that have no release yet (a stable tag can exist before its release is published), newest first. They are not collected, and a newest tag among them is looked at again by the next run. */
+  unreleased: string[];
 }
 
 /** At most `limit` code points, so an emoji is never cut in half. A longer text is cut to `limit - 1` code points and ends in `…`, the way the desktop source clips its messages. */
@@ -87,37 +89,58 @@ function clip(text: string, limit: number): string {
   return chars.length > limit ? `${chars.slice(0, limit - 1).join('')}…` : text;
 }
 
-/** One entry per pull request, in the order the bullet lists them, and how many lookups failed. A pull request that cannot be fetched keeps its bare reference. */
-async function evidenceFor(github: Pick<GitHubClient, 'pullRequest'>, numbers: number[], signal?: AbortSignal): Promise<{ evidence: Evidence[]; failures: number }> {
-  const pulls = await Promise.all(numbers.map(n => github.pullRequest(n, signal).catch((error: unknown) => {
-    if (signal?.aborted) throw error; // an abort ends the run; it is not a missing pull request
-    return undefined;
-  })));
-  const evidence = pulls.map((pr, i): Evidence => pr
-    ? { kind: 'pr', ref: `#${pr.number}`, url: pr.url, excerpt: [pr.title, ...pr.files.slice(0, EXCERPT_FILES).map(f => f.path)].join('\n') }
-    : { kind: 'pr', ref: `#${numbers[i]}` });
-  return { evidence, failures: pulls.filter(pr => pr === undefined).length };
+/** GitHub answers 403 or 429 when the rate limit is used up. */
+const isRateLimit = (error: unknown): boolean => error instanceof GitHubError && (error.status === 403 || error.status === 429);
+
+/**
+ * Looks pull requests up for the bullets of one run. They are asked one at a time, because a rate limit answers the first request that
+ * hits it and the ones already in flight would only add to it. After a 403 or 429 it asks no more for the rest of the run: every later
+ * pull request gets its bare reference. Any other failure costs only its own pull request. `failures` counts both.
+ */
+function pullRequestLookup(github: Pick<GitHubClient, 'pullRequest'>, signal?: AbortSignal) {
+  let rateLimited = false;
+  return async (numbers: number[]): Promise<{ evidence: Evidence[]; failures: number }> => {
+    const evidence: Evidence[] = [];
+    let failures = 0;
+    for (const n of numbers) {
+      let pr: PullRequest | undefined;
+      if (!rateLimited) {
+        try { pr = await github.pullRequest(n, signal); } catch (error) {
+          if (signal?.aborted) throw error; // an abort ends the run; it is not a missing pull request
+          if (isRateLimit(error)) rateLimited = true;
+        }
+      }
+      if (pr) evidence.push({ kind: 'pr', ref: `#${pr.number}`, url: pr.url, excerpt: [pr.title, ...pr.files.slice(0, EXCERPT_FILES).map(f => f.path)].join('\n') });
+      else { evidence.push({ kind: 'pr', ref: `#${n}` }); failures++; }
+    }
+    return { evidence, failures };
+  };
 }
 
 /**
  * Stores the New Features of every stable release in the window as `codex-release` candidates and returns how many were new.
  * The checkpoint moves only after the whole window went through, so a failed run is retried whole (the upserts are idempotent).
+ * It moves to the newest tag of the window that has a release, so a newest tag whose release is not published yet is looked at again by the next run.
  */
 export async function collectReleases(store: CandidateStore, github: Pick<GitHubClient, 'stableTags' | 'release' | 'pullRequest'>, snapshotDir: string, signal?: AbortSignal): Promise<ReleaseCollection> {
   const tags = await github.stableTags(RECENT_STABLE_TAGS, signal);
   const lastSeen = await store.checkpoint('lastStableTag');
   const gap = lastSeen !== undefined && !tags.includes(lastSeen);
   const window = stableWindow(tags, lastSeen);
-  if (!window) return { added: 0, gap, prLookupFailures: 0 };
-  let added = 0, prLookupFailures = 0;
+  if (!window) return { added: 0, gap, prLookupFailures: 0, unreleased: [] };
+  const lookUp = pullRequestLookup(github, signal);
+  const unreleased: string[] = [];
+  let added = 0, prLookupFailures = 0, newestReleased: string | undefined;
   // Oldest release first, and within a release the last bullet first: the store lists the latest write first, so the newest release
   // ends up on top and the first bullet of the notes leads its release.
   for (const tag of [...window.releases].reverse()) {
     const release = await github.release(tag, signal);
+    if (!release) { unreleased.unshift(tag); continue; } // tagged before its release was published: nothing to read yet
+    newestReleased = tag; // a tag flagged as prerelease counts as seen too
     if (release.prerelease) continue; // the tags endpoint has no prerelease flag; the release record is authoritative
     await writeJsonAtomic(join(snapshotDir, 'codex-releases', `${tag}.json`), release);
     for (const feature of parseReleaseBody(release.body).reverse()) {
-      const { evidence, failures } = await evidenceFor(github, feature.prs, signal);
+      const { evidence, failures } = await lookUp(feature.prs);
       prLookupFailures += failures;
       const { created } = await store.upsert({
         source: 'codex-release', key: `pr:${feature.prs[0]}`, title: clip(feature.text, TITLE_LIMIT), summary: feature.text,
@@ -126,6 +149,6 @@ export async function collectReleases(store: CandidateStore, github: Pick<GitHub
       if (created) added++;
     }
   }
-  await store.setCheckpoint('lastStableTag', window.to);
-  return { window, added, gap, prLookupFailures };
+  if (newestReleased) await store.setCheckpoint('lastStableTag', newestReleased);
+  return { window, added, gap, prLookupFailures, unreleased };
 }
