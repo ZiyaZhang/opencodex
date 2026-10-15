@@ -13,7 +13,7 @@ export interface ChangelogFeature {
 }
 export interface ChangelogOptions { now?: Date; maxReleases?: number; maxFeatures?: number; maxAgeDays?: number }
 /** Bump when the output for the same feed changes: the RSS source folds it into the hash that decides whether a feed was already read, so a parser fix takes effect on the next run. */
-export const PARSER_VERSION = '3';
+export const PARSER_VERSION = '4';
 /** `raw` is the block as written, link targets included; only the relevance gate reads it. `title` marks the heading that repeats the item title. */
 interface Block { kind: 'heading' | 'item' | 'text'; text: string; raw: string; anchor?: string; title?: true }
 interface Release { date: string; title: string; anchor?: string; url?: string; blocks: Block[] }
@@ -274,8 +274,8 @@ export function parseChangelog(content: string, sourceUrl: string, options: Chan
         if (parts.length) append(name, parts.join(' '), sectionAnchor);
       } else {
         if (split) {
-          // The text before the bullets is the announcement itself; a last line that only leads into the list ("This launch also includes:") is not part of it.
-          const lead = intro.length > 1 && /[:：]$/.test(intro.at(-1)!) ? intro.slice(0, -1) : intro;
+          // The text before the bullets is the announcement itself. A last paragraph that only leads into the list ("This launch also includes:") is not part of it, and an intro made of nothing else is no feature.
+          const lead = /[:：]$/.test(intro.at(-1) ?? '') ? intro.slice(0, -1) : intro;
           if (lead.length) append(release.title, lead.join(' '), sectionAnchor);
         }
         for (const item of items) append(titleFor(item), item);

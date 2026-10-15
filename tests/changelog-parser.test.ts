@@ -229,15 +229,18 @@ test('a title section with several bullets keeps its intro as the first feature 
   // The line that only leads into the list is not part of the intro, and a note after the list is dropped as in a "New features" section.
   assert.equal(ten[0]!.description, 'Appshots are now available in the Codex app on macOS.');
   assert.ok(ten.slice(1).every(item => item.description.startsWith('Feature ') && item.description.endsWith(sentence)));
-  // Without anything before the bullets there is no intro feature; an intro that is only a lead-in line is all there is, and stays.
+  // Without anything before the bullets there is no intro feature, and neither when all there is before them is a paragraph that leads into the list.
   const bare = parseChangelog(rss('Codex desktop update', '# Codex desktop update\n\n1. Added draft recovery for composers.\n2. Added question cards that keep input.'), url, { now });
   assert.deepEqual(bare.map(item => item.title), ['Added draft recovery for composers.', 'Added question cards that keep input.']);
   const lead = parseChangelog(rss('Codex desktop update', '# Codex desktop update\n\nMore Codex features are rolling out:\n\n- Added draft recovery for composers.\n- Added question cards that keep input.'), url, { now });
   assert.deepEqual(lead.map(item => [item.title, item.description]), [
-    ['Codex desktop update', 'More Codex features are rolling out:'],
     ['Added draft recovery for composers.', 'Added draft recovery for composers.'],
     ['Added question cards that keep input.', 'Added question cards that keep input.'],
   ]);
+  // A colon inside a paragraph is no lead-in; only a paragraph that ends in one is.
+  const kept = parseChangelog(rss('Codex desktop update', '# Codex desktop update\n\nCodex now has two modes: auto and manual.\n\n- Added draft recovery for composers.\n- Added question cards that keep input.'), url, { now });
+  assert.deepEqual(kept.map(item => item.title), ['Codex desktop update', 'Added draft recovery for composers.', 'Added question cards that keep input.']);
+  assert.equal(kept[0]!.description, 'Codex now has two modes: auto and manual.');
   // A single bullet, or paragraphs alone, are not split.
   const single = parseChangelog(rss('Codex desktop update', '# Codex desktop update\n\n- Added draft recovery for composers.'), url, { now });
   assert.deepEqual(single.map(item => item.title), ['Codex desktop update']);
