@@ -9,18 +9,22 @@ export interface PullRequest { number: number; title: string; body: string; url:
 
 /**
  * A GitHub request that failed. `path` is the request path (`repos/openai/codex/...`). `status` is the HTTP status when there was one, on gh as on REST
- * (gh's "release not found" and "Could not resolve to a PullRequest" count as 404). `rateLimitResetAt` is set when REST reports a rate limit.
- * A request that never got an answer has no status; `cause` holds the original error.
+ * (gh's "release not found" and "Could not resolve to a PullRequest" count as 404). A request that never got an answer has no status; `cause` holds the original error.
+ * Test `rateLimited` rather than for 403 and 429: GraphQL, which `gh pr view` and `gh release view` use, reports its primary rate limit as an HTTP 200 with an error body,
+ * so gh prints no status for it. It is true when GitHub refused the request over a rate limit: on gh by the wording of its message whatever the status; on REST for a 429 or
+ * a 403 that says so, sends retry-after or has no calls left. `rateLimitResetAt` is when REST says the limit lifts: retry-after seconds from now, else x-ratelimit-reset.
  */
 export class GitHubError extends Error {
   readonly path: string;
   readonly status?: number;
+  readonly rateLimited: boolean;
   readonly rateLimitResetAt?: Date;
-  constructor(message: string, path: string, details: { status?: number; rateLimitResetAt?: Date; cause?: unknown } = {}) {
+  constructor(message: string, path: string, details: { status?: number; rateLimited?: boolean; rateLimitResetAt?: Date; cause?: unknown } = {}) {
     super(message, details.cause === undefined ? undefined : { cause: details.cause });
     this.name = 'GitHubError';
     this.path = path;
     if (details.status !== undefined) this.status = details.status;
+    this.rateLimited = details.rateLimited ?? details.rateLimitResetAt !== undefined; // a reset time only exists for a rate limit
     if (details.rateLimitResetAt !== undefined) this.rateLimitResetAt = details.rateLimitResetAt;
   }
 }
@@ -36,6 +40,8 @@ const MAX_FILE_PAGES = 30;
 /** The first page of the tags listing already holds the newest stable tags; five pages reach back to about rust-v0.135 (55 stable tags on 2026-10-15). */
 const MAX_TAG_PAGES = 5;
 const STABLE_TAG = /^rust-v(\d+)\.(\d+)\.(\d+)$/;
+/** How GitHub words a rate limit: "API rate limit exceeded", "You have exceeded a secondary rate limit", "You have triggered an abuse detection mechanism". */
+const RATE_LIMIT_TEXT = /rate limit|abuse detection/i;
 
 /**
  * The environment gh runs in. The Host inherits the user's login-shell variables and some of them wreck machine-readable output: CLICOLOR_FORCE or
@@ -84,21 +90,39 @@ function networkFailure(error: unknown, path: string, route: string, signal?: Ab
   return new GitHubError(`GitHub request for ${path} failed (${route}): ${reasonOf(error)}`, path, { cause: error });
 }
 
-/** GitHub error bodies carry a `message` (rate limit, not found, diff too large, ...); it is what tells a 403 from a 403. */
-async function errorDetail(response: Response): Promise<string> {
+/**
+ * The body of an error response. `detail` is GitHub's `message` as it goes into the error text (rate limit, not found, diff too large, ...: it is what tells a 403 from a 403).
+ * `text` is what is searched for rate-limit wording: that message, or the start of a body that is no GitHub error, such as a proxy's page.
+ */
+async function errorBody(response: Response): Promise<{ detail: string; text: string }> {
+  let raw: string;
+  try { raw = await response.text(); } catch { return { detail: '', text: '' }; }
   try {
-    const { message } = await response.json() as { message?: unknown };
-    return typeof message === 'string' && message ? `: ${message.slice(0, 200)}` : '';
-  } catch { return ''; }
+    const { message } = JSON.parse(raw) as { message?: unknown };
+    if (typeof message === 'string' && message) return { detail: `: ${message.slice(0, 200)}`, text: message };
+  } catch { /* no JSON object */ }
+  return { detail: '', text: raw.slice(0, 2000) };
 }
 
-/** The answer was an HTTP error. A 403 or 429 whose reset time is known (and whose calls are used up, when GitHub says how many are left) is a rate limit. */
+/**
+ * The answer was an HTTP error. A 429 is a rate limit; a 403 is one when its message says so, retry-after comes with it, no calls are left, or the reset time is known
+ * (GitHub's other 403s, permissions and blocked repositories, are not). The time to wait for is retry-after, seconds from now, else x-ratelimit-reset.
+ */
 async function httpFailure(response: Response, path: string): Promise<GitHubError> {
   const { status } = response;
-  const reset = Number(response.headers.get('x-ratelimit-reset'));
-  const remaining = response.headers.get('x-ratelimit-remaining');
-  const limited = (status === 403 || status === 429) && Number.isFinite(reset) && reset > 0 && (remaining === null || remaining === '0');
-  return new GitHubError(`GitHub HTTP ${status} for ${path}${await errorDetail(response)}`, path, { status, rateLimitResetAt: limited ? new Date(reset * 1000) : undefined });
+  const { detail, text } = await errorBody(response);
+  let rateLimited = false;
+  let rateLimitResetAt: Date | undefined;
+  if (status === 403 || status === 429) {
+    const retryAfter = response.headers.get('retry-after');
+    const remaining = response.headers.get('x-ratelimit-remaining');
+    const reset = Number(response.headers.get('x-ratelimit-reset'));
+    const seconds = retryAfter === null || retryAfter.trim() === '' ? Number.NaN : Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) rateLimitResetAt = new Date(Date.now() + seconds * 1000);
+    else if (Number.isFinite(reset) && reset > 0 && (remaining === null || remaining === '0')) rateLimitResetAt = new Date(reset * 1000);
+    rateLimited = status === 429 || retryAfter !== null || remaining === '0' || RATE_LIMIT_TEXT.test(text) || rateLimitResetAt !== undefined;
+  }
+  return new GitHubError(`GitHub HTTP ${status} for ${path}${detail}`, path, { status, rateLimited, rateLimitResetAt });
 }
 
 /** A gh command that exited with an error. gh words its failures in two styles, "(HTTP 404)" and "HTTP 404:", and says "release not found" or "Could not resolve to a PullRequest" without a status. */
@@ -109,9 +133,11 @@ function ghFailure(error: unknown, path: string): GitHubError {
   const code = /\bHTTP (\d{3})\b/.exec(text)?.[1];
   const status = code !== undefined ? Number(code) : /release not found|Could not resolve to a PullRequest/i.test(text) ? 404 : undefined;
   const line = (stderr.split('\n').map(l => l.trim()).find(Boolean) ?? message.split('\n')[0]!).slice(0, 300);
-  if (status === undefined) return new GitHubError(`GitHub request for ${path} failed (gh): ${line}`, path, { cause: error });
+  // GraphQL's primary rate limit is an HTTP 200 whose body carries the error, so gh prints no status for it: the wording is what says so
+  const rateLimited = status === 429 || RATE_LIMIT_TEXT.test(text);
+  if (status === undefined) return new GitHubError(`GitHub request for ${path} failed (gh): ${line}`, path, { rateLimited, cause: error });
   const detail = line.replace(/^gh:\s*/, '').replace(/\s*\(HTTP \d{3}\)\s*$/, '');
-  return new GitHubError(`GitHub HTTP ${status} for ${path}${detail ? `: ${detail}` : ''}`, path, { status, cause: error });
+  return new GitHubError(`GitHub HTTP ${status} for ${path}${detail ? `: ${detail}` : ''}`, path, { status, rateLimited, cause: error });
 }
 
 const versionOf = (tag: string): number[] => STABLE_TAG.exec(tag)!.slice(1).map(Number);

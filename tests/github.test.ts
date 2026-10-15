@@ -408,24 +408,105 @@ test('withEnv puts variables back exactly, deleting the ones that were not set',
 
 test('REST failures are GitHubErrors with status and path, and a rate limit carries its reset time', async () => {
   const reset = 1_790_000_000; // epoch seconds, as in the x-ratelimit-reset header
-  const fail = async (status: number, headers: Record<string, string> = {}) => {
-    const stub = stubFetch(() => new Response(JSON.stringify({ message: 'API rate limit exceeded for 203.0.113.9.' }), { status, headers }));
+  const fail = async (status: number, headers: Record<string, string> = {}, message = 'API rate limit exceeded for 203.0.113.9.') => {
+    const stub = stubFetch(() => new Response(JSON.stringify({ message }), { status, headers }));
     const error = await failure(new GitHubClient({ gh: null, fetch: stub.fetch }).stableTags(3));
     assert.ok(error instanceof GitHubError, String(error));
     assert.equal(error.name, 'GitHubError');
     assert.equal(error.status, status);
     assert.equal(error.path, 'repos/openai/codex/tags?per_page=100&page=1');
-    assert.match(error.message, new RegExp(`^GitHub HTTP ${status} for repos/openai/codex/tags\\?per_page=100&page=1: API rate limit exceeded`));
+    assert.equal(error.message, `GitHub HTTP ${status} for repos/openai/codex/tags?per_page=100&page=1: ${message}`);
     return error;
   };
   assert.equal((await fail(403, { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(reset) })).rateLimitResetAt?.getTime(), reset * 1000);
   assert.equal((await fail(403, { 'x-ratelimit-reset': String(reset) })).rateLimitResetAt?.getTime(), reset * 1000, 'the reset header alone is taken at its word');
   assert.equal((await fail(429, { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(reset) })).rateLimitResetAt?.getTime(), reset * 1000);
-  assert.equal((await fail(403, { 'x-ratelimit-remaining': '57', 'x-ratelimit-reset': String(reset) })).rateLimitResetAt, undefined, 'a 403 with calls to spare is a permission problem, not a rate limit');
+  const permission = await fail(403, { 'x-ratelimit-remaining': '57', 'x-ratelimit-reset': String(reset) }, 'Resource not accessible by integration');
+  assert.equal(permission.rateLimitResetAt, undefined, 'a 403 with calls to spare is a permission problem, not a rate limit');
+  assert.equal(permission.rateLimited, false);
   assert.equal((await fail(404, { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(reset) })).rateLimitResetAt, undefined);
-  assert.equal((await fail(403, { 'x-ratelimit-reset': 'soon' })).rateLimitResetAt, undefined);
+  assert.equal((await fail(403, { 'x-ratelimit-reset': 'soon' }, 'Forbidden')).rateLimitResetAt, undefined);
   assert.equal((await fail(403)).rateLimitResetAt, undefined);
   assert.equal((await fail(500)).status, 500);
+  const withDate = await fail(403, { 'x-ratelimit-reset': String(reset) }, 'Forbidden');
+  assert.ok(withDate.rateLimited, 'a reset time is only ever reported for a rate limit');
+});
+
+test('REST: a 403 or 429 is a rate limit when it says so, sends retry-after or has no calls left, and nothing else is', async () => {
+  const cases: Array<[string, number, string, Record<string, string>, boolean]> = [
+    ['primary limit, by its message', 403, 'API rate limit exceeded for 203.0.113.9. (But here is the good news: Authenticated requests get a higher rate limit.)', {}, true],
+    ['secondary limit, by its message', 403, 'You have exceeded a secondary rate limit. Please wait a few minutes before you try again.', {}, true],
+    ['abuse detection, by its message', 403, 'You have triggered an abuse detection mechanism. Please wait a few minutes before you try again.', {}, true],
+    ['wording in another case, as a proxy may put it', 403, 'Rate Limit Exceeded', {}, true],
+    ['by retry-after alone', 403, 'Forbidden', { 'retry-after': '30' }, true],
+    ['by having no calls left', 403, 'Forbidden', { 'x-ratelimit-remaining': '0' }, true],
+    ['a 429 is one by definition', 429, 'Too Many Requests', {}, true],
+    ['the message on a 429', 429, 'API rate limit exceeded', {}, true],
+    ['a permission problem', 403, 'Resource not accessible by integration', { 'x-ratelimit-remaining': '4980' }, false],
+    ['a blocked repository', 403, 'Repository access blocked', {}, false],
+    ['the wording on another status', 404, 'API rate limit exceeded', {}, false],
+    ['retry-after on a server error', 503, 'Service Unavailable', { 'retry-after': '30' }, false],
+    ['an ordinary 500', 500, 'Server Error', {}, false],
+  ];
+  for (const [name, status, message, headers, limited] of cases) {
+    const stub = stubFetch(() => new Response(JSON.stringify({ message }), { status, headers }));
+    const error = await failure(new GitHubClient({ gh: null, fetch: stub.fetch }).stableTags(1));
+    assert.ok(error instanceof GitHubError, name);
+    assert.equal(error.rateLimited, limited, name);
+  }
+  // a body that is not JSON (a proxy's page) is searched for the wording as it stands
+  const page = stubFetch(() => new Response('<html><body>This proxy says: API rate limit exceeded, slow down</body></html>', { status: 403 }));
+  const viaProxy = await failure(new GitHubClient({ gh: null, fetch: page.fetch }).stableTags(1));
+  assert.ok(viaProxy instanceof GitHubError && viaProxy.rateLimited);
+  assert.equal(viaProxy.message, 'GitHub HTTP 403 for repos/openai/codex/tags?per_page=100&page=1', 'no detail is taken from a page that is no GitHub error');
+  const plain = stubFetch(() => new Response('Forbidden', { status: 403 }));
+  assert.equal(((await failure(new GitHubClient({ gh: null, fetch: plain.fetch }).stableTags(1))) as GitHubError).rateLimited, false);
+  // an error response whose body breaks off is still an error response, with its status and whatever its headers say
+  const cut = stubFetch(() => new Response(new ReadableStream({ start(controller) { controller.error(new Error('socket hang up')); } }), { status: 429, headers: { 'retry-after': '10' } }));
+  const unreadable = await failure(new GitHubClient({ gh: null, fetch: cut.fetch }).stableTags(1));
+  assert.ok(unreadable instanceof GitHubError && unreadable.status === 429 && unreadable.rateLimited);
+  assert.equal(unreadable.message, 'GitHub HTTP 429 for repos/openai/codex/tags?per_page=100&page=1');
+});
+
+test('retry-after says how long to wait: the reset time is that many seconds from now, and it beats x-ratelimit-reset', async () => {
+  const fail = async (status: number, headers: Record<string, string>) => {
+    const stub = stubFetch(() => new Response(JSON.stringify({ message: 'Forbidden' }), { status, headers }));
+    const before = Date.now();
+    const error = await failure(new GitHubClient({ gh: null, fetch: stub.fetch }).stableTags(1));
+    const after = Date.now();
+    assert.ok(error instanceof GitHubError);
+    return { error, before, after };
+  };
+  const waits = async (status: number, headers: Record<string, string>, seconds: number) => {
+    const { error, before, after } = await fail(status, headers);
+    assert.equal(error.rateLimited, true);
+    const at = error.rateLimitResetAt!.getTime();
+    assert.ok(at >= before + seconds * 1000 && at <= after + seconds * 1000, `${at - before} ms after the start, expected ${seconds} s`);
+  };
+  await waits(403, { 'retry-after': '30' }, 30);
+  await waits(429, { 'retry-after': '120' }, 120);
+  await waits(403, { 'retry-after': '0' }, 0);
+  // a secondary limit still has calls left and an x-ratelimit-reset far away; retry-after is the instruction to follow
+  const farReset = String(Math.floor(Date.now() / 1000) + 3000);
+  await waits(403, { 'retry-after': '45', 'x-ratelimit-remaining': '4500', 'x-ratelimit-reset': farReset }, 45);
+  await waits(403, { 'retry-after': '45', 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': farReset }, 45);
+  // present but without a number of seconds: still a rate limit, but no time to report
+  for (const value of ['soon', '', '-5']) {
+    const { error } = await fail(403, { 'retry-after': value });
+    assert.equal(error.rateLimited, true, `retry-after: "${value}"`);
+    assert.equal(error.rateLimitResetAt, undefined, `retry-after: "${value}"`);
+  }
+  // retry-after on a status that is no rate limit is none of our business
+  const { error: unavailable } = await fail(503, { 'retry-after': '30' });
+  assert.equal(unavailable.rateLimited, false);
+  assert.equal(unavailable.rateLimitResetAt, undefined);
+});
+
+test('GitHubError says whether it is a rate limit, and a reset time implies it', () => {
+  assert.equal(new GitHubError('m', 'p').rateLimited, false);
+  assert.equal(new GitHubError('m', 'p', { rateLimited: true }).rateLimited, true);
+  assert.equal(new GitHubError('m', 'p', { rateLimitResetAt: new Date(0) }).rateLimited, true);
+  assert.equal(new GitHubError('m', 'p', { status: 403, rateLimited: false, rateLimitResetAt: new Date(0) }).rateLimited, false, 'an explicit answer wins');
 });
 
 test('gh failures are GitHubErrors too: the HTTP status comes out of stderr, and "not found" texts count as 404', async () => {
@@ -448,6 +529,7 @@ test('gh failures are GitHubErrors too: the HTTP status comes out of stderr, and
     assert.equal(error.path, path);
     assert.equal(error.cause, original);
     assert.equal(error.rateLimitResetAt, undefined, 'gh does not print the reset time');
+    assert.equal(error.rateLimited, /rate limit/i.test(stderr), stderr);
     assert.ok(!error.message.includes('Command failed'), `the message carries gh's own line, not the command line: ${error.message}`);
     if (status === undefined) assert.match(error.message, /^GitHub request for repos\/openai\/codex\/git\/trees\/rust-v0\.162\.1\?recursive=1 failed \(gh\): stream error/);
     else assert.ok(error.message.startsWith(`GitHub HTTP ${status} for ${path}`), error.message);
@@ -457,6 +539,47 @@ test('gh failures are GitHubErrors too: the HTTP status comes out of stderr, and
   const viaGh = await failure(new GitHubClient({ gh: async () => { throw notFound; } }).treePaths('rust-v0.162.1', () => true));
   const viaRest = await failure(new GitHubClient({ gh: null, fetch: rest.fetch }).treePaths('rust-v0.162.1', () => true));
   assert.equal((viaGh as Error).message, (viaRest as Error).message, 'the same failure reads the same on both paths');
+});
+
+test('gh rate limits are flagged by their wording whatever the status, and a GraphQL limit has no status at all', async () => {
+  const run = (stderr: string): GhRunner => async () => { throw Object.assign(new Error(`Command failed: gh\n${stderr}`), { code: 1, stderr }); };
+  // GraphQL reports its primary rate limit as an HTTP 200 with an error body, so gh prints no status
+  const graphql = 'GraphQL: API rate limit exceeded for user ID 12345. If you reach out to GitHub Support for help, please include the request ID ABCD:1234. (repository.pullRequest)\n';
+  const viaPull = await failure(new GitHubClient({ gh: run(graphql) }).pullRequest(7));
+  assert.ok(viaPull instanceof GitHubError);
+  assert.equal(viaPull.status, undefined);
+  assert.equal(viaPull.rateLimited, true);
+  assert.equal(viaPull.rateLimitResetAt, undefined);
+  assert.match(viaPull.message, /^GitHub request for repos\/openai\/codex\/pulls\/7 failed \(gh\): GraphQL: API rate limit exceeded/);
+  const viaRelease = await failure(new GitHubClient({ gh: run(graphql) }).release('rust-v0.162.0')); // not "no such release"
+  assert.ok(viaRelease instanceof GitHubError && viaRelease.rateLimited && viaRelease.status === undefined);
+
+  const cases: Array<[string, number | undefined, boolean]> = [
+    ['gh: API rate limit exceeded for user ID 1234. If you reach out to GitHub Support for help, please include the request ID ABCD:1234. (HTTP 403)', 403, true],
+    ['gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)', 403, true],
+    ['gh: You have triggered an abuse detection mechanism. Please wait a few minutes before you try again. (HTTP 403)', 403, true],
+    ['GraphQL: API rate limit already exceeded for user ID 12345.', undefined, true],
+    ['gh: Too Many Requests (HTTP 429)', 429, true],
+    ['gh: Resource not accessible by personal access token (HTTP 403)', 403, false],
+    ['gh: Not Found (HTTP 404)', 404, false],
+    ['release not found', 404, false],
+    ['gh: Bad credentials (HTTP 401)', 401, false],
+    ['stream error: stream ID 1; CANCEL; received from peer', undefined, false],
+  ];
+  for (const [stderr, status, limited] of cases) {
+    const error = await failure(new GitHubClient({ gh: run(`${stderr}\n`) }).treePaths('rust-v0.162.1', () => true));
+    assert.ok(error instanceof GitHubError, stderr);
+    assert.equal(error.status, status, stderr);
+    assert.equal(error.rateLimited, limited, stderr);
+  }
+  // wording in the command line that exec repeats in its message is not gh speaking
+  const original = Object.assign(new Error('Command failed: gh release view --repo openai/codex -- rate limit watch\ngh: Not Found (HTTP 404)\n'), { code: 1, stderr: 'gh: Not Found (HTTP 404)\n' });
+  const unrelated = await failure(new GitHubClient({ gh: async () => { throw original; } }).pullRequestDiff(3));
+  assert.ok(unrelated instanceof GitHubError && !unrelated.rateLimited);
+  // a runner that only fills the message is read from the message
+  const messageOnly = Object.assign(new Error('API rate limit exceeded (HTTP 403)'), { code: 1 });
+  const fromMessage = await failure(new GitHubClient({ gh: async () => { throw messageOnly; } }).pullRequestDiff(3));
+  assert.ok(fromMessage instanceof GitHubError && fromMessage.rateLimited);
 });
 
 test('the command line in an exec error message does not decide the status; gh\'s own stderr does', async () => {
@@ -503,6 +626,7 @@ test('a REST request that never reaches GitHub names the path and the route, and
   assert.equal(error.message, 'GitHub request for repos/openai/codex/tags?per_page=100&page=1 failed (custom fetch): connect ECONNREFUSED 127.0.0.1:7897');
   assert.equal(error.cause, fetchFailed);
   assert.equal(error.status, undefined);
+  assert.equal(error.rateLimited, false);
   assert.equal(error.path, 'repos/openai/codex/tags?per_page=100&page=1');
 
   // Node's dual-stack connect errors are AggregateErrors with an empty message: the code says what happened
