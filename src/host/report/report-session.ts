@@ -52,7 +52,7 @@ function withoutFences(markdown: string): string {
   let fence: string | undefined;
   return markdown.split('\n').map(line => {
     if (fence === undefined) {
-      const open = /^ {0,3}(?:(`{3,})[^`]*|(~{3,}).*)$/.exec(line);
+      const open = /^ {0,3}(?:(`{3,})[^`]*$|(~{3,}))/.exec(line);
       fence = open?.[1] ?? open?.[2];
       return fence === undefined ? line : '';
     }
@@ -147,6 +147,34 @@ export interface ReportHost {
   subagents?: { waitForChildren(parent: LiveAgent): Promise<boolean> };
 }
 
+/**
+ * Reads an optional member of the host. Through a Cordis context, reading a service the plugin did not inject throws (`cannot get property
+ * "subagents" without inject`, although `'subagents' in ctx` is true); such a service counts as absent.
+ */
+function optional<T>(read: () => T): T | undefined {
+  try { return read(); } catch { return undefined; }
+}
+
+/** The members of a `ReportHost`, each read once when a run starts; every later use goes through these. */
+interface RunServices {
+  readonly controller: ReportHost['sessionController'];
+  readonly agents: ReportHost['agents'];
+  readonly defaults: ReportHost['agentDefaultModel'];
+  readonly approval: ReportHost['approval'];
+  readonly subagents: ReportHost['subagents'];
+  readonly cancel: ((request: SessionCancelRequest) => unknown) | undefined;
+}
+function servicesOf(host: ReportHost): RunServices {
+  const controller = host.sessionController;
+  const cancel = optional(() => controller.cancel);
+  return {
+    controller, agents: host.agents,
+    defaults: optional(() => host.agentDefaultModel), approval: optional(() => host.approval), subagents: optional(() => host.subagents),
+    // Called on the object it was read from: through Cordis, that is what keeps the method's `this`.
+    cancel: cancel && (request => cancel.call(controller, request)),
+  };
+}
+
 export interface GenerateReportInput {
   candidate: Candidate;
   /** The absolute `<data>/reports/<id>` directory: the session's cwd, which holds `evidence/` and gets `report.md`. */
@@ -220,9 +248,8 @@ function promptFor(candidate: Candidate, mirror: string): string {
  */
 let modelSwitch: Promise<unknown> = Promise.resolve();
 
-async function selectReportModel(host: ReportHost, sessionId: SessionId, model: ModelRoute): Promise<void> {
-  const select = () => host.sessionController.selectModel({ sessionId, provider: model.provider, model: model.model });
-  const defaults = host.agentDefaultModel;
+async function selectReportModel({ controller, defaults }: RunServices, sessionId: SessionId, model: ModelRoute): Promise<void> {
+  const select = () => controller.selectModel({ sessionId, provider: model.provider, model: model.model });
   if (!defaults) { await select(); return; }
   const switched = modelSwitch.then(async () => {
     const previous = defaults.currentSelection();
@@ -271,7 +298,7 @@ function queued(agent: LiveAgent, requestId: SessionRequestId): boolean | undefi
  * and so does the agent's disappearance (`vanished`). An idle agent's progressing children are joined first (`subagents`): while they work,
  * the parent only looks idle. The join is cut short by the abort and by the deadline.
  */
-async function waitForReport(host: ReportHost, sessionId: SessionId, requestId: SessionRequestId, reportPath: string, input: GenerateReportInput): Promise<string> {
+async function waitForReport({ agents, subagents }: RunServices, sessionId: SessionId, requestId: SessionRequestId, reportPath: string, input: GenerateReportInput): Promise<string> {
   const { signal } = input;
   const deadline = Date.now() + (input.timeoutMs ?? TIMEOUT_MS);
   const idlePolls = input.idlePolls ?? IDLE_POLLS;
@@ -279,9 +306,9 @@ async function waitForReport(host: ReportHost, sessionId: SessionId, requestId: 
   for (;;) {
     // Not referenced, so a Host that shuts down without aborting is not kept alive by the wait.
     await sleep(input.pollMs ?? POLL_MS, undefined, { signal, ref: false });
-    const agent = host.agents.get(sessionId);
-    if (agent?.status === 'running') { started = true; idleInARow = 0; } else if (agent && host.subagents
-      && await within(host.subagents.waitForChildren(agent).catch(() => false), deadline - Date.now(), false, signal)) {
+    const agent = agents.get(sessionId);
+    if (agent?.status === 'running') { started = true; idleInARow = 0; } else if (agent && subagents
+      && await within(subagents.waitForChildren(agent).catch(() => false), deadline - Date.now(), false, signal)) {
       idleInARow = 0;
     } else {
       if (agent && queued(agent, requestId) === false) started = true;
@@ -300,13 +327,13 @@ async function waitForReport(host: ReportHost, sessionId: SessionId, requestId: 
  * run later and write over the report put back. Otherwise through the controller, which aborts the active turn only. Errors are ignored:
  * a session that is gone or idle is fine.
  */
-async function cancelRun(host: ReportHost, sessionId: SessionId): Promise<void> {
-  const agent = host.agents.get(sessionId);
+async function cancelRun({ agents, cancel }: RunServices, sessionId: SessionId): Promise<void> {
+  const agent = agents.get(sessionId);
   if (agent?.cancel && agent.inbox) {
     try { agent.cancel({ kind: 'user' }); } catch { /* best effort */ }
     try { agent.inbox.clear(); } catch { /* best effort */ }
-  } else if (host.sessionController.cancel) {
-    try { await host.sessionController.cancel({ sessionId }); } catch { return; }
+  } else if (cancel) {
+    try { await cancel({ sessionId }); } catch { return; }
   } else return;
   const idle = agent?.whenIdle?.();
   if (idle) await within(idle.catch(() => undefined), SETTLE_MS, undefined);
@@ -324,6 +351,8 @@ async function cancelRun(host: ReportHost, sessionId: SessionId): Promise<void> 
  */
 export async function generateReport(host: ReportHost, input: GenerateReportInput): Promise<ReportRecord> {
   const { candidate, reportDir, mirror, signal } = input;
+  const services = servicesOf(host);
+  const { controller } = services;
   check(isAbsolute(reportDir) && basename(reportDir) === candidate.id && basename(dirname(reportDir)) === 'reports', `reportDir must be an absolute <data>/reports/${candidate.id}`);
   check(isAbsolute(mirror), 'mirror must be an absolute path');
   const reportPath = join(reportDir, 'report.md'), backupPath = join(reportDir, 'report.prev.md');
@@ -331,23 +360,23 @@ export async function generateReport(host: ReportHost, input: GenerateReportInpu
   if (signal.aborted) throw new ReportSessionError('aborted', undefined, { cause: signal.reason });
   let sessionId: SessionId;
   try {
-    ({ sessionId } = await host.sessionController.create({ cwd: reportDir, ...(input.preset ? { agentPreset: input.preset } : {}) }));
+    ({ sessionId } = await controller.create({ cwd: reportDir, ...(input.preset ? { agentPreset: input.preset } : {}) }));
   } catch (error) {
     throw signal.aborted ? new ReportSessionError('aborted', undefined, { cause: signal.reason }) : new ReportSessionError('setup', undefined, { cause: error });
   }
   const requestId = randomUUID() as SessionRequestId;
   let setAsideEarlier = false;
   try {
-    await host.sessionController.rename({ sessionId, title: `OpenCodex 报告 · ${[...oneLine(candidate.title)].slice(0, TITLE_LIMIT).join('')}` });
-    await selectReportModel(host, sessionId, input.model);
-    const activation = await host.sessionController.resolveAgent(sessionId);
+    await controller.rename({ sessionId, title: `OpenCodex 报告 · ${[...oneLine(candidate.title)].slice(0, TITLE_LIMIT).join('')}` });
+    await selectReportModel(services, sessionId, input.model);
+    const activation = await controller.resolveAgent(sessionId);
     if ('error' in activation) throw activation.error;
     (input.sandbox ?? setSandboxMode)(activation.agent.session, 'workspace-write');
-    host.approval?.setPolicy(activation.agent, 'never');
+    services.approval?.setPolicy(activation.agent, 'never');
     signal.throwIfAborted();
     setAsideEarlier = await setAside(reportPath, backupPath);
-    await host.sessionController.prompt({ sessionId, requestId, mode: 'queue', content: [{ type: 'text', text: promptFor(candidate, mirror) }] }, signal);
-    const markdown = await waitForReport(host, sessionId, requestId, reportPath, input);
+    await controller.prompt({ sessionId, requestId, mode: 'queue', content: [{ type: 'text', text: promptFor(candidate, mirror) }] }, signal);
+    const markdown = await waitForReport(services, sessionId, requestId, reportPath, input);
     const checks = await checkReport(markdown, mirror);
     await rm(backupPath, { force: true }).catch(() => undefined);
     // ReportRecord.path is relative to the data directory, and reportDir is <data>/reports/<id>.
@@ -356,7 +385,7 @@ export async function generateReport(host: ReportHost, input: GenerateReportInpu
     const failure = error instanceof ReportSessionError ? error
       : signal.aborted ? new ReportSessionError('aborted', sessionId, { cause: signal.reason })
       : new ReportSessionError('setup', sessionId, { cause: error });
-    if (failure.reason === 'timeout' || failure.reason === 'aborted' || failure.reason === 'idle') await cancelRun(host, sessionId);
+    if (failure.reason === 'timeout' || failure.reason === 'aborted' || failure.reason === 'idle') await cancelRun(services, sessionId);
     // Put the earlier report back over whatever the run left; if that fails, it stays in report.prev.md.
     if (setAsideEarlier) await rename(backupPath, reportPath).catch(() => undefined);
     throw failure;

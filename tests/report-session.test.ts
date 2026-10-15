@@ -101,6 +101,8 @@ interface FakeOptions {
   onSelectModel?: () => void;
   /** Runs inside `prompt`, after the request is recorded: the agent's work. */
   onPrompt?: () => Promise<void>;
+  /** Members that throw when read, as a Cordis context does for a service the plugin did not inject. */
+  unreadable?: Array<'subagents' | 'agentDefaultModel' | 'approval' | 'cancel'>;
 }
 /** A host that records every call, as plain objects, with no DSH process behind it. */
 function fakeHost(options: FakeOptions = {}) {
@@ -110,7 +112,12 @@ function fakeHost(options: FakeOptions = {}) {
   const seen: {
     create?: SessionCreateRequest; rename?: SessionRenameRequest; selectModel?: SessionSelectModelRequest; resolveAgent?: string;
     prompt?: SessionPromptRequest; promptSignal?: AbortSignal; polledIds: string[]; cancelled: string[]; policies: Array<[unknown, string]>;
-  } = { polledIds: [], cancelled: [], policies: [] };
+    /** Reads of the members defined by getters below. */
+    reads: Record<string, number>;
+  } = { polledIds: [], cancelled: [], policies: [], reads: {} };
+  const getter = (target: object, name: string, value: () => unknown) => Object.defineProperty(target, name, {
+    enumerable: true, configurable: true, get: () => { seen.reads[name] = (seen.reads[name] ?? 0) + 1; return value(); },
+  });
   const statuses = [...options.statuses ?? []];
   const host: ReportHost = {
     sessionController: {
@@ -129,7 +136,11 @@ function fakeHost(options: FakeOptions = {}) {
         await options.onPrompt?.();
         return { accepted: true };
       },
-      cancel(request) { calls.push('cancel'); seen.cancelled.push(request.sessionId); return { accepted: true }; },
+      cancel(request) {
+        // DSH's cancel uses `this`; through Cordis a call off its controller loses it.
+        if (this !== host.sessionController) throw new Error('cancel called without its controller');
+        calls.push('cancel'); seen.cancelled.push(request.sessionId); return { accepted: true };
+      },
     },
     agents: {
       get(sessionId) {
@@ -147,10 +158,10 @@ function fakeHost(options: FakeOptions = {}) {
   const { defaults } = options;
   // As through a Cordis context, every read of the service gives a new object.
   if (defaults) {
-    Object.defineProperty(host, 'agentDefaultModel', {
-      enumerable: true,
-      get: () => ({ currentSelection: () => defaults.currentSelection(), saveSelection: (next: ModelSelection) => defaults.saveSelection(next) }),
-    });
+    getter(host, 'agentDefaultModel', () => ({ currentSelection: () => defaults.currentSelection(), saveSelection: (next: ModelSelection) => defaults.saveSelection(next) }));
+  }
+  for (const name of options.unreadable ?? []) {
+    getter(name === 'cancel' ? host.sessionController : host, name, () => { throw new Error(`cannot get property "${name}" without inject`); });
   }
   return { host, calls, seen, agent, live };
 }
@@ -218,6 +229,9 @@ test('checkReport leaves fenced code blocks out of headings and references', asy
     // Three backticks with another backtick on the line are inline code, not the start of a block.
     const inline = reportWith('- `packages/x/src/a.ts:1` 有\n```rg -n x packages/x/src/a.ts:2``` 是行内代码\n- `packages/x/src/a.ts:3` 有');
     assert.deepEqual(await checkReport(inline, mirror), { requiredSections: true, dshRefsTotal: 3, dshRefsResolved: 3 });
+    // Windows line ends: a tilde fence still opens on a line ending in \r.
+    const crlf = reportWith(['- `packages/x/src/a.ts:1` 有', '~~~text', '# comment', '~~~', '- `packages/x/src/a.ts:2` 有'].join('\n')).replace(/\n/g, '\r\n');
+    assert.deepEqual(await checkReport(crlf, mirror), { requiredSections: true, dshRefsTotal: 2, dshRefsResolved: 2 });
   });
 });
 
@@ -257,6 +271,7 @@ test('generateReport prompts one analyst session and checks the report it writes
     assert.match(seen.rename?.title ?? '', /^OpenCodex 报告 · Partial answers and \$skill mentions/);
     assert.deepEqual(seen.selectModel, { sessionId: 's-1', provider: 'deepseek-official', model: 'deepseek-v4-pro' });
     assert.deepEqual(defaults.saved, [model, flash], 'the default model selectModel saved is put back');
+    assert.equal(seen.reads.agentDefaultModel, 1, 'read once for the run');
     assert.deepEqual(defaults.current, flash);
     assert.equal(seen.resolveAgent, 's-1');
     assert.equal(sandboxed.length, 1);
@@ -483,6 +498,42 @@ test('generateReport first puts back a report.prev.md that a stopped run left wi
     await assert.rejects(generateReport(refused.host, inputFor(dirs)), (error: unknown) => isReportSessionError(error) && error.reason === 'setup');
     assert.equal(await readFile(reportPath, 'utf8'), '# 上一次的报告\n');
     assert.equal(await readFile(backupPath, 'utf8'), '# 更早的报告\n');
+  });
+});
+
+test('generateReport takes a service that throws when read, as Cordis does without inject, for an absent one, and reads it once', async () => {
+  await withDirs(async dirs => {
+    const written = reportWith('- `packages/x/src/a.ts:2` 有');
+    const fine = fakeHost({
+      statuses: ['running', 'running'], unreadable: ['subagents', 'approval', 'cancel'],
+      onPrompt: () => writeFile(join(dirs.reportDir, 'report.md'), written),
+    });
+    const record = await generateReport(fine.host, inputFor(dirs));
+    assert.deepEqual(record.checks, { requiredSections: true, dshRefsTotal: 1, dshRefsResolved: 1 });
+    assert.deepEqual(fine.seen.reads, { subagents: 1, approval: 1, cancel: 1 });
+    assert.deepEqual(fine.seen.policies, []);
+    assert.equal(await readFile(join(dirs.reportDir, 'report.md'), 'utf8'), written, 'the new report stays');
+
+    // A run that fails still fails for its own reason, without the cancel it cannot read.
+    const idle = fakeHost({ unreadable: ['subagents', 'approval', 'cancel'] });
+    await assert.rejects(generateReport(idle.host, inputFor(dirs, { timeoutMs: 50 })), (error: unknown) => isReportSessionError(error) && error.reason === 'timeout');
+    assert.deepEqual(idle.seen.reads, { subagents: 1, approval: 1, cancel: 1 });
+    assert.equal(await readFile(join(dirs.reportDir, 'report.md'), 'utf8'), written, 'the report before the failed run is back');
+  });
+});
+
+test('generateReport neither restores the default model nor fails when agentDefaultModel throws when read', async () => {
+  await withDirs(async dirs => {
+    const defaults = fakeDefaults(flash);
+    const { host, seen } = fakeHost({
+      defaults, unreadable: ['agentDefaultModel'],
+      onPrompt: () => writeFile(join(dirs.reportDir, 'report.md'), reportWith('- x')),
+    });
+    const record = await generateReport(host, inputFor(dirs));
+    assert.equal(record.checks.requiredSections, true);
+    assert.equal(seen.reads.agentDefaultModel, 1);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.deepEqual(defaults.saved, [model], 'only the save selectModel makes itself; no restore');
   });
 });
 
