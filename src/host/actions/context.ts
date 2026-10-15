@@ -59,6 +59,8 @@ export interface HostContext {
   readonly fetcher?: typeof fetch;
   /** How often a report session is polled (tests); 3 seconds by default. */
   readonly reportPollMs?: number;
+  /** The waits before each further try of a classification batch that broke off on the connection. */
+  readonly classifyRetryDelaysMs: readonly number[];
   /** The DSH index, once one is loaded or built. */
   index?: DshIndex;
   /** The last check this process ran, and when it ended (ISO); a check that failed is recorded with an `errors` line. */

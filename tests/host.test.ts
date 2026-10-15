@@ -222,6 +222,8 @@ interface FixtureOptions {
   llm?: ReturnType<typeof fakeLlm>;
   feed?: typeof fetch;
   timeouts?: Dependencies['timeouts'];
+  /** 1 ms twice by default, so a retried classification does not wait 25 seconds. */
+  classifyRetryDelaysMs?: number[];
 }
 /**
  * An OpenCodex Host loaded as a Cordis plugin (`ctx.plugin`, so `inject` is enforced as in DSH) on a fresh context that provides every
@@ -245,7 +247,7 @@ async function fixture(options: FixtureOptions = {}) {
   const timers = fakeTimers();
   const fiber = ctx.plugin(hostWith({
     github: new GitHubClient({ gh: options.gh ?? codexGh() }), fetcher: options.feed ?? serve(FEED), now: () => NOW, timers: timers.timers, reportPollMs: 2,
-    ...(options.timeouts && { timeouts: options.timeouts }),
+    classifyRetryDelaysMs: options.classifyRetryDelaysMs ?? [1, 1], ...(options.timeouts && { timeouts: options.timeouts }),
   }) as never, { dataDirectory: directory } as never);
   const remove = () => rm(directory, { recursive: true, force: true });
   try { await fiber.await(); } catch (error) { await fiber.dispose(); throw error; }
@@ -358,6 +360,52 @@ test('classification runs every batch, saves what it got and reports failed batc
     assert.equal(last.candidates.filter(candidate => candidate.classification).length, 31);
     assert.equal(llm.requests.length, 5);
     assert.deepEqual([...new Set(last.candidates.map(candidate => candidate.status))], ['new'], 'classification never moves a status');
+  } finally { await f.close(); }
+});
+
+/** A model finish that broke off on the connection, as DSH's DeepSeek adapter reports it. */
+const transport = (failure: Partial<{ status: number; requestId: string }> = {}): Answer =>
+  () => ({ kind: 'error', failure: { code: 'TRANSPORT', message: 'DeepSeek Messages transport failed', ...failure } }) as FinishReason;
+
+test('a classification batch that broke off on the connection is tried again', async () => {
+  const llm = fakeLlm([transport(), transport(), classifyAll]);
+  const f = await fixture({ llm });
+  try {
+    await seed(f.store, 'pr:50148');
+    // The action rejects on any problem line, so resolving means none.
+    const response = await f.call({ action: 'classify' });
+    assert.equal(response.candidates.filter(candidate => candidate.classification).length, 1);
+    assert.equal(llm.requests.length, 3);
+  } finally { await f.close(); }
+});
+
+test('a classification failure off the connection is not tried again, and one that keeps failing shows its cause', async () => {
+  const llm = fakeLlm([
+    () => ({ kind: 'error', failure: { code: 'RATE_LIMITED', message: 'slow down' } }),
+    transport({ status: 502, requestId: 'req-7' }), transport({ status: 502, requestId: 'req-7' }), transport({ status: 502, requestId: 'req-7' }),
+  ]);
+  const f = await fixture({ llm });
+  try {
+    await seed(f.store, 'pr:50148');
+    await assert.rejects(f.call({ action: 'classify' }), /batch 1 of 1 failed, so its 1 candidates stay unclassified: classify: model finished with error RATE_LIMITED: slow down$/);
+    assert.equal(llm.requests.length, 1, 'a refusal is not a dropped connection');
+    await assert.rejects(f.call({ action: 'classify' }),
+      /batch 1 of 1 failed \(3 tries\), so its 1 candidates stay unclassified: classify: model finished with error TRANSPORT: DeepSeek Messages transport failed ← HTTP 502 ← request req-7$/);
+    assert.equal(llm.requests.length, 4);
+  } finally { await f.close(); }
+});
+
+test('the wait before another classification try ends at an unload', async () => {
+  const llm = fakeLlm([transport()]);
+  const f = await fixture({ llm, classifyRetryDelaysMs: [60_000] });
+  try {
+    await seed(f.store, 'pr:50148');
+    const classifying = f.call({ action: 'classify' });
+    await until(() => llm.requests.length === 1, 'the first try');
+    const unloading = Date.now();
+    await f.unload();
+    await assert.rejects(classifying, { name: 'AbortError' });
+    assert.ok(Date.now() - unloading < 5_000, 'the minute-long wait did not hold the unload');
   } finally { await f.close(); }
 });
 

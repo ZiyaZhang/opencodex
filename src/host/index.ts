@@ -43,6 +43,8 @@ export interface Dependencies {
   reportPollMs?: number;
   /** In ms: a check, a `classify` action and the GitHub part of a report; 30, 15 and 10 minutes by default. */
   timeouts?: Partial<HostContext['timeouts']>;
+  /** The waits before each further try of a classification batch that broke off on the connection; 5 and 20 seconds by default. */
+  classifyRetryDelaysMs?: number[];
 }
 declare module '@deepseek-ai/cordis' { interface Context { opencodex: OpenCodex } }
 
@@ -50,6 +52,7 @@ const HOUR = 3_600_000;
 /** The first check waits this long, so it does not compete with DSH starting up. */
 const FIRST_CHECK_DELAY_MS = 60_000;
 const TIMEOUTS: HostContext['timeouts'] = { check: 30 * 60_000, classify: 15 * 60_000, github: 10 * 60_000 };
+const CLASSIFY_RETRY_DELAYS_MS = [5_000, 20_000];
 const NODE_TIMERS: Timers = { set: (run, ms) => setTimeout(run, ms).unref(), clear: handle => clearTimeout(handle as NodeJS.Timeout) };
 
 /**
@@ -138,6 +141,7 @@ export default class OpenCodex extends TypertRemoteService {
       setSettings: next => { settings = next; this.rearm(host); },
       github: () => deps.github ?? new GitHubClient(),
       fetcher: deps.fetcher, reportPollMs: deps.reportPollMs, timeouts: { ...TIMEOUTS, ...deps.timeouts },
+      classifyRetryDelaysMs: deps.classifyRetryDelaysMs ?? CLASSIFY_RETRY_DELAYS_MS,
       index: await loadIndex(this.directory),
       busy: new Map(), running: new Map(), reportsRunning: 0,
       lanes: { settings: new Lane(), reports: new Lane(), classify: new Lane(), index: new Lane() },
