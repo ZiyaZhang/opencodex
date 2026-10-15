@@ -43,6 +43,8 @@ export interface Job {
   foreground?: ForegroundRequest; artifactId?: string; installedReceipt?: string;
   installation?: PluginInstallation;
   acceptance?: AcceptanceRun;
+  /** Automatic is the default; manual must be explicitly selected before paid work. */
+  acceptanceMode?: 'automatic' | 'manual';
   coverage?: { specId: string; confirmedAt: string; reason: string };
 }
 export interface Candidate {
@@ -88,6 +90,8 @@ export interface TokenReservation {
   requestId: string; jobId: string; reservedTokens: number; reservedAt: string;
   status: 'inflight' | 'settled' | 'unknown'; usage?: TokenUsage; settledAt?: string;
   unknownReason?: string;
+  /** Durable admission phase; old records are resolved against job history. */
+  phase?: JobStatus;
 }
 export interface TokenSummary {
   confirmedTokens: number; reservedTokens: number; unknownRequests: number; remainingTokens: number;

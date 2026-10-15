@@ -27,7 +27,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build",
+    "test": "node --test tests/*.test.mjs",
     "package": "npm run build && npm pack --ignore-scripts --pack-destination release",
     "prepack": "npm run build"
   },

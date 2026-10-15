@@ -91,9 +91,10 @@ export function validateState(value: unknown): asserts value is StoreState {
   check(s.schemaVersion === 1, 'Unsupported OpenCodex state version'); isoDate(s.createdAt, 'createdAt'); isoDate(s.updatedAt, 'updatedAt'); validateSettings(s.settings);
   if (s.capabilities !== null) validateCapabilities(s.capabilities);
   for (const raw of list(s.jobs, 'jobs')) {
-    const j = object(raw, 'job', ['id', 'title', 'description', 'source', 'mode', 'status', 'createdAt', 'updatedAt', 'budget', 'elapsedMs', 'activeSince', 'repairRounds', 'history', 'budgetHistory', 'sessionIds', 'sessionBindings'], ['candidateId', 'sessionId', 'executionSessionId', 'workdir', 'foreground', 'artifactId', 'installedReceipt', 'installation', 'coverage', 'acceptance']);
+    const j = object(raw, 'job', ['id', 'title', 'description', 'source', 'mode', 'status', 'createdAt', 'updatedAt', 'budget', 'elapsedMs', 'activeSince', 'repairRounds', 'history', 'budgetHistory', 'sessionIds', 'sessionBindings'], ['candidateId', 'sessionId', 'executionSessionId', 'workdir', 'foreground', 'artifactId', 'installedReceipt', 'installation', 'coverage', 'acceptance', 'acceptanceMode']);
     idDates(j, true); textValue(j.title, 'title'); textValue(j.description, 'description', true); enumeration(j.source, ['user', 'discovery'], 'source'); enumeration(j.status, JOB_STATUSES, 'status'); budget(j.budget);
     enumeration(j.mode, ['reconstruct', 'investigate'], 'job mode');
+    if (j.acceptanceMode !== undefined) enumeration(j.acceptanceMode, ['automatic', 'manual'], 'acceptance mode');
     if (j.mode === 'investigate') check(!['building', 'verifying', 'ready', 'covered', 'installed'].includes(j.status as string), 'Investigation jobs cannot reconstruct or install plugins');
     count(j.elapsedMs, 'elapsedMs'); count(j.repairRounds, 'repairRounds'); if (j.activeSince !== null) isoDate(j.activeSince, 'activeSince');
     check((j.activeSince !== null) === ['researching', 'specifying', 'building', 'verifying'].includes(j.status as string), 'Job activity clock disagrees with state');
@@ -199,7 +200,8 @@ export function validateState(value: unknown): asserts value is StoreState {
     if (v.screenshotIds !== undefined) { const ids = strings(v.screenshotIds, 'screenshotIds'); check(new Set(ids).size === ids.length, 'Duplicate verification screenshot'); }
   }
   for (const raw of list(s.reservations, 'reservations')) {
-    const r = object(raw, 'reservation', ['requestId', 'jobId', 'reservedTokens', 'reservedAt', 'status'], ['usage', 'settledAt', 'unknownReason']); textValue(r.requestId, 'requestId'); textValue(r.jobId, 'jobId'); count(r.reservedTokens, 'reservedTokens', 1); isoDate(r.reservedAt, 'reservedAt'); enumeration(r.status, ['inflight', 'settled', 'unknown'], 'reservation status');
+    const r = object(raw, 'reservation', ['requestId', 'jobId', 'reservedTokens', 'reservedAt', 'status'], ['usage', 'settledAt', 'unknownReason', 'phase']); textValue(r.requestId, 'requestId'); textValue(r.jobId, 'jobId'); count(r.reservedTokens, 'reservedTokens', 1); isoDate(r.reservedAt, 'reservedAt'); enumeration(r.status, ['inflight', 'settled', 'unknown'], 'reservation status');
+    if (r.phase !== undefined) enumeration(r.phase, JOB_STATUSES, 'reservation phase');
     if (r.status === 'settled') {
       const u = object(r.usage, 'usage', ['inputTokens', 'outputTokens']); count(u.inputTokens, 'inputTokens'); count(u.outputTokens, 'outputTokens'); count((u.inputTokens as number) + (u.outputTokens as number), 'usage total'); isoDate(r.settledAt, 'settledAt'); check(r.unknownReason === undefined, 'Settled usage cannot be unknown');
     } else { check(r.usage === undefined && r.settledAt === undefined, 'Unsettled request cannot contain settled usage'); if (r.status === 'unknown') textValue(r.unknownReason, 'unknownReason'); }

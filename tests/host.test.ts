@@ -19,7 +19,7 @@ const PNG_REFERENCE = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42
 const WEBP_REFERENCE = 'UklGRhoAAABXRUJQVlA4TA0AAAAvAAAAEAcQERGIiP4HAA==';
 const JPEG_REFERENCE = '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD3+iiigD//2Q==';
 
-async function fixture(sandbox = true, existingDirectory?: string) {
+async function fixture(sandbox = true, existingDirectory?: string, automaticAcceptance = false) {
   const directory = existingDirectory ?? await mkdtemp(join(tmpdir(), 'opencodex-host-'));
   const ctx = new Context();
   const tools = new Map<string, ToolDefinition>();
@@ -37,7 +37,7 @@ async function fixture(sandbox = true, existingDirectory?: string) {
       createCount++;
       const sessionId = SessionId(`research-${createCount}`);
       const session = { id: sessionId, header: { cwd }, mode: '', append(_type: string, data: { mode: string }) { this.mode = data.mode; } };
-      sessions.set(sessionId, session); agents.set(sessionId, { session, cancel() { cancels++; }, async whenIdle() {} });
+      sessions.set(sessionId, session); agents.set(sessionId, { session, ctx: { tools: { restrict() { return () => {}; } } }, cancel() { cancels++; }, async whenIdle() {} } as never);
       return { sessionId };
     },
     async rename() {},
@@ -49,7 +49,7 @@ async function fixture(sandbox = true, existingDirectory?: string) {
     ctx.provide('sandboxPolicy', { resolve: ({ session }: { session: { header: { cwd: string }; mode: string } }) => ({ mode: session.mode, workspaceRoot: session.header.cwd }) } as never);
   }
   const plugin = new OpenCodex(ctx, { dataDirectory: directory, monitorTickMs: 1000, automaticVerification: false }, { fetch: (...args) => globalThis.fetch(...args) });
-  const call = (request: OpenCodexRequest) => plugin.call(request, new AbortController().signal);
+  const call = (request: OpenCodexRequest) => plugin.call(request.action === 'start' && !automaticAcceptance ? { acceptanceMode: 'manual', ...request } : request, new AbortController().signal);
   const close = async () => { await ctx.fiber.dispose(); if (!existingDirectory) await rm(directory, { recursive: true, force: true }); };
   return { plugin, ctx, call, tools, descriptors, sessions, agents, prompts, counts: () => ({ createCount, cancels }), directory, close };
 }
@@ -131,6 +131,22 @@ test('manual research starts one ordinary DSH session in a confined workdir and 
   } finally { await f.close(); }
 });
 
+test('automatic delivery without a verifier fails before session creation or model spending', async () => {
+  const f = await fixture(true, undefined, true);
+  try {
+    const made = await f.call({ action: 'create', input: { title: 'Requires real feature acceptance' } });
+    const id = made.state.jobs[0]!.id;
+    await assert.rejects(f.call({ action: 'start', jobId: id }), /独立功能验收器/);
+    assert.equal(f.counts().createCount, 0);
+    assert.equal(f.prompts.length, 0);
+    assert.equal((await f.call({ action: 'snapshot' })).state.reservations.length, 0);
+    await f.call({ action: 'start', jobId: id, acceptanceMode: 'manual' });
+    assert.equal(f.prompts.length, 1);
+    assert.equal((await f.call({ action: 'snapshot' })).state.jobs[0]!.acceptanceMode, 'manual');
+    assert.match(JSON.stringify(f.prompts[0]), /manualAcceptance/);
+  } finally { await f.close(); }
+});
+
 test('fresh continuation retains ledger, SDK evidence, code, prior guidance and session ownership', async () => {
   const f = await fixture();
   try {
@@ -146,7 +162,7 @@ test('fresh continuation retains ledger, SDK evidence, code, prior guidance and 
     const execute = async () => JSON.parse((await tool.execute({ action: 'sdk', payload: { package: '@deepseek-ai/dsh-api-session-controller' } }, { signal: new AbortController().signal, agent: f.agents.get('research-1') } as never) as { result: string }).result);
     const first = await execute(), repeat = await execute();
     assert.equal(first.evidenceId, repeat.evidenceId);
-    assert.equal(store.snapshot().evidence.length, 1);
+    assert.equal(store.snapshot().evidence.filter(e => e.localPath?.includes('/sdk/')).length, 1);
     const retained = await readFile(join(workdir, first.savedView), 'utf8');
     assert.match(retained, /\nexport (?:declare|type)/);
     assert.ok(retained.includes(first.content), 'Retained declarations preserve real lines instead of an escaped JSON string');
@@ -252,7 +268,7 @@ for (const phase of ['researching', 'specifying', 'building'] as const) {
       assert.match(after.history.at(-1)!.reason, /single-call output token limit.*OpenCodex maxOutputTokens/);
       assert.deepEqual(after.budget, before.budget);
       assert.equal(after.sessionId, before.sessionId);
-      assert.equal(store.snapshot().evidence[0]!.id, evidence.id);
+      assert.ok(store.snapshot().evidence.some(item => item.id === evidence.id));
       assert.equal(f.prompts.length, 1, 'the plugin must not automatically spend on a new turn');
       await f.call({ action: 'start', jobId: id });
       await setAgentStatus(f, 'research-1', 'running');
@@ -452,7 +468,7 @@ function meteredProvider(f: Awaited<ReturnType<typeof fixture>>) {
   } };
 }
 
-test('four research attempts including failed retries pause before the fifth; explicit resume resets the gate', async () => {
+test('research attempts include failed retries and cannot be reset by resume', async () => {
   const f = await fixture();
   try {
     const made = await f.call({ action: 'create', input: { title: 'Bounded investigation' } });
@@ -460,26 +476,25 @@ test('four research attempts including failed retries pause before the fifth; ex
     await f.call({ action: 'start', jobId: id });
     const provider = meteredProvider(f);
     provider.failNext();
-    for (let i = 0; i < 4; i++) await provider.request();
-    await assert.rejects(provider.request(), /4 model attempts without new dossier/);
+    for (let i = 0; i < 6; i++) await provider.request();
+    await assert.rejects(provider.request(), /Research attempt limit/);
     let state = (await f.call({ action: 'snapshot' })).state;
-    assert.equal(provider.dispatches(), 4);
+    assert.equal(provider.dispatches(), 6);
     assert.equal(state.jobs[0]!.status, 'paused');
-    assert.equal(state.reservations.length, 4);
+    assert.equal(state.reservations.length, 6);
     assert.equal(state.reservations[0]!.status, 'unknown');
     for (let i = 0; i < 6; i++) await provider.request('ordinary-unrelated-session');
-    assert.equal(provider.dispatches(), 10);
-    assert.equal((await f.call({ action: 'snapshot' })).state.reservations.length, 4);
+    assert.equal(provider.dispatches(), 12);
+    assert.equal((await f.call({ action: 'snapshot' })).state.reservations.length, 6);
     await f.call({ action: 'start', jobId: id, note: 'Preserve the unknown checkpoint before more reading.' });
-    for (let i = 0; i < 4; i++) await provider.request();
-    await assert.rejects(provider.request(), /4 model attempts without new dossier/);
+    await assert.rejects(provider.request(), /Research attempt limit/);
     state = (await f.call({ action: 'snapshot' })).state;
-    assert.equal(provider.dispatches(), 14);
-    assert.equal(state.jobs[0]!.history.filter(event => event.reason.includes('4 model attempts')).length, 2);
+    assert.equal(provider.dispatches(), 12);
+    assert.equal(state.jobs[0]!.history.filter(event => event.reason.includes('Research attempt limit')).length, 2);
   } finally { await f.close(); }
 });
 
-test('registered evidence and specifications reset research progress; building has no research gate', async () => {
+test('reading evidence does not reset research; a typed plan commits the build handoff', async () => {
   const f = await fixture();
   try {
     const made = await f.call({ action: 'create', input: { title: 'Persist findings before building' } });
@@ -489,13 +504,14 @@ test('registered evidence and specifications reset research progress; building h
     const execute = async (args: object) => JSON.parse((await tool.execute(args, { signal: new AbortController().signal, agent: f.agents.get('research-1') } as never) as { result: string }).result);
     for (let i = 0; i < 4; i++) await provider.request();
     const evidence = await execute({ action: 'evidence', payload: { kind: 'observed', claim: 'Synthetic interface fixture exposes a composer slot.', sourceUrl: 'https://example.com/fixture' } });
-    for (let i = 0; i < 4; i++) await provider.request();
-    await execute({ action: 'spec', payload: { title: 'Minimal composer extension', behavior: ['Retain input'], visual: ['Retain question'], lifecycle: ['Restore on unload'], existingCapabilities: [], gaps: ['Runtime proof pending'], evidenceIds: [evidence.id] } });
-    for (let i = 0; i < 4; i++) await provider.request();
-    await execute({ action: 'stage', payload: { status: 'specifying', reason: 'Minimal spec recorded' } });
-    await execute({ action: 'stage', payload: { status: 'building', reason: 'Implement the observed extension point' } });
+    assert.equal(evidence.researchAllowance.attempts, 4);
+    for (let i = 0; i < 2; i++) await provider.request();
+    const plan = { title: 'Minimal composer extension', behavior: ['Retain input'], visual: ['Retain question'], lifecycle: ['Restore on unload'], existingCapabilities: [], gaps: ['Runtime proof pending'], evidenceIds: [evidence.id] };
+    await f.tools.get('opencodex_submit_plan')!.execute(plan, { signal: new AbortController().signal, agent: f.agents.get('research-1') } as never);
+    await f.tools.get('opencodex_submit_plan')!.execute(plan, { signal: new AbortController().signal, agent: f.agents.get('research-1') } as never);
+    assert.equal((await f.call({ action: 'snapshot' })).state.specs.length, 1, 'delivery retry must not create a second specification');
     for (let i = 0; i < 6; i++) await provider.request();
-    assert.equal(provider.dispatches(), 18);
+    assert.equal(provider.dispatches(), 12);
     assert.equal((await f.call({ action: 'snapshot' })).state.jobs[0]!.status, 'building');
     const workdir = (await f.call({ action: 'snapshot' })).state.jobs[0]!.workdir!;
     await writeFile(join(workdir, 'feature.tgz'), fixtureTarball());
@@ -763,5 +779,35 @@ test('a failed public checkpoint cannot block an opted-in local version investig
     assert.equal(state.jobs[0]!.status, 'researching');
     assert.equal(f.prompts.length, 1);
     assert.equal(await readFile(join(f.directory, 'discovery.json'), 'utf8'), '{ malformed checkpoint', 'Failure is reported, not silently reset');
+  } finally { await f.close(); }
+});
+
+test('plan handoff ends its turn and automatically continues in a fresh budget-owned development session', async () => {
+  const f = await fixture();
+  try {
+    const made = await f.call({ action: 'create', input: { title: 'Phase handoff' } });
+    const id = made.state.jobs[0]!.id;
+    await f.call({ action: 'start', jobId: id, note: 'Retain the original target-access restriction.' });
+    const store = await (f.plugin as unknown as { store: Promise<OpenCodexStore> }).store;
+    await store.reserveTokens(id, { requestId: 'planner', reservedTokens: 1000 });
+    await store.reconcileUsage('planner', { inputTokens: 500, outputTokens: 100 });
+    await setAgentStatus(f, 'research-1', 'running');
+    const args = { title: 'Minimal plan', behavior: ['Keep the draft'], visual: ['Show both controls'], lifecycle: ['Restore on unload'], existingCapabilities: [], gaps: ['Independent UI check pending'], evidenceIds: [store.snapshot().evidence[0]!.id] };
+    const exec = { signal: new AbortController().signal, agent: f.agents.get('research-1') } as never;
+    const result = await f.ctx.waterfall('tools/execute', { name: 'opencodex_submit_plan', arguments: args, agent: f.agents.get('research-1'), signal: new AbortController().signal } as never, async () => ({ content: [], isError: false, value: await f.tools.get('opencodex_submit_plan')!.execute(args, exec) as { result: string } }));
+    assert.equal(result.concludesTurn, true);
+    assert.equal(f.prompts.length, 1, 'Do not create a second driver while the planner is active');
+    await endAgentTurn(f, 'research-1', 'completed');
+    await setAgentStatus(f, 'research-1', 'idle');
+    for (let i = 0; i < 100 && f.prompts.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 5));
+    const job = store.getJob(id);
+    assert.equal(f.prompts.length, 2);
+    assert.equal(job.status, 'building');
+    assert.equal(job.sessionId, 'research-1');
+    assert.equal(job.executionSessionId, 'research-2');
+    assert.equal(store.budgetSummary(id).job.confirmedTokens, 600);
+    assert.match(JSON.stringify(f.prompts[1]), /Retain the original target-access restriction/);
+    assert.match(JSON.stringify(f.prompts[1]), /Keep the draft/);
+    assert.doesNotMatch(JSON.stringify(f.prompts[1]), /<opencodex-entry-skill>/);
   } finally { await f.close(); }
 });

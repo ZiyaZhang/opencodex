@@ -381,6 +381,23 @@
       "sourceType": "standard-guidance",
       "checkedAt": "2026-10-13",
       "notes": "Read the combobox interaction pattern. Use where the session chooser actually behaves as a combobox; do not impose this role on unrelated UI."
+    },
+    {
+      "id": "codex-async-compaction",
+      "title": "Codex asynchronous compaction implementation",
+      "url": "https://github.com/openai/codex/blob/main/codex-rs/core/src/session/async_compaction.rs",
+      "topics": [
+        "runtime",
+        "compaction",
+        "source-analysis"
+      ],
+      "platforms": [
+        "cli",
+        "runtime"
+      ],
+      "sourceType": "public-source",
+      "checkedAt": "2026-10-15",
+      "notes": "Background candidate and provider capability checks inspected. This is source evidence, not proof of desktop/account availability. Pin the actual commit during feature research."
     }
   ]
 }

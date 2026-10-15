@@ -216,6 +216,7 @@ function JobDetail({ job, data, busy, run, call, back, openPlugin }: { job: Job;
   const resumeAcceptance = Boolean(job.artifactId && specs.length && [...job.history].reverse().find(event => ['paused', 'blocked', 'failed'].includes(event.to) && event.from && active.has(event.from))?.from === 'verifying');
   const [resumeNote, setResumeNote] = useState('');
   const [freshContext, setFreshContext] = useState(false);
+  const [acceptanceMode, setAcceptanceMode] = useState<'automatic' | 'manual'>(job.acceptanceMode ?? 'automatic');
   const [extraTokens, setExtraTokens] = useState(job.budget.tokenLimit + 50_000);
   const [extraMinutes, setExtraMinutes] = useState(job.budget.maxDurationMs / 60_000);
   const [extraRepairs, setExtraRepairs] = useState(job.budget.maxRepairRounds);
@@ -231,8 +232,9 @@ function JobDetail({ job, data, busy, run, call, back, openPlugin }: { job: Job;
     <p className="oc-muted">待结算请求保持预留；实际用量可能超过估算。在途请求结束后才结算。</p>
     {job.sessionId && !resumeAcceptance && ['paused', 'blocked', 'failed'].includes(job.status) && <label>继续研究的补充说明（可选）<textarea rows={2} maxLength={4000} value={resumeNote} onChange={event => setResumeNote(event.target.value)} placeholder="例如：已有接口证据足够，先实现最小插件并构建验证。" /></label>}
     {job.sessionId && !resumeAcceptance && ['paused', 'blocked', 'failed'].includes(job.status) && <label className="oc-checkbox" title="保留已有证据、代码、任务预算与消耗"><input type="checkbox" checked={freshContext} onChange={event => setFreshContext(event.target.checked)} />使用新会话继续</label>}
+    {job.mode === 'reconstruct' && ['detected', 'draft', 'paused', 'blocked', 'failed'].includes(job.status) && <label>验收方式<select value={acceptanceMode} onChange={event => setAcceptanceMode(event.target.value as 'automatic' | 'manual')}><option value="automatic">自动验收并安装</option><option value="manual">人工验收 · 先生成实验包</option></select></label>}
     <div className="oc-actions">
-      {['detected', 'draft', 'paused', 'blocked', 'failed'].includes(job.status) && <button className="oc-primary" disabled={busy} onClick={() => void run({ action: 'start', jobId: job.id, note: resumeNote.trim() || undefined, freshContext: !resumeAcceptance && freshContext })}><Icon name="play" />{resumeAcceptance ? '继续验收' : job.sessionId ? '继续研究' : '开始研究'}</button>}
+      {['detected', 'draft', 'paused', 'blocked', 'failed'].includes(job.status) && <button className="oc-primary" disabled={busy} onClick={() => void run({ action: 'start', jobId: job.id, note: resumeNote.trim() || undefined, freshContext: !resumeAcceptance && freshContext, acceptanceMode })}><Icon name="play" />{resumeAcceptance ? '继续验收' : job.sessionId ? '继续研究' : '开始研究'}</button>}
       {active.has(job.status) && <button disabled={busy} onClick={() => void run({ action: 'pause', jobId: job.id })}><Icon name="pause" />暂停</button>}
       {!['cancelled', 'installed', 'ready', 'covered', 'researched'].includes(job.status) && <button disabled={busy} onClick={() => void run({ action: 'cancel', jobId: job.id })}><Icon name="close" />取消任务</button>}
       {artifacts.some(item => item.kind === 'plugin') && <button disabled={busy} onClick={() => void run({ action: 'validateArtifact', jobId: job.id })}><Icon name="package" />检查插件包</button>}

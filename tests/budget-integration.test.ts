@@ -39,7 +39,7 @@ async function fixture(t: TestContext) {
   // Exercise the actual plugin's hooks through the real Cordis waterfall and
   // LlmRuntime adapter dispatch. Only session registry/provider I/O is synthetic.
   const host = Object.create(OpenCodex.prototype) as { installHooks(): void };
-  Object.assign(host, { ctx, store: Promise.resolve(store), acceptance: Promise.resolve({ cancel() {} }), maxOutputTokens: 4096, allowSubagents: true, researchProgress: new Map(), requestCalibrations: new Map() });
+  Object.assign(host, { ctx, store: Promise.resolve(store), acceptance: Promise.resolve({ cancel() {} }), maxOutputTokens: 4096, allowSubagents: true, pendingBuildHandoffs: new Set(), requestCalibrations: new Map() });
   host.installHooks();
   t.after(async () => { for (const dispose of disposers.reverse()) dispose(); await store.close(); await rm(directory, { recursive: true, force: true }); });
   const options = (sessionId: string | undefined = 'research-root', maxTokens = 256): GenerateOptions => ({ provider: 'test-fixture', model: 'fixture', messages: [{ role: 'user', content: [{ type: 'text', text: 'Research the composer interaction' }] }], maxTokens, ...(sessionId ? { sessionId: SessionId(sessionId) } : {}) });

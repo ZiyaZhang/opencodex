@@ -30,6 +30,7 @@ import { readPluginArtifact } from './plugin-download.js';
 import { PluginInstaller } from './plugin-install.js';
 import { AcceptanceController } from './acceptance.js';
 import { inspectJobSdk } from './sdk.js';
+import { developmentRecipe, executionBrief, executionPreflight, researchAdmissionError, researchAllowance, seedRequestEvidence } from './execution.js';
 
 export interface Config { dataDirectory?: string; maxOutputTokens?: number; monitorTickMs?: number; allowSubagents?: boolean; backgroundToolNames?: string[]; automaticVerification?: boolean }
 const ACTIVE = new Set<JobStatus>(['researching', 'specifying', 'building', 'verifying']);
@@ -48,10 +49,14 @@ declare module '@deepseek-ai/cordis' { interface Context { opencodex: OpenCodex 
 
 export default class OpenCodex extends TypertRemoteService {
   static inject = ['typert', 'sessionController', 'tools', 'llm', 'sessions', 'agents'];
+  readonly executionProtocolVersion = 3;
   readonly directory: string;
   readonly artifactRoot: string;
   private readonly resources = new ResourceReader(fileURLToPath(new URL('../../', import.meta.url)));
   private readonly requestCalibrations = new Map<string, BudgetCalibration>();
+  private readonly planningScopes = new Map<string, () => void>();
+  private readonly pendingBuildHandoffs = new Set<string>();
+  private readonly extraTools = new Map<string, Set<string>>();
   private readonly store: Promise<OpenCodexStore>;
   private readonly installer: Promise<PluginInstaller>;
   private readonly acceptance: Promise<AcceptanceController>;
@@ -59,7 +64,6 @@ export default class OpenCodex extends TypertRemoteService {
   private readonly versionMonitor: VersionMonitor;
   private readonly lifetime = new AbortController();
   private readonly jobOperations = new Map<string, Promise<unknown>>();
-  private readonly researchProgress = new Map<string, { signature: string; attempts: number }>();
   private readonly drivenSessions = new Set<string>();
   private readonly turnEndReasons = new Map<string, TurnEndReason['kind'] | 'disposed'>();
   private readonly maxOutputTokens: number;
@@ -78,6 +82,7 @@ export default class OpenCodex extends TypertRemoteService {
     this.allowSubagents = config.allowSubagents ?? false;
     this.automaticVerification = config.automaticVerification ?? true;
     this.discoveryFetch = dependencies.fetch;
+    ctx.effect(() => () => { for (const dispose of this.planningScopes.values()) dispose(); this.planningScopes.clear(); });
     if (config.backgroundToolNames !== undefined && (!Array.isArray(config.backgroundToolNames) || config.backgroundToolNames.some(name => typeof name !== 'string' || !name.trim()))) throw new Error('backgroundToolNames must be exact operator-verified tool names');
     this.backgroundToolNames = new Set(config.backgroundToolNames ?? []);
     if (!Number.isSafeInteger(this.maxOutputTokens) || this.maxOutputTokens < 256 || this.maxOutputTokens > 32768) throw new Error('maxOutputTokens must be an integer from 256 to 32768');
@@ -143,7 +148,10 @@ export default class OpenCodex extends TypertRemoteService {
         break;
       }
       case 'settings': await store.updateSettings(request.patch); await this.versionMonitor.configure(store.snapshot().settings.localVersionFile); break;
-      case 'start': await this.serial(text(request.jobId, 'jobId'), () => this.start(request.jobId, request.note, request.freshContext)); break;
+      case 'start': await this.serial(text(request.jobId, 'jobId'), async () => {
+        if (request.acceptanceMode !== undefined) await store.setAcceptanceMode(request.jobId, request.acceptanceMode);
+        await this.start(request.jobId, request.note, request.freshContext);
+      }); break;
       case 'pause': await this.serial(text(request.jobId, 'jobId'), () => this.stop(request.jobId, 'paused', 'Paused by user')); break;
       case 'cancel': await this.serial(text(request.jobId, 'jobId'), () => this.stop(request.jobId, 'cancelled', 'Cancelled by user')); break;
       case 'extendBudget': await store.extendBudget(text(request.jobId, 'jobId'), request.patch); break;
@@ -191,6 +199,7 @@ export default class OpenCodex extends TypertRemoteService {
     const checks = [
       { id: 'local-version', available: localVersion.selected && !localVersion.error, detail: localVersion.error ?? (localVersion.selected ? `Local version ${localVersion.version ?? 'baseline pending'}${localVersion.build ? ` (${localVersion.build})` : ''}; ${localVersion.watching ? 'watcher active' : 'periodic fallback'}` : 'Select a local version metadata file to enable immediate version checks') },
       { id: 'dsh-sessions', available: true, detail: 'Uses DSH sessionController and the configured main Agent' },
+      { id: 'execution-protocol', available: true, version: String(this.executionProtocolVersion), detail: 'Durable research limits, scoped planning tools, atomic plan handoff and acceptance preflight' },
       { id: 'plugin-manager', available: Boolean(this.ctx.get('pluginManager')), detail: 'Accepted generated bundles install and enable automatically through the current DSH profile plugin manager' },
       { id: 'feature-verifier', available: Boolean(this.ctx.get('opencodexFeatureVerifier')), detail: this.ctx.get('opencodexFeatureVerifier') ? 'Independent feature verifier is registered; each specification obligation must be covered' : 'Native package lifecycle runs automatically. Behavior and visual comparison need a configured verifier or actual user acceptance; missing checks never pass automatically' },
       { id: 'workspace-sandbox', available: Boolean(this.ctx.get('sandbox') && this.ctx.get('sandboxPolicy')), detail: 'Research requires workspace-write confinement; no escalation is allowed' },
@@ -227,6 +236,8 @@ export default class OpenCodex extends TypertRemoteService {
     if (['ready', 'installed', 'covered', 'researched', 'cancelled'].includes(job.status)) throw new Error('This job cannot be started');
     if (job.foreground && !job.foreground.completedAt && !this.hasForegroundLease(job, store)) throw new Error('Start the queued foreground request explicitly');
     if (!this.ctx.get('sandbox') || !this.ctx.get('sandboxPolicy')) throw new Error('A DSH sandbox provider and sandboxPolicy are required before research starts');
+    const preflight = executionPreflight(job, this.automaticVerification && typeof this.ctx.get('opencodexFeatureVerifier')?.verify === 'function', typeof this.ctx.get('pluginManager')?.installBundle === 'function');
+    if (preflight.blockers.length) throw new Error(preflight.blockers.join('\n'));
     const resuming = ['paused', 'blocked', 'failed'].includes(job.status);
     const previousPhase = resuming ? [...job.history].reverse().find(event => ['paused', 'blocked', 'failed'].includes(event.to) && event.from && ACTIVE.has(event.from))?.from : undefined;
     const snapshot = store.snapshot();
@@ -256,6 +267,7 @@ export default class OpenCodex extends TypertRemoteService {
     }
     const sessionId = SessionId(job.executionSessionId ?? job.sessionId!);
     await seedDiscoveryEvidence(this.directory, store, job.id);
+    await seedRequestEvidence(store, job);
     const activation = await this.ctx.sessionController.resolveAgent(sessionId);
     if ('error' in activation) throw activation.error;
     const session = this.ctx.sessions.get(sessionId);
@@ -265,15 +277,19 @@ export default class OpenCodex extends TypertRemoteService {
     this.turnEndReasons.delete(sessionId);
     if (['draft', 'detected', 'paused', 'blocked', 'failed'].includes(job.status)) job = await store.transitionJob(id, 'queued', { reason: 'User selected research' });
     job = await store.transitionJob(id, 'researching', { reason: `Research started in a dedicated DSH session${note ? `; user note: ${note}` : ''}` });
-    this.researchProgress.delete(id);
     if (restorePhase) {
       job = await store.transitionJob(id, 'specifying', { reason: `Restored saved specification ${savedSpec!.id} after explicit resume` });
       if (restorePhase === 'building') job = await store.transitionJob(id, 'building', { reason: `Resumed implementation from saved specification ${savedSpec!.id}` });
     }
+    // Use DSH's scoped registry so this smaller tool surface is logged normally.
+    // Disposing our filter does not lift another plugin's restrictions.
+    this.planningScopes.get(sessionId)?.(); this.planningScopes.delete(sessionId);
+    if (job.mode === 'reconstruct') this.configureExecutionTools(job);
     try {
       await this.capabilities();
       const entry = await this.resources.read('opencodex', 32_000);
-      const content = researchPrompt(job, await this.resources.catalog(), this.ctx.tools.schemas(activation.agent).map(tool => tool.name), resuming && !continuation, entry.content)
+      const content = researchPrompt(job, await this.resources.catalog(), this.ctx.tools.schemas(activation.agent).map(tool => tool.name), resuming && (!continuation || job.status === 'building'), entry.content, executionBrief(store.snapshot(), job, preflight))
+        + (continuation || !resuming ? await developmentRecipe(this.resources, job) : '')
         + (continuation ? `\n\nThis is a fresh execution context of the SAME job. All prior sessions, evidence, code, limits and spent tokens remain in its ledger. Read saved records instead of repeating research. Target access denials remain binding. No budget was reset.\nPrevious user guidance remains binding:\n${previousGuidance}` : '')
         + (previousPhase === 'verifying' ? '\n\nThe previous phase was verifying, but its current package or specification is missing. Recover the required deliverable before handing off again; no acceptance was resumed. No repair round was started.' : '')
         + (note ? `\n\nUser guidance for this run:\n${note}` : '');
@@ -281,6 +297,7 @@ export default class OpenCodex extends TypertRemoteService {
     } catch (error) { await this.stop(id, 'paused', errorText(error)); throw error; }
   }
   private async stop(id: string, status: 'paused' | 'cancelled', reason: string): Promise<void> {
+    this.pendingBuildHandoffs.delete(id);
     const store = await this.store;
     const job = store.getJob(id);
     (await this.acceptance).cancel(id);
@@ -347,6 +364,15 @@ export default class OpenCodex extends TypertRemoteService {
       if (job.sessionIds.some(sessionId => this.ctx.agents.get(SessionId(sessionId))?.status === 'running')) return;
       if (store.snapshot().reservations.some(request => request.jobId === id && request.status === 'inflight')) return;
       const kind = this.turnEndReasons.get(executionId);
+      if (job.status === 'building' && this.pendingBuildHandoffs.has(id) && !['error', 'max-tokens', 'aborted', 'disposed', 'interrupted'].includes(kind ?? '')) {
+        await store.transitionJob(id, 'paused', { reason: 'Specification committed; preparing a fresh development context with the same ledger' });
+        // Leave the status callback before waiting for the driver's idle barrier.
+        setTimeout(() => { void this.serial(id, async () => {
+          if (this.closed || !this.pendingBuildHandoffs.delete(id) || store.getJob(id).status !== 'paused') return;
+          await this.start(id, undefined, true);
+        }).catch(() => undefined); }, 0);
+        return;
+      }
       const reason = kind === 'max-tokens'
         ? 'The DSH turn reached its single-call output token limit before finishing the job. Review the session, DSH model output settings and OpenCodex maxOutputTokens cap, then explicitly resume; the job budget and saved specification are unchanged.'
         : kind === 'error'
@@ -405,22 +431,12 @@ export default class OpenCodex extends TypertRemoteService {
       await self.assertActive(job);
       if (!Number.isSafeInteger(options.maxTokens) || options.maxTokens! <= 0 || options.maxTokens! > self.maxOutputTokens) throw new Error('Research model calls require an explicit bounded maxTokens; auxiliary calls must respect the job cap');
       const store = await self.store;
-      if (store.getJob(job.id).status === 'researching') {
-        const state = store.snapshot();
-        const signature = `${state.evidence.filter(item => item.jobId === job.id).map(item => item.id).join(',')}|${state.specs.filter(item => item.jobId === job.id).map(item => item.id).join(',')}`;
-        const previous = self.researchProgress.get(job.id);
-        const progress = previous?.signature === signature ? previous : { signature, attempts: 0 };
-        if (progress.attempts >= 4) {
-          const reason = 'Research paused after 4 model attempts without new dossier evidence or a specification. Review the findings and explicitly resume with guidance; register a genuine finding or unknown checkpoint before further reading.';
-          await self.stop(job.id, 'paused', reason);
-          throw new Error(reason);
-        }
-        progress.attempts++;
-        self.researchProgress.set(job.id, progress);
-      }
       const requestId = randomUUID();
       const shape = requestShape(options), calibrationKey = `${job.id}:${options.sessionId ?? initiator?.session.id ?? 'auxiliary'}`;
-      try { await store.reserveTokens(job.id, { requestId, reservedTokens: calibratedRequestTokens(shape, self.requestCalibrations.get(calibrationKey)) + options.maxTokens! }); }
+      const reservedTokens = calibratedRequestTokens(shape, self.requestCalibrations.get(calibrationKey)) + options.maxTokens!;
+      const admissionError = researchAdmissionError(store.snapshot(), store.getJob(job.id), reservedTokens);
+      if (admissionError) { await self.stop(job.id, 'paused', admissionError); throw new Error(admissionError); }
+      try { await store.reserveTokens(job.id, { requestId, reservedTokens, enforceResearchAllowance: true }); }
       catch (error) { await self.stop(job.id, 'paused', errorText(error)); throw error; }
       let usage: DshUsage | undefined;
       try {
@@ -456,6 +472,10 @@ export default class OpenCodex extends TypertRemoteService {
         if (!this.hasForegroundLease(job, await this.store)) throw new Error('Request and start a scoped foreground task in OpenCodex before desktop control');
       }
       const result = await next();
+      if (!result.isError && (exec.name === 'opencodex_submit_plan' || (exec.name === 'opencodex_job' && args.action === 'stage' && record(args.payload).status === 'building'))) {
+        this.pendingBuildHandoffs.add(job.id);
+        return { ...result, concludesTurn: true };
+      }
       if (!result.isError && exec.name === 'opencodex_job' && (args.action === 'request_foreground' || (args.action === 'stage' && ['verifying', 'researched', 'blocked'].includes(String(record(args.payload).status))))) {
         const current = (await this.store).getJob(job.id);
         for (const id of current.sessionIds) if (id !== exec.agent.session.id) this.ctx.agents.get(SessionId(id))?.cancel({ kind: 'user' });
@@ -465,6 +485,36 @@ export default class OpenCodex extends TypertRemoteService {
     });
   }
   private registerTools(): void {
+    this.ctx.tools.register(defineTool({
+      name: 'opencodex_submit_plan',
+      description: 'Commit the minimal source-grounded specification and enter implementation in one call. Use before broad SDK exploration. Keep unknown visual/runtime details in gaps; submitting a plan is not acceptance. Creates the generic empty plugin scaffold, with exact build commands, when packageName is supplied. Never replaces existing code. Investigation-only jobs use opencodex_job spec instead.',
+      parameters: {
+        title: { type: 'string', required: true },
+        behavior: { type: 'array', items: { type: 'string' }, required: true },
+        visual: { type: 'array', items: { type: 'string' }, required: true },
+        lifecycle: { type: 'array', items: { type: 'string' }, required: true },
+        existingCapabilities: { type: 'array', items: { type: 'string' }, required: true },
+        gaps: { type: 'array', items: { type: 'string' }, required: true },
+        evidenceIds: { type: 'array', items: { type: 'string' }, required: true },
+        packageName: { type: 'string' },
+      },
+      output: { schema: { type: 'object', properties: { result: { type: 'string', required: true } }, additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: value.result }] },
+      execute: async (args, exec) => {
+        exec.signal.throwIfAborted();
+        const job = exec.agent ? await this.jobForSession(exec.agent.session.id) : undefined;
+        if (!job) throw new Error('This tool requires a dedicated OpenCodex research session');
+        await this.assertActive(job);
+        const store = await this.store;
+        const { packageName, ...spec } = args;
+        const saved = await store.submitPlan(job.id, spec);
+        let scaffold: unknown;
+        if (packageName) {
+          try { scaffold = await scaffoldPlugin(fileURLToPath(new URL('../../', import.meta.url)), this.artifactRoot, store.getJob(job.id), packageName); }
+          catch (error) { scaffold = { error: errorText(error), next: 'The specification is saved and stage is building. Keep existing files; use scaffold only if a new empty plugin directory is needed.' }; }
+        }
+        return { result: JSON.stringify({ specId: saved.id, stage: 'building', scaffold, next: 'Write the smallest implementation now. Query SDK only for an unresolved signature or a compiler error. Build and register the tarball; do not repeat the plan.' }) };
+      },
+    }));
     this.ctx.tools.register(defineTool({
       name: 'opencodex_read_resource', description: 'Inspect one allowlisted guide. Defaults to a compact index with title, description, heading/source offsets, totalCharacters and sha256. Short resources of at most 3000 characters also include their full excerpt and complete:true; longer resources never include body text implicitly. Use action read for an excerpt: offset defaults to 0, maxCharacters defaults to 3000 and is capped at 6000. Offsets count UTF-16 code units; concatenate excerpts using nextOffset to reconstruct exactly. If sha256 changes, restart from the new index. Index labels are bounded and omittedEntries reports unusually long outlines.',
       parameters: { id: { type: 'string', required: true }, action: { type: 'string', enum: ['index', 'read'] }, offset: { type: 'number' }, maxCharacters: { type: 'number' } },
@@ -478,8 +528,8 @@ export default class OpenCodex extends TypertRemoteService {
     }));
     this.ctx.tools.register(defineTool({
       name: 'opencodex_job', description: `Maintain the calling OpenCodex job dossier. Cannot approve foreground operations, increase budgets, mark ready, or install. Payloads by action:
-sdk: {package:string,path?:string,symbol?:string,offset?:number}; returns the installed version, export/type paths, digest and at most 5000 declaration characters for one allowlisted DSH package. Start with the package, then follow only relevant returned declarations; prefer this to scanning node_modules. status: {offset?:number}; returns compact job/budget and latest-first paginated dossier summaries, 30 per category, without the description or full history. record: {id:string,offset?:number}; returns one same-job dossier record as JSON text in 16000-character chunks; concatenate content using nextOffset until absent. repair: {}. scaffold: {packageName:string}; reconstruction only, copies the bundled feature-free skeleton into an absent/empty plugin directory, refuses symlinks and overwrites, does not install or build. Returns exact starter Client source, target SDK versions and build/package commands; use this brief instead of rereading every template file. Use an unscoped lowercase name with letters/digits/hyphens, at most 80 characters. evidence: {kind:'observed'|'inferred'|'unknown',claim:string,sourceUrl?:string,localPath?:string,relatedEvidenceIds?:string[]}; observed needs sourceUrl or localPath. spec: {title:string,behavior:string[],visual:string[],lifecycle:string[],existingCapabilities:string[],gaps:string[],evidenceIds:string[]}; required arrays behavior/visual/lifecycle/evidenceIds must be nonempty. artifact: {path:string,label?:string,kind?:'plugin'|'report'|'screenshot'|'log',screenshot?:{subject:'codex'|'dsh'|'other',caption:string,provenance:'user'|'capture'|'public-source',sourceUrl?:string,version?:string}}; plugin is a real npm tarball. New screenshot artifacts require screenshot metadata, a real PNG/JPEG/WebP file at most 2 MiB, a concise caption explaining the visible feature, and honest subject/source labels. Capture Codex reference and DSH implementation separately; missing reference is a visual gap, not a passed comparison. verification: {details:string,localPath?:string}; records an agent report only. stage: {status:'specifying'|'building'|'verifying'|'blocked'|'researched',reason:string}; advance sequentially. request_foreground: {target:string,scope:string,steps:string[]}; pauses the job until user approval. foreground_done: {requestId:string}. Stage, repair and foreground_done return compact acknowledgements. Paths are relative to the dedicated job workspace.`,
-      parameters: { action: { type: 'string', required: true, enum: ['status', 'record', 'sdk', 'evidence', 'spec', 'scaffold', 'artifact', 'verification', 'stage', 'request_foreground', 'foreground_done', 'repair'] }, payload: { type: 'object', additionalProperties: true } },
+sdk: {package:string,path?:string,symbol?:string,offset?:number}; returns the installed version, export/type paths, digest and at most 5000 declaration characters for one allowlisted DSH package. Start with the package, then follow only relevant returned declarations; prefer this to scanning node_modules. tools: {query?:string,offset?:number,names?:string[]}; development only, inspect a bounded tool catalog or load up to four exact registered schemas; this never grants target access or permission. status: {offset?:number}; returns compact job/budget and latest-first paginated dossier summaries, 30 per category, without the description or full history. record: {id:string,offset?:number}; returns one same-job dossier record as JSON text in 16000-character chunks; concatenate content using nextOffset until absent. repair: {}. scaffold: {packageName:string}; reconstruction only, copies the bundled feature-free skeleton into an absent/empty plugin directory, refuses symlinks and overwrites, does not install or build. Returns exact starter Client source, target SDK versions and build/package commands; use this brief instead of rereading every template file. Use an unscoped lowercase name with letters/digits/hyphens, at most 80 characters. evidence: {kind:'observed'|'inferred'|'unknown',claim:string,sourceUrl?:string,localPath?:string,relatedEvidenceIds?:string[]}; observed needs sourceUrl or localPath. spec: {title:string,behavior:string[],visual:string[],lifecycle:string[],existingCapabilities:string[],gaps:string[],evidenceIds:string[]}; required arrays behavior/visual/lifecycle/evidenceIds must be nonempty. artifact: {path:string,label?:string,kind?:'plugin'|'report'|'screenshot'|'log',screenshot?:{subject:'codex'|'dsh'|'other',caption:string,provenance:'user'|'capture'|'public-source',sourceUrl?:string,version?:string}}; plugin is a real npm tarball. New screenshot artifacts require screenshot metadata, a real PNG/JPEG/WebP file at most 2 MiB, a concise caption explaining the visible feature, and honest subject/source labels. Capture Codex reference and DSH implementation separately; missing reference is a visual gap, not a passed comparison. verification: {details:string,localPath?:string}; records an agent report only. stage: {status:'specifying'|'building'|'verifying'|'blocked'|'researched',reason:string}; advance sequentially. request_foreground: {target:string,scope:string,steps:string[]}; pauses the job until user approval. foreground_done: {requestId:string}. Stage, repair and foreground_done return compact acknowledgements. Paths are relative to the dedicated job workspace.`,
+      parameters: { action: { type: 'string', required: true, enum: ['status', 'record', 'sdk', 'tools', 'evidence', 'spec', 'scaffold', 'artifact', 'verification', 'stage', 'request_foreground', 'foreground_done', 'repair'] }, payload: { type: 'object', additionalProperties: true } },
       output: { schema: { type: 'object', properties: { result: { type: 'string', required: true } }, additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: String(value.result) }] },
       execute: async (args, exec) => {
         exec.signal.throwIfAborted();
@@ -489,6 +539,13 @@ sdk: {package:string,path?:string,symbol?:string,offset?:number}; returns the in
         const payload = record(args.payload ?? {});
         const result = await (async (): Promise<unknown> => {
         switch (args.action) {
+          case 'tools': {
+            if (job.status !== 'building') throw new Error('Additional tools are loaded during development; submit the requirements first');
+            const requested = payload.names;
+            if (requested !== undefined && (!Array.isArray(requested) || requested.length > 4 || requested.some(name => typeof name !== 'string'))) throw new Error('Choose at most four exact registered tool names');
+            if (payload.query !== undefined && (typeof payload.query !== 'string' || payload.query.length > 120)) throw new Error('Tool query must be at most 120 characters');
+            return this.configureExecutionTools(job, requested as string[] | undefined, true, this.pageOffset(payload.offset), payload.query as string | undefined);
+          }
           case 'status': return this.dossierStatus(store, job.id, payload.offset);
           case 'record': {
             const state = store.snapshot();
@@ -528,7 +585,10 @@ sdk: {package:string,path?:string,symbol?:string,offset?:number}; returns the in
           default: throw new Error('Unknown OpenCodex job action');
         }
         })();
-        return { result: JSON.stringify(result) };
+        const current = store.getJob(job.id);
+        return { result: JSON.stringify(['researching', 'specifying'].includes(current.status)
+          ? { ...record(result), researchAllowance: researchAllowance(store.snapshot(), current), next: 'Commit the source-grounded plan with opencodex_submit_plan; SDK reads are not milestones.' }
+          : result) };
       },
     }));
   }
@@ -536,6 +596,26 @@ sdk: {package:string,path?:string,symbol?:string,offset?:number}; returns the in
     if (value === undefined) return 0;
     if (!Number.isSafeInteger(value) || Number(value) < 0) throw new Error('offset must be a nonnegative integer');
     return Number(value);
+  }
+  private configureExecutionTools(job: Job, requested: string[] = [], list = false, offset = 0, query = '') {
+    const id = job.executionSessionId ?? job.sessionId!;
+    const agent = this.ctx.agents.get(SessionId(id));
+    if (!agent) throw new Error('Execution agent is unavailable');
+    this.planningScopes.get(id)?.(); this.planningScopes.delete(id);
+    const available = this.ctx.tools.schemas(agent);
+    const globalNames = new Set(this.ctx.tools.schemas().map(tool => tool.name));
+    const extras = this.extraTools.get(job.id) ?? new Set<string>();
+    const invalid = requested.find(name => !available.some(tool => tool.name === name));
+    if (!invalid) for (const name of requested) extras.add(name);
+    this.extraTools.set(job.id, extras);
+    const names = job.status === 'building'
+      ? ['opencodex_job', 'opencodex_read_resource', 'read', 'edit', 'write', 'bash', 'grep', 'glob', ...this.backgroundToolNames, ...extras]
+      : ['opencodex_submit_plan', 'opencodex_job', 'opencodex_read_resource'];
+    const allow = [...new Set(names)].filter(name => globalNames.has(name) && available.some(tool => tool.name === name));
+    if (allow.length) this.planningScopes.set(id, agent.ctx.tools.restrict({ allow }));
+    if (invalid) throw new Error(`Tool is unavailable in this agent: ${invalid}`);
+    const matches = available.filter(tool => `${tool.name} ${tool.description}`.toLowerCase().includes(query.toLowerCase()));
+    return { enabled: allow, ...(list ? { available: matches.slice(offset, offset + 24).map(tool => ({ name: tool.name, description: tool.description?.slice(0, 100) })), ...(offset + 24 < matches.length ? { nextOffset: offset + 24 } : {}) } : {}), note: 'Loading a schema does not grant target access, foreground permission or sandbox escalation.' };
   }
   private jobAcknowledgement(job: Job) {
     return { id: job.id, status: job.status, mode: job.mode, repairRounds: job.repairRounds,

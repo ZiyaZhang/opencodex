@@ -114,6 +114,17 @@
       ]
     },
     {
+      "id": "runtime-compaction",
+      "title": "异步压缩与运行时功能",
+      "kind": "reference",
+      "path": "skills/opencodex/references/runtime-compaction.md",
+      "description": "Snapshot adoption, concurrent history, provider compatibility and runtime acceptance",
+      "topics": [
+        "runtime",
+        "compaction"
+      ]
+    },
+    {
       "id": "budget-resume",
       "title": "预算与恢复",
       "kind": "reference",

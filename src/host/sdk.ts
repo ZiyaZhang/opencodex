@@ -5,7 +5,7 @@ import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import type { OpenCodexStore } from '../core/store.js';
 
-export const SDK_PACKAGES = ['@deepseek-ai/cordis', '@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-api-session-controller', '@deepseek-ai/dsh-session', '@deepseek-ai/dsh-client-ui-slots', '@deepseek-ai/dsh-client-ui-renderer', '@deepseek-ai/dsh-client-ui-conversation', '@deepseek-ai/dsh-client-ui-session', '@deepseek-ai/dsh-client-ui-user-questions', '@deepseek-ai/dsh-host-webserver', '@deepseek-ai/dsh-llm'] as const;
+export const SDK_PACKAGES = ['@deepseek-ai/cordis', '@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-api-session-controller', '@deepseek-ai/dsh-session', '@deepseek-ai/dsh-client-ui-slots', '@deepseek-ai/dsh-client-ui-renderer', '@deepseek-ai/dsh-client-ui-conversation', '@deepseek-ai/dsh-client-ui-session', '@deepseek-ai/dsh-client-ui-user-questions', '@deepseek-ai/dsh-host-webserver', '@deepseek-ai/dsh-llm', '@deepseek-ai/dsh-agent', '@deepseek-ai/dsh-compaction', '@deepseek-ai/dsh-compaction-basic', '@deepseek-ai/dsh-token-meter'] as const;
 export async function inspectSdk(input: { package: string; path?: string; symbol?: string; offset?: number }, workdir?: string) {
   if (!SDK_PACKAGES.includes(input.package as typeof SDK_PACKAGES[number])) throw new Error(`Choose one SDK package: ${SDK_PACKAGES.join(', ')}`);
   if (input.symbol !== undefined && (!input.symbol.trim() || input.symbol.length > 120)) throw new Error('SDK symbol must be 1–120 characters');

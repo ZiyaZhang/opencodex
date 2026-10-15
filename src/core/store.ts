@@ -5,6 +5,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { AcceptanceRun, Artifact, BudgetSummary, CandidateInput, CapabilitySnapshot, CreateJobInput, EvidenceInput, ForegroundRequest, Job, JobBudget, JobStatus, PluginInstallation, Settings, SpecInput, StoreOptions, StoreState, TokenReservation, TokenUsage, VerificationInput } from './types.js';
 import { check, count, relativePath, textValue, validateCapabilities, validateScreenshotMetadata, validateSettings, validateState, ValidationError } from './validation.js';
 import { readScreenshotFile } from './screenshot.js';
+import { researchAdmissionError } from './research.js';
 
 export const STATE_FILE = 'opencodex-state.json';
 export const MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
@@ -220,7 +221,7 @@ export class OpenCodexStore {
     });
   }
 
-  async reserveTokens(jobId: string, input: { requestId: string; reservedTokens: number }): Promise<TokenReservation> {
+  async reserveTokens(jobId: string, input: { requestId: string; reservedTokens: number; enforceResearchAllowance?: boolean }): Promise<TokenReservation> {
     textValue(input.requestId, 'requestId'); count(input.reservedTokens, 'reservedTokens', 1);
     const result = await this.#mutate((state, at) => {
       const job = findJob(state, jobId); const existing = state.reservations.find(r => r.requestId === input.requestId);
@@ -233,9 +234,9 @@ export class OpenCodexStore {
           ? `Next request needs ${input.reservedTokens} reserved tokens; job has ${usage.job.remainingTokens} remaining`
           : input.reservedTokens > usage.daily.remainingTokens
             ? `Next request needs ${input.reservedTokens} reserved tokens; daily budget has ${usage.daily.remainingTokens} remaining`
-            : undefined;
+            : input.enforceResearchAllowance ? researchAdmissionError(state, job, input.reservedTokens) : undefined;
       if (reason) { change(state, job, 'paused', at, reason); return { error: reason }; }
-      const reservation: TokenReservation = { requestId: input.requestId, jobId, reservedTokens: input.reservedTokens, reservedAt: at, status: 'inflight' };
+      const reservation: TokenReservation = { requestId: input.requestId, jobId, reservedTokens: input.reservedTokens, reservedAt: at, status: 'inflight', phase: job.status };
       state.reservations.push(reservation); return { reservation };
     });
     if (result.error) throw new BudgetLimitError(result.error); return result.reservation!;
@@ -292,6 +293,38 @@ export class OpenCodexStore {
     return this.#mutate((state, at) => {
       const job = findJob(state, jobId); check(['researching', 'specifying'].includes(job.status), 'Specs must be recorded during research or specification');
       const spec = { ...input, id: randomUUID(), jobId, createdAt: at }; state.specs.push(spec); return spec;
+    });
+  }
+
+  /** One durable handoff: a plan cannot be saved while its build transition is lost. */
+  submitPlan(jobId: string, input: SpecInput) {
+    return this.#mutate((state, at) => {
+      const job = findJob(state, jobId);
+      check(job.mode === 'reconstruct', 'Use the inventory specification for investigation jobs');
+      const previous = state.specs.filter(spec => spec.jobId === jobId).at(-1);
+      if (job.status === 'building' && previous) {
+        const { id: _id, jobId: _jobId, createdAt: _at, ...saved } = previous;
+        if (JSON.stringify(saved) === JSON.stringify(input)) return previous;
+      }
+      check(['researching', 'specifying'].includes(job.status), 'A build plan requires research or specification');
+      check(input.evidenceIds.some(id => state.evidence.some(e => e.id === id && e.jobId === jobId && e.kind === 'observed')), 'Plan needs observed source evidence');
+      const usage = summary(state, jobId, at);
+      check(usage.elapsedMs < job.budget.maxDurationMs && usage.job.remainingTokens > 0 && usage.daily.remainingTokens > 0, 'Execution budget exhausted');
+      const spec = { ...input, id: randomUUID(), jobId, createdAt: at };
+      state.specs.push(spec);
+      if (job.status === 'researching') change(state, job, 'specifying', at, `Specification ${spec.id} submitted`);
+      change(state, job, 'building', at, `Implement specification ${spec.id}`);
+      return spec;
+    });
+  }
+
+  setAcceptanceMode(jobId: string, mode: 'automatic' | 'manual') {
+    return this.#mutate((state, at) => {
+      const job = findJob(state, jobId);
+      if ((job.acceptanceMode ?? 'automatic') === mode) return job;
+      check(!ACTIVE.has(job.status) && !['ready', 'installed', 'covered', 'researched', 'cancelled'].includes(job.status), 'Change acceptance mode only before starting or resuming');
+      job.acceptanceMode = mode; job.updatedAt = at;
+      return job;
     });
   }
 

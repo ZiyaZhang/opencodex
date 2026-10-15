@@ -16,7 +16,9 @@ interface Block { kind: 'heading' | 'item' | 'text'; text: string; anchor?: stri
 interface Release { date: string; title: string; anchor?: string; url?: string; blocks: Block[] }
 const GENERIC = /^(?:new features?|features?|what[’']?s new|highlights?|improvements?|新增功能|新功能)$/i;
 const SKIP_SECTION = /bug\s*fix|performance|chore|changelog|install|availability|pricing|修复|性能|安装/i;
-const SKIP_RELEASE = /\b(?:CLI|mobile|iOS|Android|SDK|API)\b|\b(?:deprecated|removed|retired|security update)\b|^(?:introducing\s+)?GPT[-\s]|\b(?:model|models)\b.*\b(?:retir|available|release)|\bultrafast\b.*\b(?:Codex|ChatGPT)\b/i;
+const SKIP_RELEASE = /\b(?:mobile|iOS|Android)\b|\b(?:deprecated|removed|retired|security update)\b|^(?:introducing\s+)?GPT[-\s]|\b(?:model|models)\b.*\b(?:retir|available|release)|\bultrafast\b.*\b(?:Codex|ChatGPT)\b/i;
+const RUNTIME_SURFACE = /\b(?:CLI|SDK|API)\b/i;
+const RUNTIME_FEATURE = /\b(?:compaction|checkpoint|context (?:compression|management)|background (?:compression|compaction)|async(?:hronous)? (?:compaction|tools?|execution)|tool cancellation)\b|异步压缩|后台压缩|上下文压缩|检查点/i;
 const NON_FEATURE = /^(?:(?:additional|various|general)\s+)?(?:performance improvements?|bug fixes?|stability improvements?)\b|^(?:fixed?|fixes|resolved?|corrected)\b|^(?:support for|introducing|added support for)\s+GPT[-\s]|^(?:full changelog|learn more|view details|download|npm install|\$ npm)/i;
 
 function plain(value: string): string {
@@ -135,16 +137,20 @@ export function parseChangelog(content: string, sourceUrl: string, options: Chan
     const before = features.length;
     const append = (title: string, body: string, anchor?: string) => {
       if (features.length >= maxFeatures || title.length < 5 || NON_FEATURE.test(title)) return;
+      if (RUNTIME_SURFACE.test(release.title) && !RUNTIME_FEATURE.test(`${title} ${body}`)) return;
       const normalizedTitle = title.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
       const fingerprint = `codex-feature:${createHash('sha256').update(`${release.date}\n${normalizedTitle}`).digest('hex')}`;
       if (seen.has(fingerprint)) return;
       seen.add(fingerprint);
-      const scope = /desktop|codex app|桌面/i.test(`${release.title} ${body}`) ? '桌面应用' : '通用产品公告（平台需研究确认）';
+      const scope = RUNTIME_SURFACE.test(release.title) ? 'CLI/SDK/API 运行时公告（桌面可用性未确认）' : /desktop|codex app|桌面/i.test(`${release.title} ${body}`) ? '桌面应用' : '通用产品公告（平台需研究确认）';
       features.push({ title, description: `${body.slice(0, 1000)}\n\n来源范围：${scope}。官方更新记录中的功能线索；尚未在本机验证，也不代表已经完成复刻。`, sourceUrl: release.url ? (anchor ? linkFor(release.url, anchor) : release.url) : linkFor(sourceUrl, anchor ?? release.anchor), fingerprint, publishedAt, releaseTitle: release.title });
     };
     let section = '', sectionAnchor: string | undefined, paragraphs: string[] = [], items: string[] = [];
     const flush = () => {
-      if (SKIP_SECTION.test(section)) return;
+      if (SKIP_SECTION.test(section)) {
+        if (/performance|性能/i.test(section) && !/bug\s*fix|修复/i.test(section)) for (const text of [...paragraphs, ...items]) if (RUNTIME_FEATURE.test(text)) append(titleFor(text), text, sectionAnchor);
+        return;
+      }
       if (section && !GENERIC.test(section)) {
         if (paragraphs.length || items.length) append(section, [...paragraphs, ...items].join(' '), sectionAnchor);
       } else {

@@ -90,3 +90,11 @@ test('untrusted RSS links never become script or remote site links, and undated 
   assert.equal(items.length, 1);
   assert.equal(items[0]?.sourceUrl, url);
 });
+
+test('runtime capabilities in CLI and performance notes remain candidates without claiming desktop availability', () => {
+  const source = `2026-10-12\n# Codex CLI 1.2\n### Performance\n- Async compaction: prepare a history summary in the background.\n- Fixed compaction crash.\n- Reduced startup latency.\n### Features\n- Added a shell completion shortcut.\n2026-10-11\n# Codex desktop app 26.1011\n### Performance\n- Background compaction: preserve foreground work.\n- Faster startup.\n`;
+  const items = parseChangelog(source, url, { now });
+  assert.deepEqual(items.map(item => item.title), ['Async compaction', 'Background compaction']);
+  assert.match(items[0]!.description, /桌面可用性未确认/);
+  assert.match(items[1]!.description, /桌面应用/);
+});
