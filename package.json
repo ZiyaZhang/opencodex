@@ -1,6 +1,6 @@
 {
   "name": "dsh-opencodex",
-  "version": "0.2.1-pre.3",
+  "version": "0.3.0",
   "description": "Local, budgeted Codex feature research and DSH plugin reconstruction",
   "type": "module",
   "license": "MIT",
@@ -24,11 +24,7 @@
       "types": "./dist/types/client/index.d.ts",
       "default": "./dist/client.js"
     },
-    "./package.json": "./package.json",
-    "./verification": {
-      "types": "./dist/types/host/verification-api.d.ts",
-      "default": "./dist/host/verification-api.js"
-    }
+    "./package.json": "./package.json"
   },
   "dsh": {
     "bundle": {
@@ -39,17 +35,14 @@
       "inject": [
         "@deepseek-ai/dsh-api-remotes",
         "@deepseek-ai/dsh-client-ui-layout",
-        "@deepseek-ai/dsh-client-ui-sidebar"
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-workspace"
       ]
     }
   },
   "files": [
     "dist",
     "cordis.patch.yml",
-    "skills",
-    "resources",
-    "templates",
-    "docs",
     "README.md",
     "LICENSE"
   ],
@@ -73,8 +66,9 @@
   },
   "dependencies": {
     "@deepseek-ai/dsh-typert-protocol": "0.2.1-alpha.2",
-    "undici": "8.12.1",
-    "zod": "4.4.3"
+    "dompurify": "3.2.6",
+    "marked": "16.3.0",
+    "undici": "8.12.1"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.5-alpha.1",
@@ -87,6 +81,7 @@
     "@deepseek-ai/dsh-client-ui-renderer": "0.2.1-alpha.2",
     "@deepseek-ai/dsh-client-ui-sidebar": "0.2.1-alpha.2",
     "@deepseek-ai/dsh-client-ui-slots": "0.2.1-alpha.2",
+    "@deepseek-ai/dsh-client-ui-workspace": "0.2.1-alpha.2",
     "@deepseek-ai/dsh-llm": "0.2.1-alpha.2",
     "@deepseek-ai/dsh-plugin-manager": "0.2.1-alpha.2",
     "@deepseek-ai/dsh-sandbox": "0.2.1-alpha.2",
