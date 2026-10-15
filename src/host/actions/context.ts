@@ -12,13 +12,27 @@ export type ClassifyLlm = Parameters<typeof classifyBatch>[0];
 /** The work on one candidate that only one request at a time may do. */
 export type Task = 'report' | 'start' | 'status';
 
+/** `promise`, or a rejection with `signal.reason` as soon as `signal` fires, whichever comes first. */
+function raced<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    if (signal.aborted) { abort(); return; }
+    signal.addEventListener('abort', abort, { once: true });
+    promise.then(value => { signal.removeEventListener('abort', abort); resolve(value); }, error => { signal.removeEventListener('abort', abort); reject(error); });
+  });
+}
+
 /** Runs work one piece after another, in the order it was handed in; a piece that fails does not stop the next. */
 export class Lane {
   private tail: Promise<unknown> = Promise.resolve();
-  run<T>(work: () => Promise<T>): Promise<T> {
-    const next = this.tail.then(work);
-    this.tail = next.catch(() => undefined);
-    return next;
+  /**
+   * Runs `work` once every piece handed in before it has settled. With `signal`, the call rejects as soon as it fires, waiting or not, and
+   * work whose turn has not come never runs; work already running is left to its own signal, and the next piece waits for it to settle.
+   */
+  run<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const turn = this.tail.then(() => { signal?.throwIfAborted(); return work(); });
+    this.tail = turn.catch(() => undefined);
+    return signal ? raced(turn, signal) : turn;
   }
 }
 
@@ -27,12 +41,14 @@ export interface HostContext {
   /** The absolute OpenCodex data directory. */
   readonly directory: string;
   readonly store: CandidateStore;
-  /** The Host clock: candidate timestamps and the UTC day of the report counter. */
+  /** The Host clock: candidate timestamps, the UTC day of the report counter, `lastCheckAt`. */
   readonly now: () => Date;
   /** Aborted when the plugin unloads. Long work runs under it rather than under one request's signal, so a page that goes away does not cut it short. */
   readonly signal: AbortSignal;
-  /** The Cordis context: the session controller and agents for report and start (with the default model and approval for report), `llm` for classification. */
+  /** The DSH services, taken from the injected ones when the Host starts: session controller and agents for report and start (with the default model and approval for report), `llm` for classification. */
   readonly services: ReportHost & { readonly llm: ClassifyLlm };
+  /** How long a check, a `classify` action and the GitHub part of a report may take, in ms. */
+  readonly timeouts: { readonly check: number; readonly classify: number; readonly github: number };
   /** The settings in force. */
   settings(): Readonly<Settings>;
   /** Puts settings in force once they are on disk, and re-arms the check timer. */
@@ -43,17 +59,16 @@ export interface HostContext {
   readonly fetcher?: typeof fetch;
   /** How often a report session is polled (tests); 3 seconds by default. */
   readonly reportPollMs?: number;
-  /** How long a check may run (tests); 30 minutes by default. */
-  readonly checkTimeoutMs?: number;
   /** The DSH index, once one is loaded or built. */
   index?: DshIndex;
-  /** The last check this process ran. */
+  /** The last check this process ran, and when it ended (ISO); a check that failed is recorded with an `errors` line. */
   lastCheck?: CheckResult;
+  lastCheckAt?: string;
   /** Candidates with a task running, by id: one task per candidate at a time. */
   readonly busy: Map<string, Task>;
   /** Runs a second request joins instead of starting another: `check`. */
   readonly running: Map<string, Promise<unknown>>;
-  /** Reports admitted against the daily limit that have not finished. */
+  /** Reports admitted against the daily limit whose analyst session has not started yet (a started one is in the day's counter). */
   reportsRunning: number;
   /** One lane each for settings writes, the daily report counter, classification passes and index builds. */
   readonly lanes: { readonly settings: Lane; readonly reports: Lane; readonly classify: Lane; readonly index: Lane };
@@ -81,6 +96,18 @@ export function joined<T>(ctx: HostContext, key: string, work: () => Promise<T>)
   return run;
 }
 
+/**
+ * `work` under the plugin's lifetime and a deadline of `ms`: a run that outlives the deadline is aborted, and its failure becomes an Error
+ * with `late` as the message. An unload stays the abort it is.
+ */
+export async function withDeadline<T>(ctx: HostContext, ms: number, late: string, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const deadline = AbortSignal.timeout(ms);
+  try { return await work(AbortSignal.any([ctx.signal, deadline])); } catch (error) {
+    if (deadline.aborted && !ctx.signal.aborted) throw new Error(late, { cause: error });
+    throw error;
+  }
+}
+
 /** The mirror path from the settings, or a refusal that says where to set it. */
 export function mirrorOf(settings: Readonly<Settings>): string {
   if (!settings.dshMirrorPath) throw new Error('先在设置里填写 DSH 镜像路径（dshMirrorPath）');
@@ -88,3 +115,11 @@ export function mirrorOf(settings: Readonly<Settings>): string {
 }
 
 export const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/** Characters of one line of a check's `errors`, as the collector cuts its own. */
+const LINE_LIMIT = 300;
+/** One `errors` line: whitespace collapsed, at most 300 code points, never cut inside a character. */
+export function errorLine(text: string): string {
+  const chars = Array.from(text.replace(/\s+/g, ' ').trim());
+  return chars.length > LINE_LIMIT ? `${chars.slice(0, LINE_LIMIT - 1).join('')}…` : chars.join('');
+}

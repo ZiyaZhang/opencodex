@@ -5,14 +5,16 @@
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Context, Service } from '@deepseek-ai/cordis';
-import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
+import { RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 import type {} from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import type {} from '@deepseek-ai/dsh-llm';
 import type {} from '@deepseek-ai/dsh-typert-registry';
+import { ValidationError } from '../core/check.js';
 import { CandidateStore } from '../core/store.js';
 import { loadIndex, type CheckResult } from './collector.js';
 import { GitHubClient } from './github.js';
+import type { ReportHost } from './report/report-session.js';
 import { check } from './actions/check.js';
 import { classify } from './actions/classify.js';
 import { Lane, messageOf, type HostContext } from './actions/context.js';
@@ -21,7 +23,7 @@ import { rebuildIndex } from './actions/index.js';
 import { readReport } from './actions/read-report.js';
 import { report } from './actions/report.js';
 import { loadSettings, updateSettings } from './actions/settings.js';
-import { candidate, snapshot } from './actions/snapshot.js';
+import { candidate, respond, type ActionResult } from './actions/snapshot.js';
 import { start } from './actions/start.js';
 import { OPEN_CODEX_DESCRIPTOR, parseRequest, type OpenCodexRequest, type OpenCodexResponse } from './remote.js';
 
@@ -39,15 +41,28 @@ export interface Dependencies {
   timers?: Timers;
   /** How often a report session is polled; 3 seconds by default. */
   reportPollMs?: number;
-  /** How long a check may run; 30 minutes by default. */
-  checkTimeoutMs?: number;
+  /** In ms: a check, a `classify` action and the GitHub part of a report; 30, 15 and 10 minutes by default. */
+  timeouts?: Partial<HostContext['timeouts']>;
 }
 declare module '@deepseek-ai/cordis' { interface Context { opencodex: OpenCodex } }
 
 const HOUR = 3_600_000;
 /** The first check waits this long, so it does not compete with DSH starting up. */
 const FIRST_CHECK_DELAY_MS = 60_000;
+const TIMEOUTS: HostContext['timeouts'] = { check: 30 * 60_000, classify: 15 * 60_000, github: 10 * 60_000 };
 const NODE_TIMERS: Timers = { set: (run, ms) => setTimeout(run, ms).unref(), clear: handle => clearTimeout(handle as NodeJS.Timeout) };
+
+/**
+ * What the actions call in DSH: the injected services, taken once. Never `ctx` itself, since a plugin context throws for a member it did not
+ * inject, such as the `subagents` that `generateReport` would look for. `agentDefaultModel` and `approval` are typed on `Context` only by
+ * packages this plugin does not depend on, so they are read with `ctx.get`, which skips the inject check (both are injected anyway).
+ */
+function servicesOf(ctx: Context): HostContext['services'] {
+  return {
+    sessionController: ctx.sessionController, agents: ctx.agents, llm: ctx.llm,
+    agentDefaultModel: ctx.get('agentDefaultModel') as ReportHost['agentDefaultModel'], approval: ctx.get('approval') as ReportHost['approval'],
+  };
+}
 
 export default class OpenCodex extends TypertRemoteService {
   /** `agentDefaultModel` and `approval` are read by the report session (default model put back, approval policy `never`). */
@@ -62,8 +77,6 @@ export default class OpenCodex extends TypertRemoteService {
   /** Calls and timer runs in progress, waited for on unload. */
   private readonly work = new Set<Promise<unknown>>();
   private timer: unknown;
-  /** When the last check ended, by the Host clock. */
-  private lastCheckAt?: number;
   private closed = false;
 
   constructor(ctx: Context, public config: Config = {}, deps: Dependencies = {}) {
@@ -79,41 +92,52 @@ export default class OpenCodex extends TypertRemoteService {
   /** Cordis runs this after construction: a settings.json that cannot be used fails the plugin start with the reason. */
   async [Service.init](): Promise<void> { await this.ready; }
 
-  /** The one Remote method: checks the request, runs its action, and answers with the snapshot plus what the action returns. */
+  /**
+   * The one Remote method: checks the request, runs its action, and answers with the snapshot plus what the action returns. The wire codec
+   * only checks for a JSON object, because the gateway would turn its errors into a bare "failed boundary validation"; the real check runs
+   * here, and a request the Host refuses (by `parseRequest`, or by a check such as `mergeSettings`) rejects with a `gateway/bad-request`
+   * RemoteError carrying the reason, which the page shows. A finished action is never reported as failed: see `respond`.
+   */
   async call(request: OpenCodexRequest, signal: AbortSignal): Promise<OpenCodexResponse> {
     signal.throwIfAborted();
-    const parsed = parseRequest(request); // the codec ran it on the wire; in-process callers get the same check
     if (this.closed) throw new Error('OpenCodex 已卸载');
-    return this.track(this.ready.then(host => this.dispatch(host, parsed)));
+    return this.track((async () => {
+      try {
+        const parsed = parseRequest(request);
+        const host = await this.ready;
+        return await respond(host, await this.act(host, parsed));
+      } catch (error) {
+        if (error instanceof ValidationError) throw new RemoteError('gateway/bad-request', error.message, {}, { cause: error });
+        throw error;
+      }
+    })());
   }
 
-  private async dispatch(host: HostContext, request: OpenCodexRequest): Promise<OpenCodexResponse> {
-    let extra: Partial<OpenCodexResponse> = {};
+  private async act(host: HostContext, request: OpenCodexRequest): Promise<ActionResult> {
     switch (request.action) {
-      case 'snapshot': break;
-      case 'check': await this.checkAndRearm(host); break;
-      case 'classify': await classify(host); break;
-      case 'report': await report(host, request.id); break;
-      case 'start': extra = { startedSessionId: await start(host, request.id) }; break;
-      case 'ignore': await ignore(host, request.id); break;
-      case 'restore': await restore(host, request.id); break;
-      case 'readReport': extra = { report: await readReport(host, request.id) }; break;
-      case 'candidate': extra = { candidate: await candidate(host, request.id) }; break;
-      case 'rebuildIndex': await rebuildIndex(host); break;
-      case 'settings': await updateSettings(host, request.patch); break;
+      case 'snapshot': return {};
+      case 'check': await this.checkAndRearm(host); return {};
+      case 'classify': await classify(host); return {};
+      case 'report': await report(host, request.id); return {};
+      case 'start': return { startedSessionId: await start(host, request.id) };
+      case 'ignore': await ignore(host, request.id); return {};
+      case 'restore': await restore(host, request.id); return {};
+      case 'readReport': return { report: await readReport(host, request.id) };
+      case 'candidate': return { candidate: await candidate(host, request.id) };
+      case 'rebuildIndex': await rebuildIndex(host); return {};
+      case 'settings': await updateSettings(host, request.patch); return {};
     }
-    return { ...await snapshot(host), ...extra };
   }
 
   private async open(deps: Dependencies): Promise<HostContext> {
     const now = deps.now ?? (() => new Date());
     let settings = await loadSettings(this.directory);
     const host: HostContext = {
-      directory: this.directory, store: new CandidateStore(this.directory, now), now, signal: this.lifetime.signal, services: this.ctx,
+      directory: this.directory, store: new CandidateStore(this.directory, now), now, signal: this.lifetime.signal, services: servicesOf(this.ctx),
       settings: () => settings,
       setSettings: next => { settings = next; this.rearm(host); },
       github: () => deps.github ?? new GitHubClient(),
-      fetcher: deps.fetcher, reportPollMs: deps.reportPollMs, checkTimeoutMs: deps.checkTimeoutMs,
+      fetcher: deps.fetcher, reportPollMs: deps.reportPollMs, timeouts: { ...TIMEOUTS, ...deps.timeouts },
       index: await loadIndex(this.directory),
       busy: new Map(), running: new Map(), reportsRunning: 0,
       lanes: { settings: new Lane(), reports: new Lane(), classify: new Lane(), index: new Lane() },
@@ -124,10 +148,7 @@ export default class OpenCodex extends TypertRemoteService {
 
   /** A check, by request or by the timer; when it ends, the next one is due a whole interval later. */
   private async checkAndRearm(host: HostContext): Promise<CheckResult> {
-    try { return await check(host); } finally {
-      this.lastCheckAt = host.now().getTime();
-      this.arm(host.settings().checkIntervalHours * HOUR);
-    }
+    try { return await check(host); } finally { this.arm(host.settings().checkIntervalHours * HOUR); }
   }
 
   private disarm(): void {
@@ -142,10 +163,11 @@ export default class OpenCodex extends TypertRemoteService {
 
   /** After a settings change: the next check is due one (new) interval after the last one ended. The startup timer, and a check in progress, re-arm by themselves. */
   private rearm(host: HostContext): void {
-    if (this.lastCheckAt === undefined || host.running.has('check')) return;
-    this.arm(this.lastCheckAt + host.settings().checkIntervalHours * HOUR - host.now().getTime());
+    if (host.lastCheckAt === undefined || host.running.has('check')) return;
+    this.arm(Date.parse(host.lastCheckAt) + host.settings().checkIntervalHours * HOUR - host.now().getTime());
   }
 
+  /** A timer run. A failure is recorded as `lastCheck` by the check itself, so the page shows it; the log gets it too. */
   private async scheduled(): Promise<void> {
     try { await this.track(this.ready.then(host => this.checkAndRearm(host))); } catch (error) {
       if (!this.closed) this.ctx.logger.warn(`OpenCodex: scheduled check failed: ${messageOf(error)}`);
