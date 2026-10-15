@@ -11,12 +11,16 @@ import { addedLines, changedWatched, collectFileChanges, groupWatchedFiles, WATC
 
 test('WATCHED matches the four path families only', () => {
   for (const p of ['codex-rs/features/src/lib.rs', 'codex-rs/app-server-protocol/schema/typescript/TurnStartParams.ts', 'docs/config.md', 'codex-rs/config.md']) assert.ok(WATCHED(p), p);
-  for (const p of ['codex-rs/core/src/x.rs', 'docs/images/a.png', 'docs/sub/dir.md']) assert.ok(!WATCHED(p), p);
+  for (const p of ['codex-rs/core/src/x.rs', 'docs/images/a.png', 'docs/sub/dir.md', 'codex-rs/features/src/tests.rs', 'codex-rs/features/Cargo.toml']) assert.ok(!WATCHED(p), p);
 });
 
-test('WATCHED is anchored: look-alike paths are not watched, everything under the two directories is', () => {
-  for (const p of ['xcodex-rs/features/a.rs', 'codex-rs/featuresx/a.rs', 'codex-rs/app-server-protocol/schema/json/A.json', 'docs/config.json', 'docs/a.md/b', 'codex-rs/config.md.bak', 'codex-rs/sub/config.md', 'README.md']) assert.ok(!WATCHED(p), p);
-  for (const p of ['codex-rs/features/Cargo.toml', 'codex-rs/features/src/legacy.rs', 'codex-rs/app-server-protocol/schema/typescript/v2/ThreadStartParams.ts', 'docs/README.md']) assert.ok(WATCHED(p), p);
+test('WATCHED is anchored: look-alike paths are not watched, only Rust sources of the features crate are', () => {
+  for (const p of ['xcodex-rs/features/src/a.rs', 'codex-rs/featuresx/src/a.rs', 'codex-rs/features/src/a.rs.orig', 'codex-rs/features/src/README.md', 'codex-rs/app-server-protocol/schema/json/A.json', 'docs/config.json', 'docs/a.md/b', 'codex-rs/config.md.bak', 'codex-rs/sub/config.md', 'README.md']) assert.ok(!WATCHED(p), p);
+  for (const p of ['codex-rs/features/src/legacy.rs', 'codex-rs/features/src/feature_configs.rs', 'codex-rs/features/src/registry/flags.rs', 'codex-rs/features/src/contests.rs', 'codex-rs/app-server-protocol/schema/typescript/v2/ThreadStartParams.ts', 'docs/README.md']) assert.ok(WATCHED(p), p);
+});
+
+test('WATCHED leaves out the build files and the test modules of the features crate', () => {
+  for (const p of ['codex-rs/features/Cargo.toml', 'codex-rs/features/BUILD.bazel', 'codex-rs/features/src/tests.rs', 'codex-rs/features/src/registry/tests.rs', 'codex-rs/features/src/legacy_tests.rs', 'codex-rs/features/tests/flags.rs']) assert.ok(!WATCHED(p), p);
 });
 
 test('changedWatched reports added, removed and modified blobs', () => {
@@ -58,37 +62,45 @@ test('groups by family and bounds the excerpt', () => {
     { path: 'codex-rs/app-server-protocol/schema/typescript/TurnStartParams.ts', status: 'modified', added: ['rootTurnId?: string'] },
     { path: 'docs/skills.md', status: 'added', added: Array.from({ length: 500 }, (_, i) => `line ${i} ${'x'.repeat(40)}`) },
   ]);
-  assert.deepEqual(groups.map(g => g.key), ['feature-flags', 'schema:TurnStartParams', 'doc:docs/skills.md']);
+  assert.deepEqual(groups.map(g => g.key), ['feature-flags', 'schema', 'doc:docs/skills.md']);
+  assert.deepEqual(groups.map(g => g.files.length), [1, 1, 1]); // one evidence entry per changed file
+  assert.equal(groups[1]!.title, '协议类型有变化：1 个类型');
   assert.ok(groups.every(g => g.excerpt.length <= 6_000));
 });
 
-test('groupWatchedFiles names and classifies each group, merges the feature files and drops unwatched paths', () => {
+test('groupWatchedFiles names and classifies each group, puts every protocol type in one and drops unwatched paths', () => {
   const groups = groupWatchedFiles([
     { path: 'codex-rs/features/src/lib.rs', status: 'modified', added: ['pub const A: u8 = 1;'] },
-    { path: 'codex-rs/features/Cargo.toml', status: 'modified', added: ['serde = "1"'] },
+    { path: 'codex-rs/features/src/legacy.rs', status: 'modified', added: ['const OLD: u8 = 2;'] },
+    { path: 'codex-rs/app-server-protocol/schema/typescript/TurnStartParams.ts', status: 'modified', added: ['rootTurnId?: string'] },
     { path: 'codex-rs/app-server-protocol/schema/typescript/v2/ThreadStartParams.ts', status: 'added', added: ['export type ThreadStartParams = {};'] },
     { path: 'codex-rs/config.md', status: 'modified', added: ['## Hooks'] },
     { path: 'codex-rs/core/src/x.rs', status: 'modified', added: ['not watched'] },
+    { path: 'codex-rs/features/Cargo.toml', status: 'modified', added: ['serde = "1"'] },
+    { path: 'codex-rs/features/src/tests.rs', status: 'modified', added: ['fn a_test() {}'] },
   ]);
   assert.deepEqual(groups.map(g => [g.key, g.kind, g.title, g.files.length]), [
     ['feature-flags', 'feature-flag', '功能开关注册表有变化', 2],
-    ['schema:ThreadStartParams', 'schema', '协议类型有变化：ThreadStartParams', 1],
+    ['schema', 'schema', '协议类型有变化：2 个类型', 2],
     ['doc:codex-rs/config.md', 'doc', '文档有变化：codex-rs/config.md', 1],
   ]);
-  // Excerpt lines are `<basename>: <line>`, files in the order given.
-  assert.equal(groups[0]!.excerpt, 'lib.rs: pub const A: u8 = 1;\nCargo.toml: serde = "1"');
+  // Excerpt lines are `<basename>: <line>`, or `<TypeName>: <line>` for a protocol type; files in the order given.
+  assert.equal(groups[0]!.excerpt, 'lib.rs: pub const A: u8 = 1;\nlegacy.rs: const OLD: u8 = 2;');
+  assert.equal(groups[1]!.excerpt, 'TurnStartParams: rootTurnId?: string\nThreadStartParams: export type ThreadStartParams = {};');
   assert.equal(groups[2]!.excerpt, 'config.md: ## Hooks');
 });
 
 test('a removed or unreadable file still says so in the excerpt, where its added lines would be', () => {
-  const [removed, unreadable, long] = groupWatchedFiles([
+  const [removed, unreadable, long, type] = groupWatchedFiles([
     { path: 'docs/gone.md', status: 'removed', added: [] },
     { path: 'docs/big.md', status: 'modified', added: [], error: 'docs/big.md@rust-v0.162.1 is larger than the 1 MB\nthe GitHub contents API returns (2500000 bytes)' },
     { path: 'docs/long.md', status: 'modified', added: [], error: 'e'.repeat(500) },
+    { path: 'codex-rs/app-server-protocol/schema/typescript/v2/OldType.ts', status: 'removed', added: [] },
   ]);
   assert.equal(removed!.excerpt, 'gone.md: （文件已删除）');
   assert.equal(unreadable!.excerpt, 'big.md: （内容未读取：docs/big.md@rust-v0.162.1 is larger than the 1 MB the GitHub contents API returns (2500000 bytes)）');
   assert.equal(long!.excerpt, `long.md: （内容未读取：${'e'.repeat(199)}…）`); // the reason is cut at 200 characters
+  assert.equal(type!.excerpt, 'OldType: （文件已删除）');
 });
 
 test('the excerpt ends at a whole line, and one line longer than the cap is cut with an ellipsis', () => {
@@ -112,10 +124,12 @@ test('the excerpt ends at a whole line, and one line longer than the cap is cut 
 // --- collectFileChanges: a temp-dir store and a stub GitHub client, no network ---
 
 type FilesGitHub = Pick<GitHubClient, 'treePaths' | 'fileAt'>;
-const WINDOW: StableWindow = { from: 'rust-v0.162.0', to: 'rust-v0.162.1', releases: ['rust-v0.162.1'] };
+const windowOf = (from: string, to: string): StableWindow => ({ from, to, releases: [to] });
+const WINDOW = windowOf('rust-v0.162.0', 'rust-v0.162.1');
 const compareUrl = (window: StableWindow) => `https://github.com/openai/codex/compare/${window.from}...${window.to}`;
 const COMPARE = compareUrl(WINDOW);
 const OVER_BUDGET = 'skipped: over the per-run fetch budget';
+const TYPES_DIR = 'codex-rs/app-server-protocol/schema/typescript';
 const isAbortError = (error: unknown) => (error as Error).name === 'AbortError';
 
 /** `trees` holds the watched blobs of each tag and `texts` the file bodies by `tag:path`. `calls` records every request in order; `failing` makes `fileAt` throw for a path. */
@@ -217,6 +231,48 @@ test('collectFileChanges: one candidate per group, the snapshot keeps every chan
   });
 });
 
+test('collectFileChanges: every changed protocol type of the window is one candidate, one evidence entry per type file', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const stub = stubGitHub(
+      {
+        'rust-v0.162.0': new Map([[`${TYPES_DIR}/Turn.ts`, '1'], [`${TYPES_DIR}/v2/SkillSummary.ts`, '1'], [`${TYPES_DIR}/ClientRequest.ts`, '1']]),
+        'rust-v0.162.1': new Map([[`${TYPES_DIR}/Turn.ts`, '2'], [`${TYPES_DIR}/v2/SkillSummary.ts`, '2'], [`${TYPES_DIR}/v2/RequestHeader.ts`, '1'], [`${TYPES_DIR}/ClientRequest.ts`, '1']]),
+      },
+      {
+        [`rust-v0.162.0:${TYPES_DIR}/Turn.ts`]: 'export type Turn = {\n  id: string,\n};\n',
+        [`rust-v0.162.1:${TYPES_DIR}/Turn.ts`]: 'export type Turn = {\n  id: string,\n  rootTurnId?: string,\n};\n',
+        [`rust-v0.162.0:${TYPES_DIR}/v2/SkillSummary.ts`]: 'export type SkillSummary = {\n  name: string,\n};\n',
+        [`rust-v0.162.1:${TYPES_DIR}/v2/SkillSummary.ts`]: 'export type SkillSummary = {\n  name: string,\n  scope: string,\n};\n',
+        [`rust-v0.162.1:${TYPES_DIR}/v2/RequestHeader.ts`]: 'export type RequestHeader = { name: string };\n',
+      },
+    );
+    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, WINDOW), 1); // ClientRequest.ts did not change
+    const stored = await filesCandidates(store);
+    assert.deepEqual(stored.map(c => c.fingerprint), ['codex-files:schema:0.162']);
+    const [schema] = stored;
+    assert.equal(schema!.title, '协议类型有变化：3 个类型');
+    assert.deepEqual(schema!.evidence, [ // in path order
+      { kind: 'schema', ref: `${TYPES_DIR}/Turn.ts`, url: COMPARE, excerpt: '  rootTurnId?: string,' },
+      { kind: 'schema', ref: `${TYPES_DIR}/v2/RequestHeader.ts`, url: COMPARE, excerpt: 'export type RequestHeader = { name: string };' },
+      { kind: 'schema', ref: `${TYPES_DIR}/v2/SkillSummary.ts`, url: COMPARE, excerpt: '  scope: string,' },
+    ]);
+    assert.equal(schema!.summary, 'Turn:   rootTurnId?: string,\nRequestHeader: export type RequestHeader = { name: string };\nSkillSummary:   scope: string,');
+  });
+});
+
+test('collectFileChanges: the build files and test modules of the features crate are neither read nor recorded', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const changed = (sha: string) => new Map(['src/lib.rs', 'src/tests.rs', 'src/legacy_tests.rs', 'Cargo.toml', 'BUILD.bazel'].map(name => [`codex-rs/features/${name}`, sha]));
+    const stub = stubGitHub(
+      { 'rust-v0.162.0': changed('1'), 'rust-v0.162.1': changed('2') },
+      { 'rust-v0.162.0:codex-rs/features/src/lib.rs': 'A,\n', 'rust-v0.162.1:codex-rs/features/src/lib.rs': 'A,\nB,\n' },
+    );
+    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, WINDOW), 1);
+    assert.deepEqual(stub.calls.fileAt, ['rust-v0.162.0:codex-rs/features/src/lib.rs', 'rust-v0.162.1:codex-rs/features/src/lib.rs']);
+    assert.deepEqual((await readSnapshot(snapshotDir, WINDOW)).files.map(f => f.path), ['codex-rs/features/src/lib.rs']);
+  });
+});
+
 test('collectFileChanges: the summary and the evidence excerpts are bounded at whole lines, the snapshot keeps every added line', async () => {
   await withStore(async (store, snapshotDir) => {
     const lines = Array.from({ length: 300 }, (_, i) => `line ${i} ${'x'.repeat(40)}`);
@@ -271,7 +327,7 @@ test('collectFileChanges: whatever a request fails with is recorded as text, and
   await withStore(async (store, snapshotDir) => {
     const stub = scenario();
     // Plain functions, not async ones: `config.md` is rejected at `from` and thrown at `to`; the other two files fail with values that are not Errors.
-    stub.github.fileAt = ((tag, path, signal) => {
+    stub.github.fileAt = ((tag, path) => {
       if (path === 'codex-rs/config.md') {
         if (tag === 'rust-v0.162.0') return Promise.reject(new Error('rejected'));
         throw new Error('threw synchronously');
@@ -354,17 +410,17 @@ test('collectFileChanges: at most 60 files are read, feature flags first, then s
     // Added in a deliberately unhelpful order: docs first.
     for (let i = 59; i >= 0; i--) put(`docs/d${String(i).padStart(2, '0')}.md`);
     put('codex-rs/config.md');
-    for (const name of ['C', 'B', 'A']) put(`codex-rs/app-server-protocol/schema/typescript/${name}.ts`);
+    for (const name of ['C', 'B', 'A']) put(`${TYPES_DIR}/${name}.ts`);
     for (const name of ['c', 'b', 'a']) put(`codex-rs/features/src/${name}.rs`);
     const stub = stubGitHub({ 'rust-v0.162.0': new Map(), 'rust-v0.162.1': after }, texts);
 
-    // 3 feature files make one group, 3 schema files three, config.md one and 60 docs sixty: 65 candidates.
-    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, WINDOW), 65);
+    // The 3 feature files make one group, the 3 protocol types one, config.md one and the 60 docs sixty: 63 candidates.
+    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, WINDOW), 63);
     const fetched = stub.calls.fileAt.map(call => call.slice('rust-v0.162.1:'.length));
     assert.equal(fetched.length, 60);
     assert.deepEqual(fetched.slice(0, 7), [
       'codex-rs/features/src/a.rs', 'codex-rs/features/src/b.rs', 'codex-rs/features/src/c.rs',
-      'codex-rs/app-server-protocol/schema/typescript/A.ts', 'codex-rs/app-server-protocol/schema/typescript/B.ts', 'codex-rs/app-server-protocol/schema/typescript/C.ts',
+      `${TYPES_DIR}/A.ts`, `${TYPES_DIR}/B.ts`, `${TYPES_DIR}/C.ts`,
       'codex-rs/config.md',
     ]);
     assert.deepEqual(fetched.slice(7), Array.from({ length: 53 }, (_, i) => `docs/d${String(i).padStart(2, '0')}.md`)); // alphabetical within a family
@@ -377,9 +433,47 @@ test('collectFileChanges: at most 60 files are read, feature flags first, then s
     assert.ok(skipped.every(f => f.status === 'added' && f.added.length === 0 && f.error === OVER_BUDGET));
     assert.ok(files.filter(f => !f.error).every(f => f.added.length === 1));
 
+    const schema = await store.findByFingerprint('codex-files:schema:0.162');
+    assert.equal(schema!.title, '协议类型有变化：3 个类型');
+    assert.deepEqual(schema!.evidence.map(e => e.ref), [`${TYPES_DIR}/A.ts`, `${TYPES_DIR}/B.ts`, `${TYPES_DIR}/C.ts`]);
     // A file past the budget is unread, not unchanged: it still gets a candidate that says so.
     const last = await store.findByFingerprint('codex-files:doc:docs/d59.md:0.162');
     assert.match(last!.summary, new RegExp(`^d59\\.md: （内容未读取：${OVER_BUDGET}）$`));
+  });
+});
+
+test('collectFileChanges: the caller sets the budget; a file past it is unread but still a candidate', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const stub = scenario();
+    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, WINDOW, undefined, { budget: 2 }), 3);
+    // Priority order: the feature file, then config.md (two requests); docs/skills.md is the third file.
+    assert.deepEqual(stub.calls.fileAt, ['rust-v0.162.0:codex-rs/features/src/lib.rs', 'rust-v0.162.0:codex-rs/config.md', 'rust-v0.162.1:codex-rs/config.md']);
+    const { files } = await readSnapshot(snapshotDir, WINDOW);
+    assert.deepEqual(files.filter(f => f.error), [{ path: 'docs/skills.md', status: 'added', added: [], error: OVER_BUDGET }]);
+    assert.match((await store.findByFingerprint('codex-files:doc:docs/skills.md:0.162'))!.summary, /^skills\.md: （内容未读取：skipped: over/);
+  });
+});
+
+test('collectFileChanges: a budget of zero reads nothing, an omitted one is the default, and one that is not a count is refused before any request', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const none = scenario();
+    assert.equal(await collectFileChanges(store, none.github, snapshotDir, WINDOW, undefined, { budget: 0 }), 3);
+    assert.deepEqual(none.calls.fileAt, []);
+    assert.equal((await readSnapshot(snapshotDir, WINDOW)).files.filter(f => f.error === OVER_BUDGET).length, 3);
+  });
+  await withStore(async (store, snapshotDir) => {
+    const stub = scenario();
+    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, WINDOW, undefined, {}), 3);
+    assert.equal(stub.calls.fileAt.length, 4); // all three files read: 1 + 2 + 1 requests
+    assert.equal((await readSnapshot(snapshotDir, WINDOW)).files.filter(f => f.error).length, 0);
+  });
+  await withStore(async (store, snapshotDir) => {
+    for (const budget of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const stub = scenario();
+      await assert.rejects(collectFileChanges(store, stub.github, snapshotDir, WINDOW, undefined, { budget }), (error: unknown) => (error as Error).name === 'ValidationError' && /budget/.test((error as Error).message));
+      assert.deepEqual(stub.calls.treePaths, []);
+    }
+    await assertNothingWritten(store, snapshotDir);
   });
 });
 
@@ -446,22 +540,113 @@ test('collectFileChanges: 0.162.0 and 0.162.1 land on one candidate, 0.163.0 on 
         'rust-v0.162.1:docs/skills.md': 'one\ntwo\nthree\n', 'rust-v0.163.0:docs/skills.md': 'one\ntwo\nthree\nfour\n',
       },
     );
-    const window = (from: string, to: string): StableWindow => ({ from, to, releases: [to] });
+    const first = windowOf('rust-v0.161.0', 'rust-v0.162.0'), second = windowOf('rust-v0.162.0', 'rust-v0.162.1'), third = windowOf('rust-v0.162.1', 'rust-v0.163.0');
 
-    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, window('rust-v0.161.0', 'rust-v0.162.0')), 1);
-    const [first] = await filesCandidates(store);
-    assert.equal(first!.fingerprint, 'codex-files:doc:docs/skills.md:0.162');
-    assert.equal(first!.summary, 'skills.md: two');
+    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, first), 1);
+    const [firstSeen] = await filesCandidates(store);
+    assert.equal(firstSeen!.fingerprint, 'codex-files:doc:docs/skills.md:0.162');
+    assert.equal(firstSeen!.summary, 'skills.md: two');
 
-    // The patch release refreshes the same candidate: nothing is created, the content and window are the latest.
-    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, window('rust-v0.162.0', 'rust-v0.162.1')), 0);
+    // The patch release refreshes the same candidate: nothing is created. The same file found again takes the newer entry; the window still starts where the first one did.
+    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, second), 0);
     const stored = await filesCandidates(store);
     assert.equal(stored.length, 1);
-    assert.equal(stored[0]!.id, first!.id);
+    assert.equal(stored[0]!.id, firstSeen!.id);
     assert.equal(stored[0]!.summary, 'skills.md: three');
-    assert.deepEqual(stored[0]!.window, { fromTag: 'rust-v0.162.0', toTag: 'rust-v0.162.1' });
+    assert.deepEqual(stored[0]!.evidence, [{ kind: 'doc', ref: 'docs/skills.md', url: compareUrl(second), excerpt: 'three' }]);
+    assert.deepEqual(stored[0]!.window, { fromTag: 'rust-v0.161.0', toTag: 'rust-v0.162.1' });
 
-    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, window('rust-v0.162.1', 'rust-v0.163.0')), 1);
-    assert.deepEqual((await filesCandidates(store)).map(c => c.fingerprint), ['codex-files:doc:docs/skills.md:0.162', 'codex-files:doc:docs/skills.md:0.163']);
+    // The next minor starts a candidate of its own, from its own window.
+    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, third), 1);
+    const all = await filesCandidates(store);
+    assert.deepEqual(all.map(c => c.fingerprint), ['codex-files:doc:docs/skills.md:0.162', 'codex-files:doc:docs/skills.md:0.163']);
+    assert.deepEqual(all[1]!.window, { fromTag: 'rust-v0.162.1', toTag: 'rust-v0.163.0' });
+    assert.deepEqual(all[0]!.window, { fromTag: 'rust-v0.161.0', toTag: 'rust-v0.162.1' });
+  });
+});
+
+test('collectFileChanges: a patch release adds its protocol types to the candidate of the minor, which keeps the first window start', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const type = (name: string) => `${TYPES_DIR}/${name}.ts`;
+    const stub = stubGitHub(
+      {
+        'rust-v0.161.0': new Map([[type('A'), '1'], [type('B'), '1']]),
+        'rust-v0.162.0': new Map([[type('A'), '2'], [type('B'), '1']]), // 0.162.0 changes A
+        'rust-v0.162.1': new Map([[type('A'), '2'], [type('B'), '2']]), // 0.162.1 changes B
+      },
+      {
+        [`rust-v0.161.0:${type('A')}`]: 'type A = {\n  one,\n};\n', [`rust-v0.162.0:${type('A')}`]: 'type A = {\n  one,\n  two,\n};\n',
+        [`rust-v0.162.0:${type('B')}`]: 'type B = {\n  one,\n};\n', [`rust-v0.162.1:${type('B')}`]: 'type B = {\n  one,\n  three,\n};\n',
+      },
+    );
+    const first = windowOf('rust-v0.161.0', 'rust-v0.162.0'), second = windowOf('rust-v0.162.0', 'rust-v0.162.1');
+
+    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, first), 1);
+    const [before] = await filesCandidates(store);
+    assert.equal(before!.fingerprint, 'codex-files:schema:0.162');
+    assert.equal(before!.title, '协议类型有变化：1 个类型');
+
+    // The patch release finds another type: the candidate is refreshed, not duplicated, and holds both.
+    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, second), 0);
+    const stored = await filesCandidates(store);
+    assert.equal(stored.length, 1);
+    const [merged] = stored;
+    assert.equal(merged!.id, before!.id);
+    assert.equal(merged!.status, 'new');
+    assert.equal(merged!.title, '协议类型有变化：2 个类型'); // counts the types of the whole candidate
+    assert.equal(merged!.summary, 'B:   three,'); // the newest window's excerpt
+    assert.deepEqual(merged!.evidence, [
+      { kind: 'schema', ref: type('A'), url: compareUrl(first), excerpt: '  two,' },
+      { kind: 'schema', ref: type('B'), url: compareUrl(second), excerpt: '  three,' },
+    ]);
+    assert.deepEqual(merged!.window, { fromTag: 'rust-v0.161.0', toTag: 'rust-v0.162.1' });
+  });
+});
+
+test('collectFileChanges: a type found again replaces its entry, types found only before stay in front, a rerun changes nothing', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const type = (name: string) => `${TYPES_DIR}/${name}.ts`;
+    const stub = stubGitHub(
+      {
+        'rust-v0.161.0': new Map([[type('Y'), '1'], [type('Z'), '1']]),
+        'rust-v0.162.0': new Map([[type('Y'), '2'], [type('Z'), '2']]), // 0.162.0 changes Y and Z
+        'rust-v0.162.1': new Map([[type('X'), '1'], [type('Y'), '3'], [type('Z'), '2']]), // 0.162.1 adds X and changes Y again
+        'rust-v0.163.0': new Map([[type('X'), '1'], [type('Y'), '3'], [type('Z'), '3']]), // 0.163.0 changes Z
+      },
+      {
+        [`rust-v0.161.0:${type('Y')}`]: 'y1\n', [`rust-v0.161.0:${type('Z')}`]: 'z1\n',
+        [`rust-v0.162.0:${type('Y')}`]: 'y1\ny2\n', [`rust-v0.162.0:${type('Z')}`]: 'z1\nz2\n',
+        [`rust-v0.162.1:${type('X')}`]: 'x1\n', [`rust-v0.162.1:${type('Y')}`]: 'y1\ny2\ny3\n', [`rust-v0.162.1:${type('Z')}`]: 'z1\nz2\n',
+        [`rust-v0.163.0:${type('Z')}`]: 'z1\nz2\nz3\n',
+      },
+    );
+    const first = windowOf('rust-v0.161.0', 'rust-v0.162.0'), second = windowOf('rust-v0.162.0', 'rust-v0.162.1'), third = windowOf('rust-v0.162.1', 'rust-v0.163.0');
+
+    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, first), 1);
+    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, second), 0);
+    const [merged] = await filesCandidates(store);
+    // Z was found only by the first window and stays in front; Y was found again and takes the second window's entry; X is new.
+    assert.deepEqual(merged!.evidence, [
+      { kind: 'schema', ref: type('Z'), url: compareUrl(first), excerpt: 'z2' },
+      { kind: 'schema', ref: type('X'), url: compareUrl(second), excerpt: 'x1' },
+      { kind: 'schema', ref: type('Y'), url: compareUrl(second), excerpt: 'y3' },
+    ]);
+    assert.equal(merged!.title, '协议类型有变化：3 个类型');
+    assert.equal(merged!.summary, 'X: x1\nY: y3');
+    assert.deepEqual(merged!.window, { fromTag: 'rust-v0.161.0', toTag: 'rust-v0.162.1' });
+
+    // The same window again changes nothing, not even the time of the last write.
+    const settled = await filesCandidates(store);
+    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, second), 0);
+    assert.deepEqual(await filesCandidates(store), settled);
+
+    // The next minor does not merge into it.
+    assert.equal(await collectFileChanges(store, stub.github, snapshotDir, third), 1);
+    const all = await filesCandidates(store);
+    assert.deepEqual(all.map(c => c.fingerprint), ['codex-files:schema:0.162', 'codex-files:schema:0.163']);
+    assert.deepEqual(all[0], settled[0]);
+    assert.deepEqual(all[1]!.evidence, [{ kind: 'schema', ref: type('Z'), url: compareUrl(third), excerpt: 'z3' }]);
+    assert.equal(all[1]!.title, '协议类型有变化：1 个类型');
+    assert.deepEqual(all[1]!.window, { fromTag: 'rust-v0.162.1', toTag: 'rust-v0.163.0' });
   });
 });

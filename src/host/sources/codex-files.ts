@@ -3,12 +3,19 @@
  * This source takes the recursive tree of each tag instead, keeps the watched paths and compares blob shas; only the files whose sha differs are read.
  */
 import { join } from 'node:path';
-import type { Evidence, EvidenceKind } from '../../core/candidate.js';
+import { fingerprintOf, type Evidence, type EvidenceKind } from '../../core/candidate.js';
+import { check } from '../../core/check.js';
 import { writeJsonAtomic, type CandidateStore } from '../../core/store.js';
 import type { GitHubClient } from '../github.js';
 import { minor, type StableWindow } from './codex-releases.js';
 
-export const WATCHED = (path: string): boolean => /^codex-rs\/features\/|^codex-rs\/app-server-protocol\/schema\/typescript\/|^docs\/[^/]+\.md$|^codex-rs\/config\.md$/.test(path);
+// The feature-flag registry is the Rust source of the features crate. Its build files and test modules (`tests.rs`, `*_tests.rs`) say nothing about a new flag.
+const FEATURE_SOURCE = /^codex-rs\/features\/src\/.+\.rs$/;
+const TEST_MODULE = /(?:^|\/)(?:tests|[^/]+_tests)\.rs$/;
+const SCHEMA_TYPE = /^codex-rs\/app-server-protocol\/schema\/typescript\//;
+const DOC = /^docs\/[^/]+\.md$/;
+const CONFIG_DOC = 'codex-rs/config.md';
+export const WATCHED = (path: string): boolean => (FEATURE_SOURCE.test(path) && !TEST_MODULE.test(path)) || SCHEMA_TYPE.test(path) || DOC.test(path) || path === CONFIG_DOC;
 export interface ChangedPath { path: string; status: 'added' | 'removed' | 'modified' }
 export interface ChangedFile extends ChangedPath {
   /** Lines of the new version that the old version does not have. Empty for a removed file and for a file that could not be read. */
@@ -19,19 +26,17 @@ export interface ChangedFile extends ChangedPath {
 export interface FileGroup { key: string; title: string; kind: EvidenceKind; files: ChangedFile[]; excerpt: string }
 
 /**
- * Files whose content is read in one run. The budget counts files, not requests: an added or removed file costs one request, a modified one two.
- * Through `gh` that is far below the authenticated limit; on the anonymous REST fallback (60 requests an hour) a big window can still run dry,
- * and the files after that are recorded with the error of their failed request.
+ * Files whose content is read in one run unless the caller passes another `budget`. It counts files, not requests: an added or removed file costs one request, a modified one two.
+ * Through `gh` 60 is far below the authenticated limit; on the anonymous REST fallback (60 requests an hour) the host passes a smaller budget.
  */
-const MAX_FETCHED_FILES = 60;
+const DEFAULT_BUDGET = 60;
 const OVER_BUDGET = 'skipped: over the per-run fetch budget';
 const EXCERPT_LIMIT = 6_000, SUMMARY_LIMIT = 1_000, EVIDENCE_LIMIT = 2_000, ERROR_LIMIT = 200;
 const LINE_BREAK = /\r\n|\r|\n/;
 
 type Family = 'feature-flag' | 'schema' | 'config' | 'doc';
-const FEATURES_DIR = 'codex-rs/features/', SCHEMA_DIR = 'codex-rs/app-server-protocol/schema/typescript/', CONFIG_DOC = 'codex-rs/config.md';
-const familyOf = (path: string): Family =>
-  path.startsWith(FEATURES_DIR) ? 'feature-flag' : path.startsWith(SCHEMA_DIR) ? 'schema' : path === CONFIG_DOC ? 'config' : 'doc';
+/** Only called for watched paths. */
+const familyOf = (path: string): Family => FEATURE_SOURCE.test(path) ? 'feature-flag' : SCHEMA_TYPE.test(path) ? 'schema' : path === CONFIG_DOC ? 'config' : 'doc';
 /** The order files are read in: what says most about a new capability first. */
 const PRIORITY: Record<Family, number> = { 'feature-flag': 0, schema: 1, config: 2, doc: 3 };
 const byPriority = (a: ChangedPath, b: ChangedPath): number =>
@@ -73,19 +78,35 @@ function clipLines(lines: string[], limit: number): string {
   return kept === 0 && lines.length > 0 ? cutText(lines[0]!, limit) : lines.slice(0, kept).join('\n');
 }
 
-function groupOf(path: string): Pick<FileGroup, 'key' | 'title' | 'kind'> {
+function groupOf(path: string): Pick<FileGroup, 'key' | 'kind'> {
   const family = familyOf(path);
-  if (family === 'feature-flag') return { key: 'feature-flags', title: '功能开关注册表有变化', kind: 'feature-flag' };
-  if (family === 'schema') {
-    const type = path.split('/').at(-1)!.replace(/\.ts$/, '');
-    return { key: `schema:${type}`, title: `协议类型有变化：${type}`, kind: 'schema' };
-  }
-  return { key: `doc:${path}`, title: `文档有变化：${path}`, kind: 'doc' };
+  if (family === 'feature-flag') return { key: 'feature-flags', kind: 'feature-flag' };
+  if (family === 'schema') return { key: 'schema', kind: 'schema' };
+  return { key: `doc:${path}`, kind: 'doc' };
+}
+/** The protocol group is named by how many type files it holds. */
+const schemaTitle = (types: number): string => `协议类型有变化：${types} 个类型`;
+function titleOf(group: Pick<FileGroup, 'kind' | 'files'>): string {
+  if (group.kind === 'feature-flag') return '功能开关注册表有变化';
+  if (group.kind === 'schema') return schemaTitle(group.files.length);
+  return `文档有变化：${group.files[0]!.path}`; // a doc group is the one file it is named after
 }
 
-/** `<basename>: <line>` for each added line. A file with none says why instead (removed, or unread), so that its group is not an empty shell. */
+/** What names a file in an excerpt line: the type for a protocol file (`TurnStartParams`), the file name for anything else (`lib.rs`). */
+function nameOf(path: string): string {
+  const file = path.split('/').at(-1)!;
+  return familyOf(path) === 'schema' ? file.replace(/\.ts$/, '') : file;
+}
+
+/*
+ * Two decisions about files whose content is not in hand:
+ * - A removed file has no added lines, and neither has one that could not be read (over 1 MB, a failed request, past the budget). Each says so in the excerpt,
+ *   `<name>: （文件已删除）` or `<name>: （内容未读取：<reason>）`, so that the candidate it makes is not an empty shell.
+ * - A group with such a file is still a candidate (see `hasNews`): "not read" is not "nothing new", and the change would be lost for good, because a window is collected once.
+ */
+/** `<name>: <line>` for each added line, or the reason a file has none. */
 function excerptLines(file: ChangedFile): string[] {
-  const name = file.path.split('/').at(-1)!;
+  const name = nameOf(file.path);
   if (file.added.length > 0) return file.added.map(line => `${name}: ${line}`);
   if (file.error) return [`${name}: （内容未读取：${cutText(file.error.replace(/\s+/g, ' ').trim(), ERROR_LIMIT)}）`];
   if (file.status === 'removed') return [`${name}: （文件已删除）`];
@@ -94,7 +115,7 @@ function excerptLines(file: ChangedFile): string[] {
 
 /**
  * The watched files grouped into what becomes one candidate each, in the order the groups first appear:
- * everything under `codex-rs/features/` is one group (`feature-flags`), a protocol type is one group per file name (`schema:<Type>`), a doc is one group per path (`doc:<path>`).
+ * the feature-flag sources are one group (`feature-flags`), every protocol type of the window is one group (`schema`), a doc is one group per path (`doc:<path>`).
  * The excerpt is the group's added lines (a file without any gives the reason instead), capped at 6,000 characters and cut at a whole line.
  */
 export function groupWatchedFiles(files: ChangedFile[]): FileGroup[] {
@@ -102,15 +123,18 @@ export function groupWatchedFiles(files: ChangedFile[]): FileGroup[] {
   for (const file of files) {
     if (!WATCHED(file.path)) continue;
     const head = groupOf(file.path);
-    const group = groups.get(head.key) ?? { ...head, files: [], excerpt: '' };
+    const group = groups.get(head.key) ?? { ...head, title: '', files: [], excerpt: '' };
     group.files.push(file);
     groups.set(head.key, group);
   }
-  for (const group of groups.values()) group.excerpt = clipLines(group.files.flatMap(excerptLines), EXCERPT_LIMIT);
+  for (const group of groups.values()) {
+    group.title = titleOf(group);
+    group.excerpt = clipLines(group.files.flatMap(excerptLines), EXCERPT_LIMIT);
+  }
   return [...groups.values()];
 }
 
-/** False for a group whose files were all edited in place without gaining a line and were all read: nothing to report. A removal, an addition or an unread file is. */
+/** False for a group whose files were all edited in place without gaining a line and were all read: nothing to report. A removal, an addition or an unread file is something to report. */
 const hasNews = (group: FileGroup): boolean => group.files.some(file => file.status !== 'modified' || file.added.length > 0 || file.error !== undefined);
 
 /**
@@ -130,19 +154,25 @@ async function readChange(github: Pick<GitHubClient, 'fileAt'>, window: StableWi
 }
 
 /**
- * Stores one `codex-files` candidate per group of watched files that changed from `window.from` to `window.to` and returns how many were new.
- * The fingerprint carries the minor version, so a patch release refreshes the candidate of its minor instead of adding a second one.
- * At most 60 files are read, feature flags first, then protocol types, `codex-rs/config.md` and docs (alphabetical within each); the rest are recorded unread.
+ * Stores one `codex-files` candidate per group of watched files that changed from `window.from` to `window.to` and returns how many were new:
+ * the feature-flag sources, all protocol types together, and each doc on its own.
+ * The fingerprint carries the minor version, so a patch release lands on the candidate of its minor and adds to it: evidence entries (matched by `ref`) that an earlier window
+ * found in other files stay in front, this window's entries follow and replace an older entry of the same file, `window.fromTag` stays where the first window put it, and the summary is this window's.
+ * At most `options.budget` files are read (default 60), feature flags first, then protocol types, `codex-rs/config.md` and docs (alphabetical within each); the rest are recorded unread.
  * The result is also saved as `<snapshotDir>/codex-files/<from>__<to>.json`, which keeps the added lines of every changed file, candidate or not.
  */
-export async function collectFileChanges(store: CandidateStore, github: Pick<GitHubClient, 'treePaths' | 'fileAt'>, snapshotDir: string, window: StableWindow, signal?: AbortSignal): Promise<number> {
+export async function collectFileChanges(
+  store: CandidateStore, github: Pick<GitHubClient, 'treePaths' | 'fileAt'>, snapshotDir: string, window: StableWindow, signal?: AbortSignal, options: { budget?: number } = {},
+): Promise<number> {
+  const budget = options.budget ?? DEFAULT_BUDGET;
+  check(Number.isInteger(budget) && budget >= 0, `budget must be a non-negative integer, got ${budget}`);
   signal?.throwIfAborted();
   const [before, after] = await Promise.all([github.treePaths(window.from, WATCHED, signal), github.treePaths(window.to, WATCHED, signal)]);
   const changes = changedWatched(before, after);
   const loaded = new Map<string, ChangedFile>();
   for (const [index, change] of [...changes].sort(byPriority).entries()) {
     signal?.throwIfAborted();
-    loaded.set(change.path, index < MAX_FETCHED_FILES ? await readChange(github, window, change, signal) : { ...change, added: [], error: OVER_BUDGET });
+    loaded.set(change.path, index < budget ? await readChange(github, window, change, signal) : { ...change, added: [], error: OVER_BUDGET });
   }
   const files = changes.map(change => loaded.get(change.path)!); // back in the order of the tree diff
   signal?.throwIfAborted();
@@ -150,11 +180,17 @@ export async function collectFileChanges(store: CandidateStore, github: Pick<Git
   const url = `https://github.com/openai/codex/compare/${window.from}...${window.to}`;
   let added = 0;
   for (const group of groupWatchedFiles(files).filter(hasNews)) {
+    const key = `${group.key}:${minor(window.to)}`;
+    const found = group.files.map((file): Evidence => ({ kind: group.kind, ref: file.path, url, excerpt: clipLines(file.added, EVIDENCE_LIMIT) }));
+    // Read here and written by `upsert` below: one Host runs one check at a time, so nothing writes this candidate in between.
+    const existing = await store.findByFingerprint(fingerprintOf('codex-files', key));
+    const refs = new Set(found.map(entry => entry.ref));
+    const evidence = [...(existing?.evidence ?? []).filter(entry => !refs.has(entry.ref)), ...found];
+    // The protocol title counts the types of the whole candidate, not only the ones this window found.
+    const title = group.kind === 'schema' ? schemaTitle(evidence.length) : group.title;
     const { created } = await store.upsert({
-      source: 'codex-files', key: `${group.key}:${minor(window.to)}`, title: group.title,
-      summary: clipLines(group.excerpt.split('\n'), SUMMARY_LIMIT),
-      evidence: group.files.map((file): Evidence => ({ kind: group.kind, ref: file.path, url, excerpt: clipLines(file.added, EVIDENCE_LIMIT) })),
-      window: { fromTag: window.from, toTag: window.to },
+      source: 'codex-files', key, title, summary: clipLines(group.excerpt.split('\n'), SUMMARY_LIMIT), evidence,
+      window: { fromTag: existing?.window?.fromTag ?? window.from, toTag: window.to },
     });
     if (created) added++;
   }
