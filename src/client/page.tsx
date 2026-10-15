@@ -10,20 +10,6 @@ import { Markdown, revealHidden } from './markdown.js';
 
 type Call = (request: OpenCodexRequest, signal?: AbortSignal) => Promise<OpenCodexResponse>;
 type OpenSession = (sessionId: string) => void;
-/**
- * What the Host's answers are gaining (a capped candidate list, its own busy state, the time of the last check, a notice). Optional, so the
- * page reads them where the Host sends them and does without where it does not yet.
- */
-interface HostState {
-  totalCandidates?: number;
-  /** Older candidates the snapshot left out. */
-  omittedCandidates?: number;
-  notice?: string;
-  /** What the Host is running now, whoever asked for it: a reloaded page learns it from here. */
-  busy?: { check: boolean; candidates: Record<string, 'report' | 'start'> };
-  lastCheckAt?: string;
-}
-type Snapshot = OpenCodexResponse & HostState;
 type Category = typeof CATEGORIES[number];
 type Relevance = typeof RELEVANCES[number];
 type LastCheck = NonNullable<OpenCodexResponse['lastCheck']>;
@@ -70,7 +56,7 @@ export interface Filters {
 }
 export const DEFAULT_FILTERS: Filters = { source: 'all', category: 'all', relevance: 'not-low', status: 'not-ignored' };
 
-/** The candidates the filters let through, latest change first. */
+/** The candidates the filters let through, latest discovered first: a classification or a status change does not move a row. */
 export function visibleCandidates(list: readonly Candidate[], filters: Filters): Candidate[] {
   const { source, category, relevance, status } = filters;
   return list.filter(item => {
@@ -79,7 +65,7 @@ export function visibleCandidates(list: readonly Candidate[], filters: Filters):
       && (category === 'all' || (category === 'none' ? !classification : classification?.category === category))
       && (relevance === 'all' || (relevance === 'not-low' ? classification?.relevance !== 'low' : classification?.relevance === relevance))
       && (status === 'all' || (status === 'not-ignored' ? item.status !== 'ignored' : item.status === status));
-  }).sort((a, b) => newestFirst(a.updatedAt, b.updatedAt) || newestFirst(a.createdAt, b.createdAt) || (a.id < b.id ? -1 : 1));
+  }).sort((a, b) => newestFirst(a.createdAt, b.createdAt) || (a.id < b.id ? -1 : 1));
 }
 
 /** Where a merged candidate went, one hop only: classifications can point in a circle. The target's title when it is listed, else its id. */
@@ -170,12 +156,12 @@ function LastCheckLine({ lastCheck, at }: { lastCheck?: LastCheck; at?: string }
   </div>;
 }
 
-function IndexLine({ summary, busy, rebuild }: { summary?: IndexSummary; busy: boolean; rebuild: () => Promise<boolean> }) {
+function IndexLine({ summary, mirrorSet, busy, rebuild }: { summary?: IndexSummary; mirrorSet: boolean; busy: boolean; rebuild: () => Promise<boolean> }) {
   return <div className="oc-line">
     <strong>DSH 索引</strong>
     {summary
       ? <><span>{summary.entries.toLocaleString('zh-CN')} 条</span><span>提交 <code>{summary.commit.slice(0, 12)}</code></span><span>建于 {time(summary.builtAt)}</span></>
-      : <span className="oc-muted">还没有建，先在设置里填 DSH 镜像路径</span>}
+      : <span className="oc-muted">{mirrorSet ? '还没有建，点「重建索引」' : '还没有建，先在设置里填 DSH 镜像路径'}</span>}
     <button type="button" className="oc-small" disabled={busy} onClick={rebuild}>{busy ? '重建中…' : '重建索引'}</button>
   </div>;
 }
@@ -191,7 +177,7 @@ function FilterBar({ filters, change, shown, total }: { filters: Filters; change
     {pick('category', '分类', [['all', '全部'], ...CATEGORIES.map(value => [value, CATEGORY_LABELS[value]] as const), ['none', '未归类']])}
     {pick('relevance', '相关度', [['not-low', '不含低'], ['all', '全部'], ...RELEVANCES.map(value => [value, RELEVANCE_LABELS[value]] as const)])}
     {pick('status', '状态', [['not-ignored', '不含已忽略'], ['all', '全部'], ...STATUSES.map(value => [value, STATUS_LABELS[value]] as const)])}
-    <span className="oc-filter-count">显示 {shown} / {total}</span>
+    <span className="oc-filter-count">显示 {shown} 条，共 {total.toLocaleString('zh-CN')} 条</span>
     {!isDefault && <button type="button" className="oc-small" onClick={() => change(DEFAULT_FILTERS)}>恢复默认</button>}
   </div>;
 }
@@ -199,7 +185,7 @@ function FilterBar({ filters, change, shown, total }: { filters: Filters; change
 /** The buttons of one candidate, each enabled by the status move it makes. `view` (the list) turns the report button into 查看报告 once there is a report. */
 function CandidateActions({ candidate, busy, run, view }: { candidate: Candidate; busy: boolean; run: (action: CandidateAction) => Promise<void>; view?: () => void }) {
   const { status, report } = candidate;
-  const startHint = status === 'new' ? '先生成报告再开工' : status === 'ignored' ? '先恢复这条候选' : undefined;
+  const startHint = status === 'ignored' ? '先恢复这条候选' : status !== 'new' ? undefined : report ? '恢复的候选要先重新生成报告' : '先生成报告再开工';
   return <div className="oc-candidate-actions">
     {report && view
       ? <button type="button" disabled={busy} onClick={view}>查看报告</button>
@@ -217,26 +203,33 @@ function Meta({ candidate, candidates }: { candidate: Candidate; candidates: rea
     <span>{labelOf(SOURCE_LABELS, candidate.source)}</span>
     <span>{classification ? labelOf(CATEGORY_LABELS, classification.category) : '未归类'}</span>
     {classification && <span>相关度{labelOf(RELEVANCE_LABELS, classification.relevance)}</span>}
-    <time dateTime={candidate.updatedAt}>{time(candidate.updatedAt)}</time>
+    <span>发现 <time dateTime={candidate.createdAt}>{time(candidate.createdAt)}</time></span>
     {classification?.mergedInto && <span>{mergeLabel(classification.mergedInto, candidates)}</span>}
   </div>;
 }
 
-/** What this page knows about one candidate's action: the request it has out, or the error the last one ended with. */
-interface RowState { pending?: CandidateAction; error?: string }
+/** What this page knows about one candidate's action: the request it has out, or how the last one ended (an error, or a note). */
+interface RowState { pending?: CandidateAction; error?: string; note?: string }
 
-function CandidateRow({ candidate, candidates, busy, error, open, run }: {
-  candidate: Candidate; candidates: readonly Candidate[]; busy?: CandidateAction; error?: string; open: () => void; run: (action: CandidateAction) => Promise<void>;
+function CandidateRow({ candidate, candidates, busy, state, open, run }: {
+  candidate: Candidate; candidates: readonly Candidate[]; busy?: CandidateAction; state: RowState; open: () => void; run: (action: CandidateAction) => Promise<void>;
 }) {
   return <article className="oc-candidate" aria-busy={busy !== undefined}>
     <div className="oc-candidate-main">
       <div className="oc-candidate-title"><button type="button" className="oc-title-button" onClick={open}>{candidate.title}</button><StatusBadge status={candidate.status} busy={busy} /></div>
       {candidate.summary && <p className="oc-candidate-summary">{candidate.summary}</p>}
       <Meta candidate={candidate} candidates={candidates} />
-      {error && <p className="oc-error" role="alert">{error}</p>}
+      <RowMessages state={state} />
     </div>
     <CandidateActions candidate={candidate} busy={busy !== undefined} run={run} view={open} />
   </article>;
+}
+
+function RowMessages({ state }: { state: RowState }) {
+  return <>
+    {state.note && <p className="oc-row-note" role="status">{state.note}</p>}
+    {state.error && <p className="oc-error" role="alert">{state.error}</p>}
+  </>;
 }
 
 function EvidenceList({ evidence }: { evidence: readonly Evidence[] }) {
@@ -256,8 +249,8 @@ function EvidenceList({ evidence }: { evidence: readonly Evidence[] }) {
 /** What the detail view reads for one candidate: the whole record (evidence excerpts) and the report text. */
 interface Detail { id: string; loading: boolean; candidate?: Candidate; candidateError?: string; report?: ReportText; reportError?: string }
 
-function CandidateDetail({ candidate, candidates, detail, busy, error, run, back, openSession }: {
-  candidate: Candidate; candidates: readonly Candidate[]; detail?: Detail; busy?: CandidateAction; error?: string;
+function CandidateDetail({ candidate, candidates, detail, busy, state, run, back, openSession }: {
+  candidate: Candidate; candidates: readonly Candidate[]; detail?: Detail; busy?: CandidateAction; state: RowState;
   run: (action: CandidateAction) => Promise<void>; back: () => void; openSession?: OpenSession;
 }) {
   const { classification, started, window: range } = candidate;
@@ -278,7 +271,7 @@ function CandidateDetail({ candidate, candidates, detail, busy, error, run, back
     </div>
     {summary && <p className="oc-text">{summary}</p>}
     <CandidateActions candidate={candidate} busy={busy !== undefined} run={run} />
-    {error && <p className="oc-error" role="alert">{error}</p>}
+    <RowMessages state={state} />
     {started && <p className="oc-row-meta">
       <span>开工会话 <code>{started.sessionId}</code>，{time(started.at)}</span>
       {openSession && <button type="button" className="oc-small" onClick={() => openSession(started.sessionId)}>打开会话</button>}
@@ -311,9 +304,22 @@ function SettingsForm({ settings, saving, error, save }: { settings: Settings; s
   const [saved, setSaved] = useState(false);
   /** The last save's error describes values the user has edited since. */
   const [edited, setEdited] = useState(false);
+  /** The settings the draft was last brought up to date with: a field that still holds its value there is one the user has not changed. */
+  const base = useRef(draftOf(settings));
   const stored = JSON.stringify(settings);
-  // A new value from the Host (a save, or a change made elsewhere) replaces the draft; a refresh with the same settings leaves edits alone.
-  useEffect(() => { setDraft(draftOf(JSON.parse(stored) as Settings)); }, [stored]);
+  // New settings from the Host (after a save, or a refresh that brings a change made elsewhere) go into the fields the user has not
+  // changed and the ones the user changed to just that value; what the user is still typing stays.
+  useEffect(() => {
+    const next = draftOf(JSON.parse(stored) as Settings), previous = base.current;
+    base.current = next;
+    setDraft(current => {
+      const merged = { ...current };
+      for (const key of Object.keys(next) as (keyof SettingsDraft)[]) {
+        if (current[key] === previous[key] || current[key].trim() === next[key]) merged[key] = next[key];
+      }
+      return merged;
+    });
+  }, [stored]);
   const patch = settingsPatch(settings, draft);
   const dirty = Object.keys(patch).length > 0;
   const field = (name: keyof SettingsDraft, label: string, attributes: InputHTMLAttributes<HTMLInputElement> = {}) =>
@@ -354,7 +360,7 @@ function SettingsForm({ settings, saving, error, save }: { settings: Settings; s
 }
 
 export function OpenCodexPage({ call, openSession }: { call: Call; openSession?: OpenSession }) {
-  const [data, setData] = useState<Snapshot>();
+  const [data, setData] = useState<OpenCodexResponse>();
   const [loadError, setLoadError] = useState('');
   const [tab, setTab] = useState<Tab>('candidates');
   const [filters, setFilters] = useState(DEFAULT_FILTERS);
@@ -370,7 +376,7 @@ export function OpenCodexPage({ call, openSession }: { call: Call; openSession?:
   /** Counts the responses shown, so a snapshot asked for before another response arrived does not replace it. */
   const shownCount = useRef(0);
 
-  const show = useCallback((response: Snapshot) => { shownCount.current++; setData(response); }, []);
+  const show = useCallback((response: OpenCodexResponse) => { shownCount.current++; setData(response); }, []);
   const refresh = useCallback(async () => {
     const signal = lifetime.current?.signal, before = shownCount.current;
     try {
@@ -397,7 +403,7 @@ export function OpenCodexPage({ call, openSession }: { call: Call; openSession?:
 
   const setRow = (id: string, update: (state: RowState) => RowState) => setRows(current => {
     const next = update(current[id] ?? {});
-    return next.pending === undefined && next.error === undefined ? without(current, id) : { ...current, [id]: next };
+    return next.pending === undefined && next.error === undefined && next.note === undefined ? without(current, id) : { ...current, [id]: next };
   });
   /** One action on one candidate: its buttons wait, the answer replaces the page, an error stays on its row. */
   const run = async (id: string, action: CandidateAction) => {
@@ -408,7 +414,11 @@ export function OpenCodexPage({ call, openSession }: { call: Call; openSession?:
       setRow(id, () => ({}));
       if (signal?.aborted) return;
       show(response);
-      if (action === 'start' && response.startedSessionId) openSession?.(response.startedSessionId);
+      const sessionId = action === 'start' ? response.startedSessionId : undefined;
+      if (sessionId) {
+        // The start went through; only switching to its session failed.
+        try { openSession?.(sessionId); } catch { setRow(id, () => ({ note: `开工会话已创建（${sessionId}），但没能自动打开` })); }
+      }
     } catch (error) {
       if (signal?.aborted) { setRow(id, () => ({})); return; }
       setRow(id, () => ({ error: messageOf(error) }));
@@ -465,11 +475,13 @@ export function OpenCodexPage({ call, openSession }: { call: Call; openSession?:
   };
 
   const shown = visibleCandidates(candidates, filters);
-  const waiting = candidates.filter(item => item.status === 'new').length;
+  const waiting = shown.filter(item => item.status === 'new').length;
+  // `busy` and the counts are read with care: right after the plugin is reinstalled, this page can still be talking to the previous Host.
   const checking = Boolean(busy.check || data?.busy?.check);
   /** The action running on a candidate: the one this page asked for, else the one the Host reports. */
   const busyOf = (id: string): CandidateAction | undefined => rows[id]?.pending ?? data?.busy?.candidates?.[id];
   const omitted = data?.omittedCandidates ?? 0;
+  const total = data?.totalCandidates ?? candidates.length;
   return <div className="oc-page" ref={page}>
     <header className="oc-header">
       <div className="oc-brand">OpenCodex</div>
@@ -486,13 +498,13 @@ export function OpenCodexPage({ call, openSession }: { call: Call; openSession?:
         {data.notice && <p className="oc-notice" role="status">{data.notice}</p>}
         <LastCheckLine lastCheck={data.lastCheck} at={data.lastCheckAt} />
         {controlErrors.check && <p className="oc-error" role="alert">{controlErrors.check}</p>}
-        <IndexLine summary={data.indexSummary} busy={Boolean(busy.index)} rebuild={() => control('index', { action: 'rebuildIndex' })} />
+        <IndexLine summary={data.indexSummary} mirrorSet={data.settings.dshMirrorPath !== ''} busy={Boolean(busy.index)} rebuild={() => control('index', { action: 'rebuildIndex' })} />
         {controlErrors.index && <p className="oc-error" role="alert">{controlErrors.index}</p>}
         {loadError && <p className="oc-error" role="alert">刷新失败：{loadError}</p>}
       </section>
       <nav className="oc-tabs" aria-label="OpenCodex"><div>
         {TABS.map(([id, label, icon]) => <button type="button" key={id} aria-current={tab === id ? 'page' : undefined} onClick={() => { setTab(id); setSelected(undefined); }}>
-          <Icon name={icon} />{label}{id === 'candidates' && waiting > 0 && <span className="oc-count" title="新发现">{waiting}</span>}
+          <Icon name={icon} />{label}{id === 'candidates' && waiting > 0 && <span className="oc-count" title="列表里显示的新发现">{waiting}</span>}
         </button>)}
       </div></nav>
       {tab === 'settings'
@@ -500,20 +512,20 @@ export function OpenCodexPage({ call, openSession }: { call: Call; openSession?:
         : selected
           ? listed
             ? <CandidateDetail candidate={listed} candidates={candidates} detail={detail?.id === selected ? detail : undefined}
-              busy={busyOf(selected)} error={rows[selected]?.error} run={action => run(selected, action)} back={() => setSelected(undefined)} openSession={openSession} />
+              busy={busyOf(selected)} state={rows[selected] ?? {}} run={action => run(selected, action)} back={() => setSelected(undefined)} openSession={openSession} />
             : <section className="oc-detail">
               <button type="button" className="oc-back" onClick={() => setSelected(undefined)}><Icon name="back" />全部候选</button>
               <p className="oc-muted">这条候选不在列表里了。</p>
             </section>
           : <>
-            <FilterBar filters={filters} change={setFilters} shown={shown.length} total={candidates.length} />
+            <FilterBar filters={filters} change={setFilters} shown={shown.length} total={total} />
             {shown.length === 0
               ? <div className="oc-empty">
                 <h2>{candidates.length === 0 ? '还没有候选' : '没有符合筛选的候选'}</h2>
                 <p className="oc-muted">{candidates.length === 0 ? '点「检查更新」从发布说明、仓库文件、桌面端和 RSS 收集 Codex 的新功能。' : '换个筛选条件，或点「恢复默认」。'}</p>
               </div>
               : <div className="oc-list">{shown.map(item => <CandidateRow key={item.id} candidate={item} candidates={candidates} busy={busyOf(item.id)}
-                error={rows[item.id]?.error} open={() => open(item.id)} run={action => run(item.id, action)} />)}</div>}
+                state={rows[item.id] ?? {}} open={() => open(item.id)} run={action => run(item.id, action)} />)}</div>}
             {omitted > 0 && <p className="oc-muted oc-omitted">另有 {omitted.toLocaleString('zh-CN')} 条较旧的候选未列出</p>}
           </>}
     </>}

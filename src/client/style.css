@@ -86,8 +86,10 @@
 .oc-list { border-top: 1px solid var(--oc-line); }
 .oc-candidate { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 8px 16px; padding: 14px 4px; border-bottom: 1px solid var(--oc-line); }
 .oc-candidate-main { min-width: 0; }
-.oc-candidate-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
-.oc-page .oc-title-button { display: inline; min-height: 0; padding: 0; border: 0; border-radius: 0; background: none; text-align: left; font-size: 14px; font-weight: 600; line-height: 1.5; overflow-wrap: anywhere; }
+/* A long title wraps inside its own box, so the badges stay beside it instead of falling onto a line of their own. */
+.oc-candidate-title { display: flex; align-items: baseline; gap: 8px; }
+.oc-candidate-title > .oc-status, .oc-detail-head > .oc-status { flex-shrink: 0; }
+.oc-page .oc-title-button { display: block; flex: 0 1 auto; min-width: 0; min-height: 0; padding: 0; border: 0; border-radius: 0; background: none; text-align: left; font-size: 14px; font-weight: 600; line-height: 1.5; overflow-wrap: anywhere; }
 .oc-page .oc-title-button:not(:disabled):hover { background: none; color: var(--oc-accent); }
 .oc-candidate-summary { margin: 2px 0 6px; color: var(--oc-muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .oc-row-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; margin: 4px 0; color: var(--oc-muted); font-size: 12px; line-height: 1.4; }
@@ -107,8 +109,8 @@
 
 /* Detail: summary, classification, report, evidence */
 .oc-page .oc-back { border: 0; padding: 0; min-height: 26px; color: var(--oc-muted); background: none; font-size: 13px; }
-.oc-detail-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px; margin: 10px 0 4px; }
-.oc-detail-head h2 { display: block; font-size: 17px; overflow-wrap: anywhere; }
+.oc-detail-head { display: flex; align-items: baseline; gap: 10px; margin: 10px 0 4px; }
+.oc-detail-head h2 { display: block; flex: 0 1 auto; min-width: 0; font-size: 17px; overflow-wrap: anywhere; }
 .oc-detail > .oc-candidate-actions { margin: 12px 0; }
 .oc-detail > .oc-error, .oc-detail > .oc-row-note { margin: 0 0 10px; }
 .oc-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.6; max-width: 85ch; }
@@ -139,8 +141,9 @@
 .oc-markdown hr { border: 0; border-top: 1px solid var(--oc-line); margin: 16px 0; }
 .oc-page .oc-evidence { list-style: none; margin: 0; padding: 0; }
 .oc-page .oc-evidence li { margin: 0; padding: 8px 0; border-bottom: 1px solid var(--oc-line); }
-.oc-evidence-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; font-size: 13px; }
-.oc-evidence-head a { font-size: 12px; }
+/* kind | reference (wraps) | link: a long path wraps in its own column and leaves 打开 where it is. */
+.oc-evidence-head { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: baseline; gap: 4px 10px; font-size: 13px; }
+.oc-evidence-head a { font-size: 12px; white-space: nowrap; }
 .oc-evidence summary { margin-top: 4px; font-size: 12px; color: var(--oc-muted); cursor: pointer; }
 .oc-evidence .oc-raw { max-height: 320px; margin-top: 6px; }
 .oc-tag { font-size: 12px; padding: 1px 6px; border-radius: 4px; background: var(--oc-layer); color: var(--oc-muted); white-space: nowrap; }
