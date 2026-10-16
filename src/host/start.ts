@@ -9,12 +9,11 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 import type { SessionRequestId } from '@deepseek-ai/dsh-api-session-controller/types';
-import type { SessionId } from '@deepseek-ai/dsh-session';
 import { Marked } from 'marked';
 import { canTransition, type Candidate } from '../core/candidate.js';
 import { check } from '../core/check.js';
 import type { ModelRoute } from '../core/settings.js';
-import type { ReportHost } from './report/report-session.js';
+import { selectModelAndRestore, type DefaultModelService, type ReportHost } from './report/report-session.js';
 
 const TITLE_LIMIT = 60;
 const DIR_MODE = 0o700;
@@ -79,11 +78,11 @@ function opensOnlyComments(raw: string): boolean {
 
 /**
  * What `startWork` needs from the Host context, typed as `ReportHost` types it: four session-controller calls and, when the Host has it,
- * the default-model service, so the user's default model can be put back after the session is switched to its own.
+ * the default-model service, with which `selectModelAndRestore` puts the user's default model back after the session's switch.
  */
 export interface StartWorkHost {
   sessionController: Pick<ReportHost['sessionController'], 'create' | 'rename' | 'selectModel' | 'prompt'>;
-  agentDefaultModel?: ReportHost['agentDefaultModel'];
+  agentDefaultModel?: DefaultModelService;
 }
 
 export interface StartWorkInput {
@@ -112,33 +111,6 @@ export class StartWorkError extends Error {
     this.name = aborted ? 'AbortError' : 'StartWorkError';
     this.sessionId = sessionId;
   }
-}
-
-/** A member of the Host context that may be missing: through Cordis, reading a service the plugin did not inject throws. */
-function optional<T>(read: () => T): T | undefined {
-  try { return read(); } catch { return undefined; }
-}
-
-/**
- * The last default-model switch of a creator session in this process. DSH's `selectModel` also saves its choice as the user's default
- * model, so the default read before the switch is saved back right after it, as `generateReport` does for report sessions; switches are
- * chained so that two hand-offs cannot take each other's passing default for the one to restore.
- */
-let modelSwitch: Promise<unknown> = Promise.resolve();
-
-/** Switches the session to `model`; with the default-model service, puts the user's default model back afterwards. */
-async function selectModel(host: StartWorkHost, defaults: StartWorkHost['agentDefaultModel'], sessionId: SessionId, model: ModelRoute): Promise<void> {
-  const select = () => host.sessionController.selectModel({ sessionId, provider: model.provider, model: model.model });
-  if (!defaults) { await select(); return; }
-  const switched = modelSwitch.then(async () => {
-    const previous = defaults.currentSelection();
-    await select();
-    try { await defaults.saveSelection(previous); } catch (error) {
-      throw new Error(`没能把默认模型恢复为 ${previous.provider}/${previous.model}：${messageOf(error)}`, { cause: error });
-    }
-  });
-  modelSwitch = switched.catch(() => undefined);
-  await switched;
 }
 
 /** The session title's candidate part: the title on one line, at most `TITLE_LIMIT` code points, a longer one cut to end in `…`. */
@@ -237,9 +209,10 @@ async function readReport(directory: string, id: string, path: string): Promise<
  * before anything is created: an absolute `directory`, a mirror path, a report on the candidate, a status that can move to `started`, a
  * report at `reports/<id>/report.md` that is not empty once its closed comments are gone, then the signal. `<directory>/work/<id>/` is made
  * (mode 0o700; an existing one is reused as it is), the session is created there with `preset`, titled `实现 · <title>` (cut to end in
- * `…` when long), switched to `model` with the user's default model put back, and prompted once; the result comes back as soon as DSH
- * accepts the prompt. Recording `started` on the candidate is the caller's job. A `create` failure rejects as it is; a rename, model switch
- * or prompt failure rejects with a `StartWorkError` naming the session left in DSH.
+ * `…` when long), switched to `model` with the user's default model put back (`selectModelAndRestore`, whose one queue of switches report
+ * sessions share), and prompted once; the result comes back as soon as DSH accepts the prompt. Recording `started` on the candidate is the
+ * caller's job. A `create` failure rejects as it is; a rename, model switch or prompt failure rejects with a `StartWorkError` naming the
+ * session left in DSH.
  */
 export async function startWork(host: StartWorkHost, input: StartWorkInput): Promise<{ sessionId: string; workdir: string }> {
   const { candidate, directory, mirror, signal } = input;
@@ -250,13 +223,12 @@ export async function startWork(host: StartWorkHost, input: StartWorkInput): Pro
   const report = await readReport(directory, candidate.id, candidate.report.path);
   const workdir = join(directory, 'work', candidate.id);
   const text = promptFor(report, randomUUID(), { workdir, mirror, evidence: join(directory, 'reports', candidate.id, 'evidence') });
-  const defaults = optional(() => host.agentDefaultModel);
   signal.throwIfAborted();
   await mkdir(workdir, { recursive: true, mode: DIR_MODE });
   const { sessionId } = await host.sessionController.create({ cwd: workdir, ...(input.preset ? { agentPreset: input.preset } : {}) });
   try {
     await host.sessionController.rename({ sessionId, title: `实现 · ${clippedTitle(candidate.title)}` });
-    await selectModel(host, defaults, sessionId, input.model);
+    await selectModelAndRestore(host, sessionId, input.model);
     await host.sessionController.prompt({ sessionId, requestId: randomUUID() as SessionRequestId, mode: 'queue', content: [{ type: 'text', text }] }, signal);
   } catch (error) {
     throw new StartWorkError(sessionId, error, signal.aborted);
