@@ -225,7 +225,10 @@ test('invisible characters are counted and spelled out in the raw view', () => {
 });
 
 test('the settings patch holds only the changed keys, a model route whole, numbers as numbers', () => {
-  const current: Settings = { ...DEFAULT_SETTINGS, classifyModel: { ...DEFAULT_SETTINGS.classifyModel }, reportModel: { ...DEFAULT_SETTINGS.reportModel } };
+  const current: Settings = {
+    ...DEFAULT_SETTINGS, classifyModel: { ...DEFAULT_SETTINGS.classifyModel }, reportModel: { ...DEFAULT_SETTINGS.reportModel },
+    startModel: { ...DEFAULT_SETTINGS.startModel },
+  };
   assert.deepEqual(settingsPatch(current, draftOf(current)), {});
   const draft = { ...draftOf(current), dshMirrorPath: ' /Users/x/deepseek-harness ', classifyModel: 'deepseek-pro', dailyReportLimit: '3' };
   assert.deepEqual(settingsPatch(current, draft), {
@@ -233,6 +236,8 @@ test('the settings patch holds only the changed keys, a model route whole, numbe
     classifyModel: { provider: current.classifyModel.provider, model: 'deepseek-pro' },
     dailyReportLimit: 3,
   });
+  assert.deepEqual(settingsPatch(current, { ...draftOf(current), startModel: ' deepseek-flash ' }),
+    { startModel: { provider: current.startModel.provider, model: 'deepseek-flash' } });
 });
 
 /**
@@ -248,6 +253,7 @@ function fakeHost(candidates: Candidate[], extra: Partial<OpenCodexResponse> = {
       host.requests.push(request);
       const failure = host.failures[request.action];
       if (failure) throw new Error(failure);
+      if (request.action === 'settings') host.settings = { ...host.settings, ...request.patch };
       const snapshot: OpenCodexResponse = {
         settings: host.settings, candidates, totalCandidates: candidates.length, omittedCandidates: 0, checkpoints: {},
         busy: { check: false, candidates: {} }, ...extra,
@@ -359,6 +365,22 @@ test('saving settings sends only what changed; a Host error shows inline until t
     assert.doesNotMatch(textOf(renderer.root.findAllByType('form')[0]!), /DSH 镜像路径要写绝对路径/);
     await submit(renderer.root);
     assert.deepEqual(host.requests.at(-1), { action: 'settings', patch: { dshMirrorPath: '/Users/x/deepseek-harness' } });
+  } finally { renderer.unmount(); }
+});
+
+test('the start model goes to the Host only when it changes', async () => {
+  const host = fakeHost([]);
+  const renderer = await mount({ call: host.call });
+  try {
+    await click(buttons(renderer.root, '设置')[0]);
+    assert.equal(valueOf(renderer.root, 'startProvider'), DEFAULT_SETTINGS.startModel.provider);
+    assert.equal(valueOf(renderer.root, 'startModel'), DEFAULT_SETTINGS.startModel.model);
+    await type(renderer.root, 'dshMirrorPath', '/Users/x/deepseek-harness');
+    await submit(renderer.root);
+    assert.deepEqual(host.requests.at(-1), { action: 'settings', patch: { dshMirrorPath: '/Users/x/deepseek-harness' } });
+    await type(renderer.root, 'startModel', 'deepseek-flash');
+    await submit(renderer.root);
+    assert.deepEqual(host.requests.at(-1), { action: 'settings', patch: { startModel: { provider: DEFAULT_SETTINGS.startModel.provider, model: 'deepseek-flash' } } });
   } finally { renderer.unmount(); }
 });
 

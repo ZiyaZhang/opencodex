@@ -90,13 +90,14 @@ export function checksSummary({ requiredSections, dshRefsTotal: total, dshRefsRe
 /** The settings form's fields, all text as inputs hold them. */
 export interface SettingsDraft {
   dshMirrorPath: string; desktopPlistPath: string; desktopLocale: string;
-  classifyProvider: string; classifyModel: string; reportProvider: string; reportModel: string;
+  classifyProvider: string; classifyModel: string; reportProvider: string; reportModel: string; startProvider: string; startModel: string;
   reportPreset: string; startPreset: string; dailyReportLimit: string; checkIntervalHours: string;
 }
 export const draftOf = (settings: Settings): SettingsDraft => ({
   dshMirrorPath: settings.dshMirrorPath, desktopPlistPath: settings.desktopPlistPath, desktopLocale: settings.desktopLocale,
   classifyProvider: settings.classifyModel.provider, classifyModel: settings.classifyModel.model,
   reportProvider: settings.reportModel.provider, reportModel: settings.reportModel.model,
+  startProvider: settings.startModel.provider, startModel: settings.startModel.model,
   reportPreset: settings.reportPreset, startPreset: settings.startPreset,
   dailyReportLimit: String(settings.dailyReportLimit), checkIntervalHours: String(settings.checkIntervalHours),
 });
@@ -107,6 +108,7 @@ export function settingsPatch(current: Settings, draft: SettingsDraft): Partial<
     dshMirrorPath: draft.dshMirrorPath.trim(), desktopPlistPath: draft.desktopPlistPath.trim(), desktopLocale: draft.desktopLocale.trim(),
     classifyModel: { provider: draft.classifyProvider.trim(), model: draft.classifyModel.trim() },
     reportModel: { provider: draft.reportProvider.trim(), model: draft.reportModel.trim() },
+    startModel: { provider: draft.startProvider.trim(), model: draft.startModel.trim() },
     reportPreset: draft.reportPreset.trim(), startPreset: draft.startPreset.trim(),
     dailyReportLimit: Number(draft.dailyReportLimit), checkIntervalHours: Number(draft.checkIntervalHours),
   };
@@ -340,6 +342,7 @@ function SettingsForm({ settings, saving, error, save }: { settings: Settings; s
     <h3>模型</h3>
     <div className="oc-two-columns">{field('classifyProvider', '归类模型的提供方')}{field('classifyModel', '归类模型')}</div>
     <div className="oc-two-columns">{field('reportProvider', '报告模型的提供方')}{field('reportModel', '报告模型')}</div>
+    <div className="oc-two-columns">{field('startProvider', '开工模型的提供方')}{field('startModel', '开工模型')}</div>
     <h3>会话</h3>
     <div className="oc-two-columns">
       {field('reportPreset', '报告会话的 Agent 预设', { placeholder: '留空用 DSH 默认预设' })}
