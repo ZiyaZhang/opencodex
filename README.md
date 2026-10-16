@@ -37,7 +37,7 @@ dsh plugin --profile opencodex add /绝对路径/dsh-opencodex-0.3.0.tgz
 dsh --profile opencodex
 ```
 
-`dsh plugin add` 会打印 `WARN Issues with peer dependencies found.`。本插件的 peer dependency（`@deepseek-ai/cordis` 和几个 `@deepseek-ai/dsh-*` 包）由 DSH 运行时提供，这条警告是预期的。升级时用新的 tgz 再 `add` 一次并重启 DSH；卸载用 `dsh plugin --profile <profile> remove dsh-opencodex`。
+`dsh plugin add` 会打印 `WARN Issues with peer dependencies found.`。本插件的 peer dependency（`@deepseek-ai/cordis` 和几个 `@deepseek-ai/dsh-*` 包）由 DSH 运行时提供，这条警告是预期的。升级时先 `dsh plugin --profile <profile> remove dsh-opencodex` 再用新的 tgz `add`，然后重启 DSH：profile 用的是 pnpm 的 hoisted 链接方式，同一路径的 tgz 直接再 `add` 一次只会更新锁文件，`node_modules` 里还是旧构建（实测如此）。卸载同样用 `remove`。
 
 ### 第一次启动
 
