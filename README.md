@@ -12,7 +12,7 @@ DeepSeek Harness（DSH）的第三方插件：每天收集 Codex 的更新，对
 
 | 项 | 要求 |
 | --- | --- |
-| DSH | `dsh` CLI 0.2.1-alpha 系列，验证过 0.2.1-alpha.2（`npm install -g @deepseek-ai/dsh@0.2.1-alpha.2`）；本插件的 `@deepseek-ai/*` 依赖钉在这个版本。DSH 桌面端自带的 CLI 是 0.2.0-rc.2，比它旧，不要用来装 |
+| DSH | `dsh` CLI 0.2.1-alpha 系列，验证过 0.2.1-alpha.2（`npm install -g @deepseek-ai/dsh@0.2.1-alpha.2`）；本插件的 `@deepseek-ai/*` 依赖钉在这个版本。DSH 桌面端 0.2.0-rc.2 的运行时也能跑（实测采集、索引、归类正常；报告和开工用到的接口都在，但没在这个版本上跑过），见下面「装进桌面端」 |
 | DSH 源码 | [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 的一份 git 检出，生成报告和开工时必须有 |
 | GitHub | 建议装 `gh` 并登录；没有时走匿名 REST，限额见[时限与上限](#时限与上限) |
 | 桌面端 | 可选：macOS 上的 ChatGPT.app；没装就跳过这个来源 |
@@ -39,6 +39,18 @@ dsh --profile opencodex
 ```
 
 `dsh plugin add` 会打印 `WARN Issues with peer dependencies found.`。本插件的 peer dependency（`@deepseek-ai/cordis` 和几个 `@deepseek-ai/dsh-*` 包）由 DSH 运行时提供，这条警告是预期的。升级时先 `dsh plugin --profile <profile> remove dsh-opencodex` 再用新的 tgz `add`，然后重启 DSH：profile 用的是 pnpm 的 hoisted 链接方式，同一路径的 tgz 直接再 `add` 一次只会更新锁文件，`node_modules` 里还是旧构建（实测如此）。卸载同样用 `remove`。tgz 装完别删：profile 的锁文件记着它的路径，之后在这个 profile 里再装任何插件（包括开工会话装自己的 bundle）都会重新跑 pnpm，文件不在就报 `ENOENT`（实测如此），所以上面先把它放到固定目录。
+
+### 装进桌面端
+
+桌面端的 `desktop` profile 只能由桌面应用启动，安装要用桌面端自带的 CLI。它的运行时是 0.2.0-rc.2，比插件钉的版本旧，DSH 会先拒绝，要对这个版本放行一次再装，然后重启桌面应用：
+
+```sh
+DSH="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
+"$DSH" plugin --profile desktop allow-version dsh-opencodex@0.3.0 --dsh-version 0.2.0-rc.2 --accept-risk
+"$DSH" plugin --profile desktop add ~/.dsh/opencodex-release/dsh-opencodex-0.3.0.tgz
+```
+
+放行只对这一对版本有效。桌面端和同一 `DSH_HOME` 下其他装了 OpenCodex 的 profile 共用数据目录，不要同时运行。
 
 ### 第一次启动
 
