@@ -12,7 +12,7 @@ DeepSeek Harness（DSH）的第三方插件：每天收集 Codex 的更新，对
 
 | 项 | 要求 |
 | --- | --- |
-| DSH | `dsh` CLI 0.2.1-alpha 系列，验证过 0.2.1-alpha.2（`npm install -g @deepseek-ai/dsh@0.2.1-alpha.2`）；本插件的 `@deepseek-ai/*` 依赖钉在这个版本。DSH 桌面端 0.2.0-rc.2 的运行时也能跑（实测采集、索引、归类正常；报告和开工用到的接口都在，但没在这个版本上跑过），见下面「装进桌面端」 |
+| DSH | `dsh` CLI 0.2 系列：本插件对 `@deepseek-ai/dsh-*` 的 peer dependency 范围是 `>=0.2.0-rc.2 <0.3.0`，范围内的版本直接装，不用放行。验证过 0.2.1-alpha.2（`npm install -g @deepseek-ai/dsh@0.2.1-alpha.2`）；DSH 桌面端自带的 0.2.0-rc.2 运行时也能跑（实测采集、索引、归类正常；报告和开工用到的接口都在，但没在这个版本上跑过），见下面「装进桌面端」 |
 | DSH 源码 | [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 的一份 git 检出，生成报告和开工时必须有 |
 | GitHub | 建议装 `gh` 并登录；没有时走匿名 REST，限额见[时限与上限](#时限与上限) |
 | 桌面端 | 可选：macOS 上的 ChatGPT.app；没装就跳过这个来源 |
@@ -21,7 +21,7 @@ DeepSeek Harness（DSH）的第三方插件：每天收集 Codex 的更新，对
 
 ### 安装包
 
-从 [GitHub Releases](https://github.com/ZiyaZhang/opencodex/releases) 下载 `dsh-opencodex-0.3.0.tgz`，用 `shasum -a 256` 核对 release 里给的 SHA256。也可以从源码打包：
+从 [GitHub Releases](https://github.com/ZiyaZhang/opencodex/releases) 下载 `dsh-opencodex-0.3.1.tgz`，用 `shasum -a 256` 核对 release 里给的 SHA256。也可以从源码打包：
 
 ```sh
 git clone https://github.com/ZiyaZhang/opencodex.git && cd opencodex
@@ -33,8 +33,8 @@ npm ci && npm run check && npm pack
 ```sh
 # 可选：从内置的 web 模板新建一个试用 profile
 dsh --profile opencodex --from-default-profile web --dump-config
-mkdir -p ~/.dsh/opencodex-release && cp dsh-opencodex-0.3.0.tgz ~/.dsh/opencodex-release/
-dsh plugin --profile opencodex add ~/.dsh/opencodex-release/dsh-opencodex-0.3.0.tgz
+mkdir -p ~/.dsh/opencodex-release && cp dsh-opencodex-0.3.1.tgz ~/.dsh/opencodex-release/
+dsh plugin --profile opencodex add ~/.dsh/opencodex-release/dsh-opencodex-0.3.1.tgz
 dsh --profile opencodex
 ```
 
@@ -42,15 +42,14 @@ dsh --profile opencodex
 
 ### 装进桌面端
 
-桌面端的 `desktop` profile 只能由桌面应用启动，安装要用桌面端自带的 CLI。它的运行时是 0.2.0-rc.2，比插件钉的版本旧，DSH 会先拒绝，要对这个版本放行一次再装，然后重启桌面应用：
+桌面端的 `desktop` profile 只能由桌面应用启动，安装要用桌面端自带的 CLI。它的运行时是 0.2.0-rc.2，在插件的 peer dependency 范围内，直接 `add` 就行，不用 `allow-version` 放行，然后重启桌面应用：
 
 ```sh
 DSH="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
-"$DSH" plugin --profile desktop allow-version dsh-opencodex@0.3.0 --dsh-version 0.2.0-rc.2 --accept-risk
-"$DSH" plugin --profile desktop add ~/.dsh/opencodex-release/dsh-opencodex-0.3.0.tgz
+"$DSH" plugin --profile desktop add ~/.dsh/opencodex-release/dsh-opencodex-0.3.1.tgz
 ```
 
-放行只对这一对版本有效。桌面端和同一 `DSH_HOME` 下其他装了 OpenCodex 的 profile 共用数据目录，不要同时运行。
+桌面端和同一 `DSH_HOME` 下其他装了 OpenCodex 的 profile 共用数据目录，不要同时运行。
 
 ### 第一次启动
 
