@@ -168,6 +168,13 @@ function fakeHost(options: FakeOptions = {}) {
 const inputFor = (dirs: Dirs, extra: Partial<GenerateReportInput> = {}): GenerateReportInput =>
   ({ candidate, reportDir: dirs.reportDir, mirror: dirs.mirror, model, signal: new AbortController().signal, pollMs: 5, sandbox: () => {}, ...extra });
 
+test('the template asks for two states per DSH item: in the mirror source, and enabled in the default profile', () => {
+  const section = TEMPLATE.split('\n## DSH 现在有没有\n')[1]!.split('\n## ')[0]!;
+  assert.ok(section.includes('- 源码里有（路径:行号）：'), 'source presence, with a citation');
+  assert.ok(section.includes('- 默认 profile 里是否启用（看 packages/bundle/base/cordis.patch.yml 和 packages/bundle/web-app/presets/，没查到就写“未知”）'), 'default-profile enablement');
+  assert.ok(TEMPLATE.includes('\n区分“镜像源码里存在”与“默认 profile 里启用”，两者都写。'), 'the writing rule');
+});
+
 test('checkReport only counts level-two headings that start a line', async () => {
   await withDirs(async ({ mirror }) => {
     const prose = `# T\n\n报告要有 ${HEADINGS.join('、')} 这六节。\n`;
@@ -309,6 +316,9 @@ test('generateReport prompts one analyst session and checks the report it writes
     // rg may be missing: the prompt and the template both offer DSH's own search and grep.
     assert.equal(text.split('用 DSH 自带的搜索工具或 grep/rg（rg 可能没装）和 read 自己定位').length - 1, 2);
     assert.ok(!text.includes('用 rg 和 read'));
+    // Present in the source is not enabled by default: the prompt says so itself, and carries the template's rule.
+    assert.ok(text.includes('每条分开写源码里有没有和默认 profile 里是否启用，源码里有不等于默认启用。'));
+    assert.ok(text.includes('区分“镜像源码里存在”与“默认 profile 里启用”，两者都写。'));
     // The header time is when the session started; the record's generatedAt is when the report was read.
     assert.match(text, /\u3000会话开始时间：\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\n/);
     assert.ok(!text.includes('生成时间'));

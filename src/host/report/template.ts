@@ -20,7 +20,10 @@ export const TEMPLATE: string = [
   '',
   '## DSH 现在有没有',
   '',
-  '每条都带 `相对镜像根目录的路径:行号`。镜像根目录在 evidence/INDEX.md 里给出；用 DSH 自带的搜索工具或 grep/rg（rg 可能没装）和 read 自己定位，不只看 dsh/ 下的摘要。索引没命中就写"未找到：查过 X、Y、Z"，不写"没有"。',
+  '每条分开写两种状态：',
+  '',
+  '- 源码里有（路径:行号）：带 `相对镜像根目录的路径:行号`。镜像根目录在 evidence/INDEX.md 里给出；用 DSH 自带的搜索工具或 grep/rg（rg 可能没装）和 read 自己定位，不只看 dsh/ 下的摘要。索引没命中就写"未找到：查过 X、Y、Z"，不写"没有"。',
+  '- 默认 profile 里是否启用（看 packages/bundle/base/cordis.patch.yml 和 packages/bundle/web-app/presets/，没查到就写“未知”）：源码里有的包不一定默认加载，实验性的功能常常默认关闭。',
   '',
   '## 差哪些扩展点',
   '',
@@ -41,4 +44,5 @@ export const TEMPLATE: string = [
   '---',
   '',
   '写作规则（照做，不写进报告）：平铺名词标题；先结论；不用比喻词；每段落不超过六行；数字放表格；凭公告文字写不出来的就写"未知"。',
+  '区分“镜像源码里存在”与“默认 profile 里启用”，两者都写。',
 ].join('\n');
