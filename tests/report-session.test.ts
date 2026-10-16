@@ -7,7 +7,7 @@ import type { ModelSelection } from '@deepseek-ai/dsh-agent';
 import { SessionId, type Session } from '@deepseek-ai/dsh-session';
 import type { SessionCreateRequest, SessionPromptRequest, SessionRenameRequest, SessionSelectModelRequest } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { Candidate } from '../src/core/candidate.ts';
-import { checkReport, generateReport, ReportSessionError, type GenerateReportInput, type ReportHost } from '../src/host/report/report-session.ts';
+import { checkReport, generateReport, ReportSessionError, selectModelAndRestore, type GenerateReportInput, type ReportHost } from '../src/host/report/report-session.ts';
 import { TEMPLATE } from '../src/host/report/template.ts';
 
 test('checkReport counts resolvable DSH references and required sections', async () => {
@@ -565,6 +565,50 @@ test('generateReport neither restores the default model nor fails when agentDefa
     assert.equal(seen.reads.agentDefaultModel, 1);
     await new Promise(resolve => setTimeout(resolve, 10));
     assert.deepEqual(defaults.saved, [model], 'only the save selectModel makes itself; no restore');
+  });
+});
+
+test('selectModelAndRestore shares one switch chain with report sessions, and leaves the default alone when it cannot read the service', async () => {
+  await withDirs(async dirs => {
+    // A creator session switches while a report session's default is still on its way back.
+    const defaults = fakeDefaults(flash, { delayFor: next => (next.model === flash.model ? 30 : 0) });
+    let startCreator = () => {};
+    const creatorMayStart = new Promise<void>(resolve => { startCreator = resolve; });
+    const report = fakeHost({ defaults, onSelectModel: () => { setTimeout(startCreator, 5); }, onPrompt: () => writeFile(join(dirs.reportDir, 'report.md'), reportWith('- a')) });
+    const reportRun = generateReport(report.host, inputFor(dirs));
+    await creatorMayStart;
+    const creatorModel = { provider: 'deepseek-official', model: 'deepseek-creator' };
+    const selected: SessionSelectModelRequest[] = [];
+    const creator = {
+      sessionController: {
+        async selectModel(request: SessionSelectModelRequest) {
+          selected.push(request);
+          defaults.saveSelection({ provider: request.provider, model: request.model }).catch(() => {});
+          return { selected: request };
+        },
+      },
+      // As through a Cordis context: a new object on every read.
+      get agentDefaultModel() { return { currentSelection: () => defaults.currentSelection(), saveSelection: (next: ModelSelection) => defaults.saveSelection(next) }; },
+    };
+    await Promise.all([reportRun, selectModelAndRestore(creator, SessionId('c-1'), creatorModel)]);
+    assert.deepEqual(selected, [{ sessionId: 'c-1', provider: 'deepseek-official', model: 'deepseek-creator' }]);
+    assert.deepEqual(defaults.saved, [model, flash, creatorModel, flash]);
+    assert.deepEqual(defaults.current, flash);
+
+    // A service that throws when read is absent: the session is switched, nothing is put back, and the call succeeds.
+    const plain = fakeDefaults(flash);
+    const unreadable = {
+      sessionController: {
+        async selectModel(request: SessionSelectModelRequest) {
+          plain.saveSelection({ provider: request.provider, model: request.model }).catch(() => {});
+          return { selected: request };
+        },
+      },
+      get agentDefaultModel(): never { throw new Error('cannot get property "agentDefaultModel" without inject'); },
+    };
+    await selectModelAndRestore(unreadable, SessionId('c-2'), creatorModel);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.deepEqual(plain.saved, [creatorModel]);
   });
 });
 

@@ -106,6 +106,9 @@ export async function checkReport(markdown: string, mirror: string): Promise<Rep
   return { requiredSections: SECTIONS.every(title => headingOf(title).test(text)), dshRefsTotal: refs.length, dshRefsResolved: resolved };
 }
 
+/** `ctx.agentDefaultModel` (`@deepseek-ai/dsh-agent-default-model`), as far as switching a session's model needs it. */
+export interface DefaultModelService { currentSelection(): ModelSelection; saveSelection(selection: ModelSelection): Promise<unknown> }
+
 /** The part of DSH's live Agent that setup needs. */
 interface ReportAgent { readonly session: Session }
 /** A message waiting in an agent's inbox; a prompt sent through the controller has `source.rpcId`, its request id. */
@@ -142,7 +145,7 @@ export interface ReportHost {
   /** `ctx.agents`; DSH's `Agent.status` is `'idle' | 'running'`. */
   agents: { get(sessionId: SessionId): LiveAgent | undefined };
   /** `ctx.agentDefaultModel`. When present, the default model `selectModel` overwrites is saved back; when absent, it is left as `selectModel` leaves it. */
-  agentDefaultModel?: { currentSelection(): ModelSelection; saveSelection(selection: ModelSelection): Promise<unknown> };
+  agentDefaultModel?: DefaultModelService;
   /** `ctx.approval` (`@deepseek-ai/dsh-user-approval`). When present, the session gets approval policy `never`, so no ask waits for a person. */
   approval?: { setPolicy(agent: ReportAgent, policy: 'never'): void };
   /**
@@ -246,15 +249,29 @@ function promptFor(candidate: Candidate, mirror: string): string {
 }
 
 /**
- * The last default-model switch in this process. DSH's `selectModel` saves its choice as the user's default model; it submits that save
- * before it returns, and saves commit in submission order, so the default read before the switch is saved back right after it. Switches
- * are chained, so that a concurrent report cannot take another report's passing default for the one to restore. The chain is one per
- * process, not one per service object: every read of a Cordis service through `ctx` returns a new proxy.
+ * The last default-model switch in this process, shared by every caller of `selectModelAndRestore` (report and creator sessions alike).
+ * The chain is one per process, not one per service object: every read of a Cordis service through `ctx` returns a new proxy.
  */
 let modelSwitch: Promise<unknown> = Promise.resolve();
 
-async function selectReportModel({ controller, defaults }: RunServices, sessionId: SessionId, model: ModelRoute): Promise<void> {
-  const select = () => controller.selectModel({ sessionId, provider: model.provider, model: model.model });
+/** What `selectModelAndRestore` needs. `ctx` fits as it is, and so does a plain object. */
+export interface ModelSwitchServices {
+  sessionController: Pick<ReportHost['sessionController'], 'selectModel'>;
+  /** `ctx.agentDefaultModel`; absent, or throwing when read (a Cordis service the plugin did not inject), means the default is not put back. */
+  agentDefaultModel?: DefaultModelService;
+}
+
+/**
+ * Switches session `sessionId` to `route` without changing the user's default model. DSH's `selectModel` also saves its choice as the
+ * default; it submits that save before it returns, and saves commit in submission order, so the default read before the switch is saved
+ * back right after it. Switches run one at a time across the process, so that two sessions switching at once cannot take each other's
+ * passing default for the one to restore. A failed restore rejects, its error as `cause`; a failed `selectModel` saves nothing and is not
+ * followed by a restore. Without `agentDefaultModel` the session is switched and the default is left as `selectModel` leaves it.
+ */
+export async function selectModelAndRestore(services: ModelSwitchServices, sessionId: SessionId, route: ModelRoute): Promise<void> {
+  const controller = services.sessionController;
+  const defaults = optional(() => services.agentDefaultModel);
+  const select = () => controller.selectModel({ sessionId, provider: route.provider, model: route.model });
   if (!defaults) { await select(); return; }
   const switched = modelSwitch.then(async () => {
     const previous = defaults.currentSelection();
@@ -373,7 +390,7 @@ export async function generateReport(host: ReportHost, input: GenerateReportInpu
   let setAsideEarlier = false;
   try {
     await controller.rename({ sessionId, title: `OpenCodex 报告 · ${[...oneLine(candidate.title)].slice(0, TITLE_LIMIT).join('')}` });
-    await selectReportModel(services, sessionId, input.model);
+    await selectModelAndRestore({ sessionController: controller, agentDefaultModel: services.defaults }, sessionId, input.model);
     const activation = await controller.resolveAgent(sessionId);
     if ('error' in activation) throw activation.error;
     (input.sandbox ?? setSandboxMode)(activation.agent.session, 'workspace-write');
