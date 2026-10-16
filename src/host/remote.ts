@@ -61,7 +61,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** The JSON type of every setting. The values themselves (absolute paths, ranges) are `mergeSettings`'s to check on the Host. */
 const SETTING_SHAPES = {
   channel: 'string', desktopPlistPath: 'string', desktopLocale: 'string', dshMirrorPath: 'string',
-  classifyModel: 'route', reportModel: 'route', reportPreset: 'string', startPreset: 'string',
+  classifyModel: 'route', reportModel: 'route', reportPreset: 'string', startPreset: 'string', startModel: 'route',
   dailyReportLimit: 'number', checkIntervalHours: 'number',
 } as const satisfies Record<keyof Settings, 'string' | 'number' | 'route'>;
 const SHAPE_TEXT = { string: '字符串', number: '数字' } as const;

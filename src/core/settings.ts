@@ -11,6 +11,8 @@ export interface Settings {
   reportModel: ModelRoute;
   reportPreset: string;
   startPreset: string;
+  /** The creator session is switched to this route right after creation, as the analyst session is to `reportModel`. */
+  startModel: ModelRoute;
   dailyReportLimit: number;
   checkIntervalHours: number;
 }
@@ -31,13 +33,17 @@ const isRoute = (value: unknown): value is ModelRoute =>
 /** A frozen copy whose model routes are frozen copies too, holding only `provider` and `model`. Call it on validated settings only. */
 function frozen(settings: Settings): Readonly<Settings> {
   const route = ({ provider, model }: ModelRoute): ModelRoute => Object.freeze({ provider, model });
-  return Object.freeze({ ...settings, classifyModel: route(settings.classifyModel), reportModel: route(settings.reportModel) });
+  return Object.freeze({
+    ...settings, classifyModel: route(settings.classifyModel), reportModel: route(settings.reportModel), startModel: route(settings.startModel),
+  });
 }
 
+/** The route reports and creator sessions run on unless the settings say otherwise. */
+const PRO: ModelRoute = { provider: 'deepseek-official', model: 'deepseek-v4-pro' };
 export const DEFAULT_SETTINGS: Readonly<Settings> = frozen({
   channel: 'stable', desktopPlistPath: '/Applications/ChatGPT.app/Contents/Info.plist', desktopLocale: 'zh-CN', dshMirrorPath: '',
-  classifyModel: { provider: 'deepseek-official', model: 'deepseek-flash' }, reportModel: { provider: 'deepseek-official', model: 'deepseek-v4-pro' },
-  reportPreset: '', startPreset: 'cordis', dailyReportLimit: 10, checkIntervalHours: 24,
+  classifyModel: { provider: 'deepseek-official', model: 'deepseek-flash' }, reportModel: PRO,
+  reportPreset: '', startPreset: 'cordis', startModel: PRO, dailyReportLimit: 10, checkIntervalHours: 24,
 });
 const KEYS = Object.keys(DEFAULT_SETTINGS) as Array<keyof Settings>;
 
@@ -58,6 +64,7 @@ export function validateSettings(value: Settings): void {
   check(isRoute(value.reportModel), 'reportModel needs a provider and a model');
   check(typeof value.reportPreset === 'string', 'reportPreset must be a string');
   check(typeof value.startPreset === 'string', 'startPreset must be a string');
+  check(isRoute(value.startModel), 'startModel needs a provider and a model');
 }
 
 /**

@@ -554,6 +554,10 @@ test('settings are saved and read back on the next start; a refused request is a
     const response = await f.call({ action: 'settings', patch: { dailyReportLimit: 3, reportModel: { provider: 'p', model: 'm' } } });
     assert.equal(response.settings.dailyReportLimit, 3);
     assert.deepEqual(response.settings.reportModel, { provider: 'p', model: 'm' });
+    assert.deepEqual(response.settings.startModel, DEFAULT_SETTINGS.startModel, 'the start model keeps its default when the report model changes');
+    const started = await f.call({ action: 'settings', patch: { startModel: { provider: 'p', model: 'pro' } } });
+    assert.deepEqual(started.settings.startModel, { provider: 'p', model: 'pro' });
+    await assert.rejects(f.call({ action: 'settings', patch: { startModel: { provider: '', model: 'm' } } }), remoteError('gateway/bad-request', /^startModel needs a provider and a model$/));
     assert.equal((JSON.parse(await readFile(join(f.directory, 'settings.json'), 'utf8')) as Settings).dailyReportLimit, 3);
     await assert.rejects(f.call({ action: 'settings', patch: { dailyReportLimit: '3' } } as never), remoteError('gateway/bad-request', /^设置项 dailyReportLimit 必须是数字$/));
     await assert.rejects(f.call({ action: 'settings', patch: { bogus: 1 } } as never), remoteError('gateway/bad-request', /^没有这个设置项："bogus"$/));
@@ -806,6 +810,8 @@ test('start opens a creator session for a reported candidate, records it, and re
     assert.equal(started.status, 'started');
     assert.deepEqual(started.started, { sessionId: 'cordis-1', at: NOW.toISOString() });
     assert.deepEqual(f.dsh.created, [{ cwd: join(f.directory, 'work', candidate.id), agentPreset: 'cordis' }]);
+    assert.deepEqual(f.dsh.selected, [{ sessionId: 'cordis-1', ...DEFAULT_SETTINGS.startModel }], 'the creator session runs on the start model');
+    assert.deepEqual(f.dsh.defaults, [{ provider: 'deepseek-official', model: 'deepseek-flash' }], 'the user default model is put back');
     const prompt = f.dsh.prompts[0]!.content[0]!;
     assert.ok(prompt.type === 'text' && prompt.text.includes(REPORT), 'the report is the task');
 

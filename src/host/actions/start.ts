@@ -11,8 +11,8 @@ function refusal(status: Status): string {
 }
 
 /**
- * Opens a creator-mode session (`startPreset`) for candidate `id` with its report as the task, and returns the session id. Refused before
- * anything is created when the status cannot move to `started`, when no mirror path is set, when the candidate has a task running, and
+ * Opens a creator-mode session (`startPreset`, on `startModel`) for candidate `id` with its report as the task, and returns the session id.
+ * Refused before anything is created when the status cannot move to `started`, when no mirror path is set, when the candidate has a task running, and
  * when the session of the last start is still running, whatever the status is now (`started -> started` opens another session, so two
  * clicks would open two; a report rerun moves a started candidate back to `reported` while its session may still work). Then
  * one patch moves the candidate to `started` and records the session. A session that exists but did not get its task, or that works
@@ -27,7 +27,9 @@ export async function start(ctx: HostContext, id: string): Promise<string> {
     const previous = candidate.started?.sessionId;
     if (previous !== undefined && ctx.services.agents.get(SessionId(previous))?.status === 'running') throw new Error(`上一个开工会话还在运行（会话 ${previous}）`);
     // A failure once the session exists is a StartWorkError whose message names the session.
-    const { sessionId } = await startWork(ctx.services, { candidate, directory: ctx.directory, preset: settings.startPreset, mirror, signal: ctx.signal });
+    const { sessionId } = await startWork(ctx.services, {
+      candidate, directory: ctx.directory, preset: settings.startPreset, model: settings.startModel, mirror, signal: ctx.signal,
+    });
     const at = ctx.now().toISOString();
     try {
       await ctx.store.patch(id, current => ({ ...transition(current, 'started', at), started: { sessionId, at } }));

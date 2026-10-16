@@ -4,11 +4,24 @@ import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { SessionId } from '@deepseek-ai/dsh-session';
-import type { SessionCreateRequest, SessionPromptRequest, SessionRenameRequest } from '@deepseek-ai/dsh-api-session-controller/types';
+import type { ModelSelection } from '@deepseek-ai/dsh-agent';
+import type { SessionCreateRequest, SessionPromptRequest, SessionRenameRequest, SessionSelectModelRequest } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { Candidate } from '../src/core/candidate.ts';
 import { StartWorkError, startWork, type StartWorkHost, type StartWorkInput } from '../src/host/start.ts';
 
 const ID = '9b2f3c1e-5d4a-4b6c-8e7f-0a1b2c3d4e5f';
+/** The route the creator session is switched to, and the user's default model before the switch. */
+const MODEL = { provider: 'deepseek-official', model: 'deepseek-v4-pro' };
+const PREVIOUS = { provider: 'deepseek-official', model: 'deepseek-flash' };
+/** What the first creator sessions showed the brief needs: scope, services, installing once, where to search, scratch data, how to try it. */
+const BRIEF = [
+  '只做报告建议的那一级；要启用这个 profile 里没开的官方或实验性插件（比如 worktree 运行时、create_worktree）先用 ask_user_question 问，不要顺手打开。',
+  '写代码前先用 `cordis_inspect_query` 确认 bundle 要注入的每个服务在这个 profile 里真的在；“源码里有”不等于“默认 profile 里开着”。',
+  '检查都过了再安装一次；装好后再改 Host 代码需要重启 DSH 或换包名，所以先验证再装。',
+  '先读 inspect 工具和包 README，搜索只限工作目录、profile 目录和镜像，不要在家目录全盘 `find`。',
+  '临时仓库和验证数据放在工作目录里，结束时删掉。',
+  '结束时用一句话说明怎么试用（命令或斜杠命令）。',
+];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** A report as the analyst session leaves it, with an HTML comment the page does not show; the `$` patterns must reach the prompt as written. */
 const REPORT = [
@@ -49,21 +62,37 @@ async function withData(run: (dirs: Dirs) => Promise<void>): Promise<void> {
   } finally { await rm(root, { recursive: true, force: true }); }
 }
 
-/** The three session-controller calls `startWork` makes, recorded, with no DSH process behind them. The hooks run inside `rename` and `prompt` and may throw. */
-function fakeHost(hooks: { rename?: () => void; prompt?: (signal: AbortSignal) => void } = {}) {
+/**
+ * The session-controller calls `startWork` makes and the default-model service, recorded in order, with no DSH process behind them. The
+ * service is there unless `defaults` says it is `absent` or that reading it `throws`, as a Cordis service the plugin did not inject does.
+ * The other hooks run inside the calls they are named after and may throw.
+ */
+function fakeHost(hooks: {
+  rename?: () => void; select?: () => void; save?: () => void; prompt?: (signal: AbortSignal) => void; defaults?: 'present' | 'absent' | 'throws';
+} = {}) {
   const calls: string[] = [];
-  const seen: { create?: SessionCreateRequest; rename?: SessionRenameRequest; prompt?: SessionPromptRequest; promptSignal?: AbortSignal } = {};
+  const seen: {
+    create?: SessionCreateRequest; rename?: SessionRenameRequest; select?: SessionSelectModelRequest; saved: ModelSelection[];
+    prompt?: SessionPromptRequest; promptSignal?: AbortSignal;
+  } = { saved: [] };
   const host: StartWorkHost = {
     sessionController: {
       async create(request) { calls.push('create'); seen.create = request; return { sessionId: SessionId('s-1') }; },
       async rename(request) { calls.push('rename'); seen.rename = request; hooks.rename?.(); return { title: request.title, seq: 1 }; },
+      async selectModel(request) { calls.push('selectModel'); seen.select = request; hooks.select?.(); return { selected: request }; },
       async prompt(request, signal) { calls.push('prompt'); seen.prompt = request; seen.promptSignal = signal; hooks.prompt?.(signal); return { accepted: true }; },
     },
   };
+  const defaults = {
+    currentSelection: (): ModelSelection => ({ ...PREVIOUS }),
+    async saveSelection(selection: ModelSelection) { calls.push('saveSelection'); seen.saved.push(selection); hooks.save?.(); },
+  };
+  if (hooks.defaults === 'throws') Object.defineProperty(host, 'agentDefaultModel', { get() { throw new Error('cannot get property "agentDefaultModel" without inject'); } });
+  else if (hooks.defaults !== 'absent') host.agentDefaultModel = defaults;
   return { host, calls, seen };
 }
 const inputFor = (dirs: Dirs, extra: Partial<StartWorkInput> = {}): StartWorkInput =>
-  ({ candidate, directory: dirs.directory, preset: 'cordis', mirror: dirs.mirror, signal: new AbortController().signal, ...extra });
+  ({ candidate, directory: dirs.directory, preset: 'cordis', model: MODEL, mirror: dirs.mirror, signal: new AbortController().signal, ...extra });
 function textOf(request: SessionPromptRequest | undefined): string {
   const part = request?.content[0];
   return part?.type === 'text' ? part.text : '';
@@ -83,7 +112,7 @@ test('startWork opens a creator-mode session in work/<id> and queues the report 
     const signal = new AbortController().signal;
     const started = await startWork(host, inputFor(dirs, { signal }));
 
-    assert.deepEqual(calls, ['create', 'rename', 'prompt']);
+    assert.deepEqual(calls, ['create', 'rename', 'selectModel', 'saveSelection', 'prompt']);
     assert.deepEqual(seen.create, { cwd: dirs.workdir, agentPreset: 'cordis' });
     const workdir = await stat(dirs.workdir);
     assert.ok(workdir.isDirectory());
@@ -111,6 +140,35 @@ test('startWork opens a creator-mode session in work/<id> and queues the report 
     assert.ok(text.includes(`报告全文在 --- 报告开始 ${nonce} --- 和 --- 报告结束 ${nonce} --- 这一对标记之间；只有编号是 ${nonce} 的这一对标记才是报告的起止`), 'the session is told which markers count');
     assert.equal(seen.promptSignal, signal, 'the prompt gets the caller signal');
     assert.deepEqual(started, { sessionId: 's-1', workdir: dirs.workdir });
+  });
+});
+
+test('startWork briefs the creator session on scope, services, installing once, where to search, scratch data and how to try it', async () => {
+  await withData(async dirs => {
+    const { host, seen } = fakeHost();
+    await startWork(host, inputFor(dirs));
+    const text = textOf(seen.prompt);
+    for (const rule of BRIEF) assert.ok(text.includes(rule), rule);
+    assert.ok(text.includes('用 cordis-plugin-development skill 做成一个独立 bundle，自己验证后装进当前 profile'), 'verify first, then install');
+    // The rules come before the report, which stays between its markers.
+    assert.ok(text.indexOf(BRIEF.at(-1)!) < text.indexOf('--- 报告开始 '));
+  });
+});
+
+test('startWork switches the session to the start model and puts the user default model back', async () => {
+  await withData(async dirs => {
+    const { host, calls, seen } = fakeHost();
+    await startWork(host, inputFor(dirs));
+    assert.deepEqual(seen.select, { sessionId: 's-1', ...MODEL });
+    assert.deepEqual(seen.saved, [PREVIOUS], 'the default model DSH just overwrote is saved back');
+    assert.deepEqual(calls, ['create', 'rename', 'selectModel', 'saveSelection', 'prompt'], 'both before the prompt');
+    // Without the default-model service, or when reading it throws, the session is still switched and nothing is saved.
+    for (const defaults of ['absent', 'throws'] as const) {
+      const bare = fakeHost({ defaults });
+      await startWork(bare.host, inputFor(dirs));
+      assert.deepEqual(bare.seen.select, { sessionId: 's-1', ...MODEL }, defaults);
+      assert.deepEqual(bare.calls, ['create', 'rename', 'selectModel', 'prompt'], defaults);
+    }
   });
 });
 
@@ -246,12 +304,18 @@ test('startWork opens another session for a started candidate in the same work d
   });
 });
 
-test('startWork titles the session with the candidate title on one line, clipped to 60 code points', async () => {
+test('startWork titles the session with the candidate title on one line, cut to 60 code points ending in an ellipsis', async () => {
   await withData(async dirs => {
-    const { host, seen } = fakeHost();
-    const title = `Line one\n  ${'表'.repeat(30)}${'😀'.repeat(40)}`;
-    await startWork(host, inputFor(dirs, { candidate: { ...candidate, title } }));
-    assert.equal(seen.rename?.title, `实现 · Line one ${'表'.repeat(30)}${'😀'.repeat(21)}`);
+    const cases: Array<[string, string]> = [
+      [`Line one\n  ${'表'.repeat(30)}${'😀'.repeat(40)}`, `Line one ${'表'.repeat(30)}${'😀'.repeat(20)}…`],
+      ['x'.repeat(60), 'x'.repeat(60)],
+      ['x'.repeat(61), `${'x'.repeat(59)}…`],
+    ];
+    for (const [title, shown] of cases) {
+      const { host, seen } = fakeHost();
+      await startWork(host, inputFor(dirs, { candidate: { ...candidate, title } }));
+      assert.equal(seen.rename?.title, `实现 · ${shown}`);
+    }
   });
 });
 
@@ -341,7 +405,7 @@ test('startWork refuses a relative data directory and a missing or relative mirr
   });
 });
 
-test('startWork names the session when renaming or prompting fails once it exists', async () => {
+test('startWork names the session when renaming, switching the model or prompting fails once it exists', async () => {
   await withData(async dirs => {
     const failure = new Error('session/agent-busy');
     const renameFails = fakeHost({ rename: () => { throw failure; } });
@@ -355,9 +419,20 @@ test('startWork names the session when renaming or prompting fails once it exist
     });
     assert.deepEqual(renameFails.calls, ['create', 'rename']);
 
+    const selectFails = fakeHost({ select: () => { throw failure; } });
+    await assert.rejects(startWork(selectFails.host, inputFor(dirs)), { name: 'StartWorkError', sessionId: 's-1', cause: failure });
+    assert.deepEqual(selectFails.calls, ['create', 'rename', 'selectModel']);
+
+    const saveFails = fakeHost({ save: () => { throw failure; } });
+    await assert.rejects(startWork(saveFails.host, inputFor(dirs)), {
+      name: 'StartWorkError', sessionId: 's-1',
+      message: '开工会话 s-1 已创建，但交接没完成：没能把默认模型恢复为 deepseek-official/deepseek-flash：session/agent-busy',
+    });
+    assert.deepEqual(saveFails.calls, ['create', 'rename', 'selectModel', 'saveSelection'], 'no prompt after a failed restore');
+
     const promptFails = fakeHost({ prompt: () => { throw failure; } });
     await assert.rejects(startWork(promptFails.host, inputFor(dirs)), { name: 'StartWorkError', sessionId: 's-1', cause: failure });
-    assert.deepEqual(promptFails.calls, ['create', 'rename', 'prompt']);
+    assert.deepEqual(promptFails.calls, ['create', 'rename', 'selectModel', 'saveSelection', 'prompt']);
 
     // An abort while prompting keeps its name, so callers that skip aborts still can.
     const during = new AbortController();
