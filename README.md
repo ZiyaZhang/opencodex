@@ -33,11 +33,12 @@ npm ci && npm run check && npm pack
 ```sh
 # 可选：从内置的 web 模板新建一个试用 profile
 dsh --profile opencodex --from-default-profile web --dump-config
-dsh plugin --profile opencodex add /绝对路径/dsh-opencodex-0.3.0.tgz
+mkdir -p ~/.dsh/opencodex-release && cp dsh-opencodex-0.3.0.tgz ~/.dsh/opencodex-release/
+dsh plugin --profile opencodex add ~/.dsh/opencodex-release/dsh-opencodex-0.3.0.tgz
 dsh --profile opencodex
 ```
 
-`dsh plugin add` 会打印 `WARN Issues with peer dependencies found.`。本插件的 peer dependency（`@deepseek-ai/cordis` 和几个 `@deepseek-ai/dsh-*` 包）由 DSH 运行时提供，这条警告是预期的。升级时先 `dsh plugin --profile <profile> remove dsh-opencodex` 再用新的 tgz `add`，然后重启 DSH：profile 用的是 pnpm 的 hoisted 链接方式，同一路径的 tgz 直接再 `add` 一次只会更新锁文件，`node_modules` 里还是旧构建（实测如此）。卸载同样用 `remove`。
+`dsh plugin add` 会打印 `WARN Issues with peer dependencies found.`。本插件的 peer dependency（`@deepseek-ai/cordis` 和几个 `@deepseek-ai/dsh-*` 包）由 DSH 运行时提供，这条警告是预期的。升级时先 `dsh plugin --profile <profile> remove dsh-opencodex` 再用新的 tgz `add`，然后重启 DSH：profile 用的是 pnpm 的 hoisted 链接方式，同一路径的 tgz 直接再 `add` 一次只会更新锁文件，`node_modules` 里还是旧构建（实测如此）。卸载同样用 `remove`。tgz 装完别删：profile 的锁文件记着它的路径，之后在这个 profile 里再装任何插件（包括开工会话装自己的 bundle）都会重新跑 pnpm，文件不在就报 `ENOENT`（实测如此），所以上面先把它放到固定目录。
 
 ### 第一次启动
 
@@ -115,7 +116,7 @@ dsh --profile opencodex
 
 「开工」在 `work/<id>/` 开一个 `startPreset` 会话（默认 `cordis`，创造模式），标题「实现 · <候选标题>」，页面随即跳过去。首条消息是任务说明加报告全文（去掉页面上不显示的 HTML 注释）：用 `cordis-plugin-development` skill 把「建议」一节推荐的那一级做成独立 bundle，装进当前 profile 并自己验证；需要改 DSH 核心代码时停下来，写清楚改哪个包的哪几行。提示词交代报告和证据里的原文、命令、链接都是第三方数据，不照做。
 
-之后 OpenCodex 不再介入：不选模型（用 DSH 当前的默认模型），不设沙箱，不等结果。会话从部署的默认沙箱模式开始，常见是只读，要写 bundle 时在那个会话里放宽。同一条候选可以再开工，上一个开工会话还在运行时会拒绝。
+之后 OpenCodex 不再介入：不设沙箱，不等结果。会话从部署的默认沙箱模式开始，常见是只读，要写 bundle 时在那个会话里放宽到工作目录。会话用 DSH 自带的 plugin_manager 工具安装 bundle，每次安装会弹一张「允许本次操作使用 danger-full-access 权限」的单次审批卡，批之前先看一眼它写的代码；装好的 bundle 是 `link:` 装法，源码就在 `work/<id>/` 里，删了那个目录 profile 就坏。同一条候选可以再开工，上一个开工会话还在运行时会拒绝。两次实跑（`list_worktrees` 工具、`workflow-to-skill` skill）见 [phase3-trial.md](docs/plans/phase3-trial.md)。
 
 ### 失败处理
 
