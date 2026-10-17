@@ -1,4 +1,5 @@
 /** The state the Host's actions share, and the helpers they all use. */
+import type { LockKind, LockResult } from '../../core/lock.js';
 import type { Settings } from '../../core/settings.js';
 import type { CandidateStore } from '../../core/store.js';
 import type { classifyBatch } from '../classify.js';
@@ -55,6 +56,8 @@ export interface HostContext {
   setSettings(next: Readonly<Settings>): void;
   /** A GitHub client for one run: a client that finds gh unusable stays on REST for its lifetime, so production makes a new one each time. */
   github(): GitHubClient;
+  /** Takes the data-directory lock for `kind` (see `acquireLock`) under the Host clock and lifetime; a hold not released by unload is released then. */
+  lock(kind: LockKind): Promise<LockResult>;
   /** Serves the RSS feed instead of the proxy-aware public network (tests). */
   readonly fetcher?: typeof fetch;
   /** How often a report session is polled (tests); 3 seconds by default. */
@@ -63,7 +66,7 @@ export interface HostContext {
   readonly classifyRetryDelaysMs: readonly number[];
   /** The DSH index, once one is loaded or built. */
   index?: DshIndex;
-  /** The last check this process ran, and when it ended (ISO); a check that failed is recorded with an `errors` line. */
+  /** The last check this process ran, and when it ended (ISO); a check that failed is recorded with an `errors` line. checks.jsonl has every process's. */
   lastCheck?: CheckResult;
   lastCheckAt?: string;
   /** Candidates with a task running, by id: one task per candidate at a time. */

@@ -8,12 +8,14 @@ import type { FinishReason } from '@deepseek-ai/dsh-llm';
 import { remoteErrorOf } from '@deepseek-ai/dsh-typert-protocol';
 import { transition, type Candidate, type Evidence } from '../src/core/candidate.ts';
 import { ValidationError } from '../src/core/check.ts';
+import type { CheckLogEntry } from '../src/core/run-log.ts';
 import { DEFAULT_SETTINGS, type Settings } from '../src/core/settings.ts';
 import { CandidateStore } from '../src/core/store.ts';
 import { MAX_PAYLOAD, OPEN_CODEX_DESCRIPTOR, parseRequest, type OpenCodexResponse } from '../src/host/remote.ts';
-import { FLAGS, MIRROR, NOW, REPORT, classifyAll, codexGh, fakeLlm, fixture, offlineGh, serve, stalledGh, until, type Answer, type Fixture } from './helpers/host-fixture.ts';
+import { FLAGS, GONE_PID, MIRROR, NOW, REPORT, classifyAll, codexGh, fakeLlm, fixture, foreignLock, offlineGh, serve, stalledGh, until, type Answer, type Fixture } from './helpers/host-fixture.ts';
 
 const COUNTER = 'reportsOn-2026-10-15';
+const MINUTE = 60_000;
 const HOUR = 3_600_000;
 const UNKNOWN_ID = '00000000-0000-4000-8000-000000000000';
 
@@ -54,7 +56,8 @@ test('the Host registers its Remote descriptor and a first snapshot writes the d
     assert.deepEqual(response.checkpoints, { lastStableTag: 'rust-v0.161.0' }, 'checkpoints come from the store');
     assert.deepEqual([response.candidates, response.totalCandidates, response.omittedCandidates], [[], 0, 0]);
     assert.deepEqual(response.busy, { check: false, candidates: {} });
-    for (const key of ['lastCheck', 'lastCheckAt', 'indexSummary', 'notice'] as const) assert.equal(response[key], undefined, key);
+    assert.equal(response.hostPid, process.pid);
+    for (const key of ['lastCheck', 'lastCheckAt', 'lastCheckLog', 'lock', 'indexSummary', 'notice'] as const) assert.equal(response[key], undefined, key);
   } finally { await f.close(); }
 });
 
@@ -377,6 +380,106 @@ test('a check that stalls gives up at its deadline, is recorded, and does not ho
   } finally { await f.close(); }
 });
 
+const lockFile = (f: Fixture) => join(f.directory, 'lock.json');
+const logLines = async (f: Fixture) => (await readFile(join(f.directory, 'checks.jsonl'), 'utf8')).split('\n').filter(Boolean).map(line => JSON.parse(line) as CheckLogEntry);
+
+test('checks one after the other each take the lock, let it go and append a line, which snapshots and a restarted Host read back', async () => {
+  const f = await fixture();
+  try {
+    const first = await f.call({ action: 'check' });
+    f.clock.advance(HOUR);
+    const second = await f.call({ action: 'check' });
+    assert.equal(await exists(lockFile(f)), false, 'no lock is left behind');
+    const { releases, files, rss } = first.lastCheck!;
+    const later = new Date(NOW.getTime() + HOUR).toISOString();
+    assert.deepEqual(await logLines(f), [
+      { at: NOW.toISOString(), startedAt: NOW.toISOString(), trigger: 'manual', pid: process.pid, window: { fromTag: 'rust-v0.161.0', toTag: 'rust-v0.162.0' },
+        added: { releases: releases.added, files: files.added, desktop: 0, rss }, errors: [] },
+      { at: later, startedAt: later, trigger: 'manual', pid: process.pid, window: null, added: { releases: 0, files: 0, desktop: 0, rss: 0 }, errors: [] },
+    ]);
+    assert.deepEqual([first.lastCheckAt, second.lastCheckAt], [NOW.toISOString(), later], 'a line ends when lastCheckAt says');
+    const [, last] = await logLines(f);
+    assert.deepEqual(second.lastCheckLog, last);
+    assert.equal(second.hostPid, process.pid);
+    await f.unload();
+    const next = await fixture({ directory: f.directory, settings: null });
+    try {
+      const restarted = await next.call({ action: 'snapshot' });
+      assert.equal(restarted.lastCheck, undefined, 'the restarted Host has run no check');
+      assert.deepEqual(restarted.lastCheckLog, last);
+    } finally { await next.close(); }
+  } finally { await f.close(); }
+});
+
+test('a check refused by another process\'s lock is a bad request, writes no line, keeps lastCheck and is tried again in 10 minutes', async () => {
+  const f = await fixture();
+  try {
+    const before = await f.call({ action: 'check' });
+    const holder = foreignLock();
+    await writeFile(lockFile(f), JSON.stringify(holder));
+    await assert.rejects(f.call({ action: 'check' }), remoteError('gateway/bad-request', new RegExp(`^另一个 DSH 进程正在检查（pid ${process.ppid}，开始于 .+）$`)));
+    assert.equal(f.timers.log.at(-1)!.ms, 10 * MINUTE);
+    const refused = await f.call({ action: 'snapshot' });
+    assert.deepEqual([refused.lastCheck, refused.lastCheckAt, refused.lastCheckLog], [before.lastCheck, before.lastCheckAt, before.lastCheckLog]);
+    assert.deepEqual(refused.lock, { pid: process.ppid, kind: 'check', startedAt: holder.startedAt });
+    // The timer's try is refused the same way; the one after the other process lets go runs.
+    f.timers.fire();
+    await until(() => f.timers.log.length === 4, 'the timer check to be refused');
+    assert.equal(f.timers.log.at(-1)!.ms, 10 * MINUTE);
+    assert.equal((await logLines(f)).length, 1, 'no line for a check that did not run');
+    assert.deepEqual(JSON.parse(await readFile(lockFile(f), 'utf8')), holder, 'the other process keeps its lock');
+    await rm(lockFile(f));
+    f.timers.fire();
+    await until(() => f.timers.log.length === 5, 'the timer check to run');
+    assert.deepEqual((await logLines(f)).map(line => line.trigger), ['manual', 'timer']);
+    assert.equal(f.timers.log.at(-1)!.ms, 24 * HOUR);
+  } finally { await f.close(); }
+});
+
+test('the snapshot names its own process, and another process\'s lock only while that process is alive and beating', async () => {
+  const f = await fixture();
+  try {
+    const plain = await f.call({ action: 'snapshot' });
+    assert.equal(plain.hostPid, process.pid);
+    assert.equal(plain.lock, undefined);
+    const holder = foreignLock({ kind: 'research' });
+    await writeFile(lockFile(f), JSON.stringify(holder));
+    assert.deepEqual((await f.call({ action: 'snapshot' })).lock, { pid: process.ppid, kind: 'research', startedAt: holder.startedAt });
+    f.clock.advance(6 * MINUTE);
+    assert.equal((await f.call({ action: 'snapshot' })).lock, undefined, 'a heartbeat over 5 minutes old');
+    await writeFile(lockFile(f), JSON.stringify(foreignLock({ pid: GONE_PID, heartbeatAt: f.clock.now().toISOString() })));
+    assert.equal((await f.call({ action: 'snapshot' })).lock, undefined, 'a process that is gone');
+    assert.equal(JSON.parse(await readFile(lockFile(f), 'utf8')).pid, GONE_PID, 'a snapshot takes nothing over');
+  } finally { await f.close(); }
+});
+
+test('unloading during a check lets go of the lock and writes no line', async () => {
+  let calls = 0;
+  const f = await fixture({ gh: (args, signal) => { calls++; return stalledGh(args, signal); } });
+  try {
+    const running = f.call({ action: 'check' });
+    await until(() => calls > 0, 'the check to reach GitHub');
+    const held = JSON.parse(await readFile(lockFile(f), 'utf8'));
+    assert.deepEqual([held.pid, held.kind], [process.pid, 'check']);
+    assert.equal((await f.call({ action: 'snapshot' })).lock, undefined, 'the lock of this process is not shown as another\'s');
+    await f.unload();
+    await assert.rejects(running, { name: 'AbortError' });
+    assert.equal(await exists(lockFile(f)), false);
+    assert.equal(await exists(join(f.directory, 'checks.jsonl')), false);
+  } finally { await f.close(); }
+});
+
+test('a check log that cannot be written becomes a log line of the check, and one that cannot be read a notice', async () => {
+  const f = await fixture();
+  try {
+    await mkdir(join(f.directory, 'checks.jsonl'));
+    const response = await f.call({ action: 'check' });
+    assert.match(response.lastCheck!.errors.at(-1)!, /^log: EISDIR/);
+    assert.equal(response.lastCheckLog, undefined);
+    assert.match(response.notice ?? '', /^检查日志 .*checks\.jsonl 没能读出来：EISDIR/);
+  } finally { await f.close(); }
+});
+
 test('parseRequest accepts the listed actions only, with candidate UUIDs and settings of the right shape; the wire codec only wants an object', () => {
   const id = '9b2f3c1e-5d4a-4b6c-8e7f-0a1b2c3d4e5f';
   assert.deepEqual(parseRequest({ action: 'snapshot' }), { action: 'snapshot' });
@@ -602,6 +705,7 @@ test('the timer runs the first check after a short delay, re-arms after each che
     f.timers.fire();
     const checked = await f.call({ action: 'check' });
     assert.equal(feed.count, 1, 'the requested check joined the one the timer started');
+    assert.equal(checked.lastCheckLog?.trigger, 'startup');
     assert.ok(checked.lastCheck && checked.lastCheck.errors.length > 0);
     assert.deepEqual([...new Set(f.timers.log.slice(1).map(entry => entry.ms))], [24 * HOUR]);
     assert.equal(f.timers.armed.size, 1);

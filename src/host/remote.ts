@@ -6,6 +6,8 @@
 import type { InvocationDescriptor, RemoteResult, TypertRemoteContribution } from '@deepseek-ai/dsh-typert-protocol';
 import type { Candidate } from '../core/candidate.js';
 import { ValidationError, check } from '../core/check.js';
+import type { LockHolder } from '../core/lock.js';
+import type { CheckLogEntry } from '../core/run-log.js';
 import type { ModelRoute, Settings } from '../core/settings.js';
 import type { CheckResult } from './collector.js';
 
@@ -38,6 +40,12 @@ export interface OpenCodexResponse {
   /** The last check this Host process ran, by the timer or on request (one that failed as a whole has a `check:` line), and when it ended. */
   lastCheck?: CheckResult;
   lastCheckAt?: string;
+  /** The last line of checks.jsonl: the last check any process ran on this data directory, there after a restart too. */
+  lastCheckLog?: CheckLogEntry;
+  /** The process of this Host, to tell its own checks in `lastCheckLog` from another process's. */
+  hostPid: number;
+  /** Another live DSH process holding the data-directory lock, and what for: a check asked for now is refused. */
+  lock?: LockHolder;
   /** Work in progress: a check, and the candidates with a report or a start running. */
   busy: { check: boolean; candidates: Record<string, 'report' | 'start'> };
   /** `readReport`: the report, or empty text and a `notice` saying why there is none to show. */
@@ -48,7 +56,10 @@ export interface OpenCodexResponse {
   indexSummary?: { entries: number; commit: string; builtAt: string };
   /** `start`: the creator-mode session just opened, for the page to switch to. */
   startedSessionId?: string;
-  /** What this answer lacks though the action finished: the list or the checkpoints could not be read, records were damaged, the list was too large. */
+  /**
+   * What this answer lacks though the action finished: the list, the checkpoints, the check log or the lock file could not be read, records
+   * were damaged, the list was too large.
+   */
   notice?: string;
 }
 

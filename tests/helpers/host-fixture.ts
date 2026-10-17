@@ -1,10 +1,10 @@
 /**
  * The Host test bench: an OpenCodex Host loaded as a Cordis plugin over a temporary data directory, with DSH, the model, GitHub, the RSS
- * feed, the timers and the clock replaced by fakes the tests drive.
+ * feed, the timers and the clock replaced by fakes the tests drive, and the lock file another DSH process would leave in the directory.
  */
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Context } from '@deepseek-ai/cordis';
@@ -13,6 +13,7 @@ import type { FinishReason, GenerateOptions, LlmCallConfig, StreamChunk } from '
 import { SessionId } from '@deepseek-ai/dsh-session';
 import type { SessionCancelRequest, SessionCreateRequest, SessionPromptRequest, SessionRenameRequest, SessionSelectModelRequest } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { InvocationDescriptor } from '@deepseek-ai/dsh-typert-protocol';
+import type { LockRecord } from '../../src/core/lock.ts';
 import { DEFAULT_SETTINGS, type Settings } from '../../src/core/settings.ts';
 import { CandidateStore } from '../../src/core/store.ts';
 import { GitHubClient, type GhRunner } from '../../src/host/github.ts';
@@ -132,6 +133,12 @@ export function fakeClock(start: Date = NOW) {
     advance(ms: number) { at += ms; },
   };
 }
+
+/** No process has this pid: Linux and macOS both keep pids below 2^22. */
+export const GONE_PID = 2 ** 22 + 1;
+/** `lock.json` as another DSH process leaves it: by default the parent of this test process, which is alive, checking since NOW and beating at NOW. */
+export const foreignLock = (fields: Partial<LockRecord> = {}): LockRecord =>
+  ({ pid: process.ppid, kind: 'check', startedAt: NOW.toISOString(), heartbeatAt: NOW.toISOString(), hostname: hostname(), ...fields });
 
 /** The ids of the candidate blocks in a classification request. */
 function idsOf(request: GenerateOptions): string[] {

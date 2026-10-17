@@ -1,5 +1,7 @@
 /** The answer every action ends with, and the `candidate` action that returns one record whole. */
 import type { Candidate, Evidence } from '../../core/candidate.js';
+import { lockHolder, type LockHolder } from '../../core/lock.js';
+import { readLastCheckLog } from '../../core/run-log.js';
 import type { Checkpoints } from '../../core/store.js';
 import { clip } from '../changelog-parser.js';
 import { MAX_PAYLOAD, type OpenCodexResponse } from '../remote.js';
@@ -53,9 +55,10 @@ function busyOf(ctx: HostContext): OpenCodexResponse['busy'] {
 
 /**
  * The answer to an action that has finished: the snapshot with `result` laid over it. Building the snapshot never fails the action. When
- * the list or the checkpoints cannot be read, the answer goes without them and `notice` says so; a damaged record is listed without what is
- * damaged and named in `notice`; an answer that would pass the Remote's 4 MB bound goes without the list. The list holds the candidates
- * `selected` picks, each as `listed` shows it; `totalCandidates` and `omittedCandidates` say how many there are and how many it leaves out.
+ * the list, the checkpoints, the check log or the lock file cannot be read, the answer goes without them and `notice` says so; a damaged
+ * record is listed without what is damaged and named in `notice`; an answer that would pass the Remote's 4 MB bound goes without the list.
+ * The list holds the candidates `selected` picks, each as `listed` shows it; `totalCandidates` and `omittedCandidates` say how many there
+ * are and how many it leaves out.
  */
 export async function respond(ctx: HostContext, result: ActionResult = {}): Promise<OpenCodexResponse> {
   const notices: string[] = [];
@@ -71,10 +74,15 @@ export async function respond(ctx: HostContext, result: ActionResult = {}): Prom
   }
   let checkpoints: Checkpoints = {};
   try { checkpoints = await ctx.store.checkpoints(); } catch (error) { notices.push(`state.json 没能读出来：${messageOf(error)}`); }
+  const log = await readLastCheckLog(ctx.directory);
+  if (log.problem) notices.push(log.problem);
+  let lock: LockHolder | undefined;
+  try { lock = await lockHolder(ctx.directory, { now: ctx.now }); } catch (error) { notices.push(`数据目录锁 lock.json 没能读出来：${messageOf(error)}`); }
   const { index, lastCheck, lastCheckAt } = ctx;
   const response: OpenCodexResponse = {
     settings: ctx.settings(), ...listing, checkpoints, busy: busyOf(ctx),
-    ...(lastCheck && { lastCheck }), ...(lastCheckAt && { lastCheckAt }),
+    ...(lastCheck && { lastCheck }), ...(lastCheckAt && { lastCheckAt }), ...(log.entry && { lastCheckLog: log.entry }),
+    hostPid: process.pid, ...(lock && { lock }),
     ...(index && { indexSummary: { entries: index.entries.length, commit: index.commit, builtAt: index.builtAt } }),
     ...result,
     ...(notices.length > 0 && { notice: notices.join('；') }),

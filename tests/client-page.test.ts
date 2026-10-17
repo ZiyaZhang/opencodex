@@ -256,7 +256,7 @@ function fakeHost(candidates: Candidate[], extra: Partial<OpenCodexResponse> = {
       if (request.action === 'settings') host.settings = { ...host.settings, ...request.patch };
       const snapshot: OpenCodexResponse = {
         settings: host.settings, candidates, totalCandidates: candidates.length, omittedCandidates: 0, checkpoints: {},
-        busy: { check: false, candidates: {} }, ...extra,
+        busy: { check: false, candidates: {} }, hostPid: 4242, ...extra,
       };
       if (request.action === 'start') return { ...snapshot, startedSessionId: 'session-1' };
       if (request.action === 'candidate') return { ...snapshot, candidate: whole[request.id] ?? candidates.find(item => item.id === request.id) };

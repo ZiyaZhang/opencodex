@@ -11,6 +11,8 @@ import type {} from '@deepseek-ai/dsh-api-session-controller';
 import type {} from '@deepseek-ai/dsh-llm';
 import type {} from '@deepseek-ai/dsh-typert-registry';
 import { ValidationError } from '../core/check.js';
+import { LockedError, acquireLock, type LockKind, type LockResult } from '../core/lock.js';
+import type { CheckTrigger } from '../core/run-log.js';
 import { CandidateStore } from '../core/store.js';
 import { loadIndex, type CheckResult } from './collector.js';
 import { GitHubClient } from './github.js';
@@ -51,9 +53,13 @@ declare module '@deepseek-ai/cordis' { interface Context { opencodex: OpenCodex 
 const HOUR = 3_600_000;
 /** The first check waits this long, so it does not compete with DSH starting up. */
 const FIRST_CHECK_DELAY_MS = 60_000;
+/** A check refused by another process's lock is tried again this soon, not a whole interval later: what that process runs takes minutes. */
+const LOCKED_RETRY_MS = 10 * 60_000;
 const TIMEOUTS: HostContext['timeouts'] = { check: 30 * 60_000, classify: 15 * 60_000, github: 10 * 60_000 };
 const CLASSIFY_RETRY_DELAYS_MS = [5_000, 20_000];
 const NODE_TIMERS: Timers = { set: (run, ms) => setTimeout(run, ms).unref(), clear: handle => clearTimeout(handle as NodeJS.Timeout) };
+/** What the timer starts: the first check after the Host starts, or a later one. */
+type TimerTrigger = Extract<CheckTrigger, 'startup' | 'timer'>;
 
 /**
  * What the actions call in DSH: the injected services, taken once. Never `ctx` itself, since a plugin context throws for a member it did not
@@ -79,6 +85,8 @@ export default class OpenCodex extends TypertRemoteService {
   private readonly timers: Timers;
   /** Calls and timer runs in progress, waited for on unload. */
   private readonly work = new Set<Promise<unknown>>();
+  /** Holds of the data-directory lock taken through the HostContext and not released yet. */
+  private readonly locks = new Set<Extract<LockResult, { held: true }>>();
   private timer: unknown;
   private closed = false;
 
@@ -119,7 +127,7 @@ export default class OpenCodex extends TypertRemoteService {
   private async act(host: HostContext, request: OpenCodexRequest): Promise<ActionResult> {
     switch (request.action) {
       case 'snapshot': return {};
-      case 'check': await this.checkAndRearm(host); return {};
+      case 'check': await this.checkAndRearm(host, 'manual'); return {};
       case 'classify': await classify(host); return {};
       case 'report': await report(host, request.id); return {};
       case 'start': return { startedSessionId: await start(host, request.id) };
@@ -140,29 +148,44 @@ export default class OpenCodex extends TypertRemoteService {
       settings: () => settings,
       setSettings: next => { settings = next; this.rearm(host); },
       github: () => deps.github ?? new GitHubClient(),
+      lock: kind => this.lock(kind, now),
       fetcher: deps.fetcher, reportPollMs: deps.reportPollMs, timeouts: { ...TIMEOUTS, ...deps.timeouts },
       classifyRetryDelaysMs: deps.classifyRetryDelaysMs ?? CLASSIFY_RETRY_DELAYS_MS,
       index: await loadIndex(this.directory),
       busy: new Map(), running: new Map(), reportsRunning: 0,
       lanes: { settings: new Lane(), reports: new Lane(), classify: new Lane(), index: new Lane() },
     };
-    this.arm(FIRST_CHECK_DELAY_MS);
+    this.arm(FIRST_CHECK_DELAY_MS, 'startup');
     return host;
   }
 
-  /** A check, by request or by the timer; when it ends, the next one is due a whole interval later. */
-  private async checkAndRearm(host: HostContext): Promise<CheckResult> {
-    try { return await check(host); } finally { this.arm(host.settings().checkIntervalHours * HOUR); }
+  /** The data-directory lock under the Host clock and lifetime. A hold is kept here until released, so that one still held at unload is released then. */
+  private async lock(kind: LockKind, now: () => Date): Promise<LockResult> {
+    const taken = await acquireLock(this.directory, kind, { now, signal: this.lifetime.signal });
+    if (!taken.held) return taken;
+    this.locks.add(taken);
+    return { held: true, release: () => { this.locks.delete(taken); return taken.release(); } };
+  }
+
+  /**
+   * A check, by request or by the timer; when it ends, the next one is due a whole interval later, or 10 minutes later when another
+   * process's lock refused it.
+   */
+  private async checkAndRearm(host: HostContext, trigger: CheckTrigger): Promise<CheckResult> {
+    let refused = false;
+    try { return await check(host, trigger); } catch (error) { refused = error instanceof LockedError; throw error; } finally {
+      this.arm(refused ? LOCKED_RETRY_MS : host.settings().checkIntervalHours * HOUR);
+    }
   }
 
   private disarm(): void {
     if (this.timer !== undefined) this.timers.clear(this.timer);
     this.timer = undefined;
   }
-  /** Arms the timer to fire in `ms`, replacing the armed one; nothing once the plugin is unloading. */
-  private arm(ms: number): void {
+  /** Arms the timer to run a check in `ms`, replacing the armed one; nothing once the plugin is unloading. */
+  private arm(ms: number, trigger: TimerTrigger = 'timer'): void {
     this.disarm();
-    if (!this.closed) this.timer = this.timers.set(() => { this.timer = undefined; void this.scheduled(); }, Math.max(0, ms));
+    if (!this.closed) this.timer = this.timers.set(() => { this.timer = undefined; void this.scheduled(trigger); }, Math.max(0, ms));
   }
 
   /** After a settings change: the next check is due one (new) interval after the last one ended. The startup timer, and a check in progress, re-arm by themselves. */
@@ -171,10 +194,15 @@ export default class OpenCodex extends TypertRemoteService {
     this.arm(Date.parse(host.lastCheckAt) + host.settings().checkIntervalHours * HOUR - host.now().getTime());
   }
 
-  /** A timer run. A failure is recorded as `lastCheck` by the check itself, so the page shows it; the log gets it too. */
-  private async scheduled(): Promise<void> {
-    try { await this.track(this.ready.then(host => this.checkAndRearm(host))); } catch (error) {
-      if (!this.closed) this.ctx.logger.warn(`OpenCodex: scheduled check failed: ${messageOf(error)}`);
+  /**
+   * A timer run. A failure is recorded as `lastCheck` and in checks.jsonl by the check itself, so the page shows it; the DSH log gets it
+   * too. A refusal by another process's lock is no failure, and its retry is armed already.
+   */
+  private async scheduled(trigger: TimerTrigger): Promise<void> {
+    try { await this.track(this.ready.then(host => this.checkAndRearm(host, trigger))); } catch (error) {
+      if (this.closed) return;
+      if (error instanceof LockedError) this.ctx.logger.info(`OpenCodex: scheduled check skipped: ${error.message}`);
+      else this.ctx.logger.warn(`OpenCodex: scheduled check failed: ${messageOf(error)}`);
     }
   }
 
@@ -185,11 +213,15 @@ export default class OpenCodex extends TypertRemoteService {
     return work;
   }
 
-  /** Unload: no more timer, every running report, start, check and classification aborted, and their ends waited for. */
+  /** Unload: no more timer, every running report, start, check and classification aborted, their ends waited for, and the lock let go. */
   private async close(): Promise<void> {
     this.closed = true;
     this.disarm();
     this.lifetime.abort(new DOMException('OpenCodex 已卸载', 'AbortError'));
     await Promise.allSettled([...this.work]);
+    // Each run lets go of its lock as it ends. A hold still here would go on beating, and refusing every other process, while DSH runs.
+    const left = [...this.locks];
+    this.locks.clear();
+    await Promise.all(left.map(lock => lock.release()));
   }
 }
