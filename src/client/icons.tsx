@@ -1,13 +1,12 @@
 import { ArrowClockwiseIcon } from '@phosphor-icons/react/dist/csr/ArrowClockwise';
 import { ArrowLeftIcon } from '@phosphor-icons/react/dist/csr/ArrowLeft';
 import { ArrowUpRightIcon } from '@phosphor-icons/react/dist/csr/ArrowUpRight';
-import { BroadcastIcon } from '@phosphor-icons/react/dist/csr/Broadcast';
 import { CodeIcon } from '@phosphor-icons/react/dist/csr/Code';
 import { SlidersHorizontalIcon } from '@phosphor-icons/react/dist/csr/SlidersHorizontal';
 
 const icons = {
   refresh: ArrowClockwiseIcon, back: ArrowLeftIcon, external: ArrowUpRightIcon,
-  code: CodeIcon, radar: BroadcastIcon, settings: SlidersHorizontalIcon,
+  code: CodeIcon, settings: SlidersHorizontalIcon,
 };
 export type IconName = keyof typeof icons;
 

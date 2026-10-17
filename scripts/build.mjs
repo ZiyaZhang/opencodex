@@ -18,7 +18,8 @@ await build({
 const client = await build({
   absWorkingDir: root, entryPoints: ['src/client/index.tsx'], bundle: true, write: false,
   platform: 'browser', target: 'es2022', format: 'cjs', jsx: 'automatic',
-  external: ['react', 'react/jsx-runtime', 'react-dom', 'react-dom/client', '@deepseek-ai/cordis', '@deepseek-ai/dsh-client-ui-slots'],
+  // DSH resolves these from its own module table at load time, the DSH controls (`dsh-client-ui-primitives`) by their bare package name.
+  external: ['react', 'react/jsx-runtime', 'react-dom', 'react-dom/client', '@deepseek-ai/cordis', '@deepseek-ai/dsh-client-ui-slots', '@deepseek-ai/dsh-client-ui-primitives'],
   define: { 'process.env.NODE_ENV': '"production"' },
   loader: { '.css': 'text' }, minify: true,
 });

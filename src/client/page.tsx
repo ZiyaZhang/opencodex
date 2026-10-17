@@ -1,77 +1,44 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type InputHTMLAttributes } from 'react';
+/**
+ * The OpenCodex page: the data it reads from the Host and the requests it sends, and how the parts fit together (the header, the views
+ * and the list, the settings, the detail of one candidate). The detail view below is the one from before the list's redesign.
+ */
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { canTransition, type Evidence, type ReportChecks, type ReportRecord, type Status } from '../core/candidate.js';
+import { CandidateList } from './CandidateList.js';
+import type { CandidateAction, RowState } from './CandidateRow.js';
+import type { Call, ClientCandidate, ClientRequest, ClientResponse, OpenSession } from './contract.js';
+import { Filters } from './Filters.js';
+import { Header } from './Header.js';
+import { Icon } from './icons.js';
 import {
-  CATEGORIES, RELEVANCES, SOURCES, STATUSES, canTransition,
-  type Candidate, type Evidence, type EvidenceKind, type ReportChecks, type ReportRecord, type Source, type Status,
-} from '../core/candidate.js';
-import type { Settings } from '../core/settings.js';
-import type { OpenCodexRequest, OpenCodexResponse } from '../host/remote.js';
-import { Icon, type IconName } from './icons.js';
+  CATEGORY_LABELS, EVIDENCE_LABELS, RELEVANCE_LABELS, SOURCE_LABELS, STATUS_LABELS, countViews, labelOf, mergeLabel, time, viewOf, type View,
+} from './labels.js';
 import { Markdown, revealHidden } from './markdown.js';
+import { SettingsView } from './SettingsView.js';
+import type { Ui } from './ui.js';
+import { UiContext, useUi } from './ui-context.js';
 
-type Call = (request: OpenCodexRequest, signal?: AbortSignal) => Promise<OpenCodexResponse>;
-type OpenSession = (sessionId: string) => void;
-type Category = typeof CATEGORIES[number];
-type Relevance = typeof RELEVANCES[number];
-type LastCheck = NonNullable<OpenCodexResponse['lastCheck']>;
-type IndexSummary = NonNullable<OpenCodexResponse['indexSummary']>;
-type ReportText = NonNullable<OpenCodexResponse['report']>;
-/** The actions on one candidate. */
-type CandidateAction = 'report' | 'start' | 'ignore' | 'restore';
+type ReportText = NonNullable<ClientResponse['report']>;
 /** The controls outside the list, each with its own busy flag and error line. */
 type Control = 'check' | 'index' | 'settings';
-type Tab = 'candidates' | 'settings';
 
-const TABS: readonly (readonly [Tab, string, IconName])[] = [['candidates', '候选', 'radar'], ['settings', '设置', 'settings']];
-const SOURCE_LABELS: Record<Source, string> = { 'codex-release': 'Codex 发布说明', 'codex-files': 'Codex 仓库文件', desktop: 'Codex 桌面端', rss: '官方 RSS' };
-const CATEGORY_LABELS: Record<Category, string> = { 'cli-core': 'CLI 核心', desktop: '桌面端', cloud: '云端', model: '模型', fix: '修复', other: '其他' };
-const RELEVANCE_LABELS: Record<Relevance, string> = { high: '高', medium: '中', low: '低' };
-const STATUS_LABELS: Record<Status, string> = { new: '新发现', reported: '已出报告', started: '已开工', ignored: '已忽略' };
-const EVIDENCE_LABELS: Record<EvidenceKind, string> = { pr: 'PR', file: '文件', chunk: 'chunk', i18n: 'i18n key', rss: 'RSS', 'feature-flag': '功能开关', schema: '协议类型', doc: '文档' };
-const BUSY_LABELS: Record<CandidateAction, string> = { report: '生成中', start: '开工中', ignore: '忽略中', restore: '恢复中' };
+const BUSY_LABELS: Record<CandidateAction, string> = { report: '调研中', start: '发送中', ignore: '忽略中', restore: '恢复中' };
 /** How often a visible page asks for a fresh snapshot: the timer's checks and the reports finish without the page asking. Sooner while the Host is busy. */
 const POLL_MS = 60_000, BUSY_POLL_MS = 5_000;
+/** What an empty view says, and what the list says before the first check found anything. */
+const EMPTY: Record<View, { title: string; hint: string }> = {
+  todo: { title: '没有待办的动态', hint: '新发现的动态归类后，相关度不是低的会出现在这里。' },
+  low: { title: '没有相关度低的动态', hint: '归类为相关度低的新发现会出现在这里。' },
+  ignored: { title: '没有已忽略的动态', hint: '忽略的动态会出现在这里，可以随时恢复。' },
+};
+const NOTHING_YET = { title: '还没有 Codex 动态', hint: '点「检查更新」从发布说明、仓库文件、桌面端和 RSS 收集 Codex 的新功能。' };
 
 const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
-/** The label of a value read from disk, or the value itself when this page does not know it. */
-const labelOf = <K extends string>(labels: Record<K, string>, value: string): string => (Object.hasOwn(labels, value) ? labels[value as K] : value);
-const time = (iso: string) => {
-  const date = new Date(iso);
-  return Number.isNaN(date.getTime()) ? iso : date.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-};
 const httpUrl = (url: string | undefined) => (url && /^https?:\/\//i.test(url) ? url : undefined);
 const without = <T,>(record: Record<string, T>, key: string): Record<string, T> => {
   const { [key]: _dropped, ...rest } = record;
   return rest;
 };
-/** Descending order of ISO timestamps, which sort as strings. */
-const newestFirst = (a: string, b: string) => (a < b ? 1 : a > b ? -1 : 0);
-
-export interface Filters {
-  source: Source | 'all';
-  /** `none`: not classified yet. */
-  category: Category | 'all' | 'none';
-  /** `not-low`: everything but `low`, the unclassified included. */
-  relevance: Relevance | 'all' | 'not-low';
-  status: Status | 'all' | 'not-ignored';
-}
-export const DEFAULT_FILTERS: Filters = { source: 'all', category: 'all', relevance: 'not-low', status: 'not-ignored' };
-
-/** The candidates the filters let through, latest discovered first: a classification or a status change does not move a row. */
-export function visibleCandidates(list: readonly Candidate[], filters: Filters): Candidate[] {
-  const { source, category, relevance, status } = filters;
-  return list.filter(item => {
-    const classification = item.classification;
-    return (source === 'all' || item.source === source)
-      && (category === 'all' || (category === 'none' ? !classification : classification?.category === category))
-      && (relevance === 'all' || (relevance === 'not-low' ? classification?.relevance !== 'low' : classification?.relevance === relevance))
-      && (status === 'all' || (status === 'not-ignored' ? item.status !== 'ignored' : item.status === status));
-  }).sort((a, b) => newestFirst(a.createdAt, b.createdAt) || (a.id < b.id ? -1 : 1));
-}
-
-/** Where a merged candidate went, one hop only: classifications can point in a circle. The target's title when it is listed, else its id. */
-export function mergeLabel(mergedInto: string, candidates: readonly Candidate[]): string {
-  return `并入：${candidates.find(item => item.id === mergedInto)?.title ?? mergedInto}`;
-}
 
 /** The report checks as the report header shows them. A report without any DSH reference does not pass. */
 export function checksSummary({ requiredSections, dshRefsTotal: total, dshRefsResolved: resolved }: ReportChecks) {
@@ -85,35 +52,6 @@ export function checksSummary({ requiredSections, dshRefsTotal: total, dshRefsRe
     ],
     warnings,
   };
-}
-
-/** The settings form's fields, all text as inputs hold them. */
-export interface SettingsDraft {
-  dshMirrorPath: string; desktopPlistPath: string; desktopLocale: string;
-  classifyProvider: string; classifyModel: string; reportProvider: string; reportModel: string; startProvider: string; startModel: string;
-  reportPreset: string; startPreset: string; dailyReportLimit: string; checkIntervalHours: string;
-}
-export const draftOf = (settings: Settings): SettingsDraft => ({
-  dshMirrorPath: settings.dshMirrorPath, desktopPlistPath: settings.desktopPlistPath, desktopLocale: settings.desktopLocale,
-  classifyProvider: settings.classifyModel.provider, classifyModel: settings.classifyModel.model,
-  reportProvider: settings.reportModel.provider, reportModel: settings.reportModel.model,
-  startProvider: settings.startModel.provider, startModel: settings.startModel.model,
-  reportPreset: settings.reportPreset, startPreset: settings.startPreset,
-  dailyReportLimit: String(settings.dailyReportLimit), checkIntervalHours: String(settings.checkIntervalHours),
-});
-/** The settings the draft changes, trimmed, numbers as numbers, a changed model route whole. The Host checks the values. */
-export function settingsPatch(current: Settings, draft: SettingsDraft): Partial<Settings> {
-  const next: Settings = {
-    ...current,
-    dshMirrorPath: draft.dshMirrorPath.trim(), desktopPlistPath: draft.desktopPlistPath.trim(), desktopLocale: draft.desktopLocale.trim(),
-    classifyModel: { provider: draft.classifyProvider.trim(), model: draft.classifyModel.trim() },
-    reportModel: { provider: draft.reportProvider.trim(), model: draft.reportModel.trim() },
-    startModel: { provider: draft.startProvider.trim(), model: draft.startModel.trim() },
-    reportPreset: draft.reportPreset.trim(), startPreset: draft.startPreset.trim(),
-    dailyReportLimit: Number(draft.dailyReportLimit), checkIntervalHours: Number(draft.checkIntervalHours),
-  };
-  const changed = (Object.keys(next) as (keyof Settings)[]).filter(key => JSON.stringify(next[key]) !== JSON.stringify(current[key]));
-  return Object.fromEntries(changed.map(key => [key, next[key]])) as Partial<Settings>;
 }
 
 function StatusBadge({ status, busy }: { status: Status; busy?: CandidateAction }) {
@@ -141,90 +79,17 @@ export function ReportView({ record, report, error, loading }: { record?: Report
   </div>;
 }
 
-function LastCheckLine({ lastCheck, at }: { lastCheck?: LastCheck; at?: string }) {
-  if (!lastCheck) return <p className="oc-line oc-muted">{at ? `上次检查在 ${time(at)}，没有结果可显示。` : 'DSH 启动后还没有检查过。'}</p>;
-  const { releases, files, desktop, rss, errors } = lastCheck;
-  const range = releases.window ?? files.window;
-  return <div className="oc-line">
-    <strong>上次检查</strong>
-    {at && <time dateTime={at}>{time(at)}</time>}
-    <span>{range ? `${range.from} → ${range.to}` : '没有新的正式版'}</span>
-    <span>发布说明 +{releases.added}</span>
-    <span>仓库文件 +{files.added}</span>
-    <span>桌面端 +{desktop.added}</span>
-    <span>RSS +{rss}</span>
-    {errors.length === 0 ? <span>没有错误</span>
-      : <details className="oc-errors"><summary className="oc-warn">{errors.length} 条错误</summary><ul>{errors.map((line, index) => <li key={index}>{line}</li>)}</ul></details>}
-  </div>;
-}
-
-function IndexLine({ summary, mirrorSet, busy, rebuild }: { summary?: IndexSummary; mirrorSet: boolean; busy: boolean; rebuild: () => Promise<boolean> }) {
-  return <div className="oc-line">
-    <strong>DSH 索引</strong>
-    {summary
-      ? <><span>{summary.entries.toLocaleString('zh-CN')} 条</span><span>提交 <code>{summary.commit.slice(0, 12)}</code></span><span>建于 {time(summary.builtAt)}</span></>
-      : <span className="oc-muted">{mirrorSet ? '还没有建，点「重建索引」' : '还没有建，先在设置里填 DSH 镜像路径'}</span>}
-    <button type="button" className="oc-small" disabled={busy} onClick={rebuild}>{busy ? '重建中…' : '重建索引'}</button>
-  </div>;
-}
-
-function FilterBar({ filters, change, shown, total }: { filters: Filters; change: (next: Filters) => void; shown: number; total: number }) {
-  const pick = <K extends keyof Filters>(key: K, label: string, options: readonly (readonly [string, string])[]) =>
-    <label>{label}<select value={filters[key]} onChange={event => { const next = { ...filters }; next[key] = event.target.value as Filters[K]; change(next); }}>
-      {options.map(([value, text]) => <option key={value} value={value}>{text}</option>)}
-    </select></label>;
-  const isDefault = (Object.keys(DEFAULT_FILTERS) as (keyof Filters)[]).every(key => filters[key] === DEFAULT_FILTERS[key]);
-  return <div className="oc-filters">
-    {pick('source', '来源', [['all', '全部'], ...SOURCES.map(value => [value, SOURCE_LABELS[value]] as const)])}
-    {pick('category', '分类', [['all', '全部'], ...CATEGORIES.map(value => [value, CATEGORY_LABELS[value]] as const), ['none', '未归类']])}
-    {pick('relevance', '相关度', [['not-low', '不含低'], ['all', '全部'], ...RELEVANCES.map(value => [value, RELEVANCE_LABELS[value]] as const)])}
-    {pick('status', '状态', [['not-ignored', '不含已忽略'], ['all', '全部'], ...STATUSES.map(value => [value, STATUS_LABELS[value]] as const)])}
-    <span className="oc-filter-count">显示 {shown} 条，共 {total.toLocaleString('zh-CN')} 条</span>
-    {!isDefault && <button type="button" className="oc-small" onClick={() => change(DEFAULT_FILTERS)}>恢复默认</button>}
-  </div>;
-}
-
-/** The buttons of one candidate, each enabled by the status move it makes. `view` (the list) turns the report button into 查看报告 once there is a report. */
-function CandidateActions({ candidate, busy, run, view }: { candidate: Candidate; busy: boolean; run: (action: CandidateAction) => Promise<void>; view?: () => void }) {
+/** The buttons of one candidate in the detail view, each enabled by the status move it makes. */
+function CandidateActions({ candidate, busy, run }: { candidate: ClientCandidate; busy: boolean; run: (action: CandidateAction) => Promise<void> }) {
   const { status, report } = candidate;
   const startHint = status === 'ignored' ? '先恢复这条候选' : status !== 'new' ? undefined : report ? '恢复的候选要先重新生成报告' : '先生成报告再开工';
   return <div className="oc-candidate-actions">
-    {report && view
-      ? <button type="button" disabled={busy} onClick={view}>查看报告</button>
-      : <button type="button" disabled={busy || !canTransition(status, 'reported')} onClick={() => run('report')}>{report ? '重新生成报告' : '生成报告'}</button>}
+    <button type="button" disabled={busy || !canTransition(status, 'reported')} onClick={() => run('report')}>{report ? '重新生成报告' : '生成报告'}</button>
     <button type="button" disabled={busy || !canTransition(status, 'started')} title={startHint} onClick={() => run('start')}>开工</button>
     {status === 'ignored'
       ? <button type="button" disabled={busy || !canTransition(status, 'new')} onClick={() => run('restore')}>恢复</button>
       : <button type="button" disabled={busy || !canTransition(status, 'ignored')} onClick={() => run('ignore')}>忽略</button>}
   </div>;
-}
-
-function Meta({ candidate, candidates }: { candidate: Candidate; candidates: readonly Candidate[] }) {
-  const { classification } = candidate;
-  return <div className="oc-row-meta">
-    <span>{labelOf(SOURCE_LABELS, candidate.source)}</span>
-    <span>{classification ? labelOf(CATEGORY_LABELS, classification.category) : '未归类'}</span>
-    {classification && <span>相关度{labelOf(RELEVANCE_LABELS, classification.relevance)}</span>}
-    <span>发现 <time dateTime={candidate.createdAt}>{time(candidate.createdAt)}</time></span>
-    {classification?.mergedInto && <span>{mergeLabel(classification.mergedInto, candidates)}</span>}
-  </div>;
-}
-
-/** What this page knows about one candidate's action: the request it has out, or how the last one ended (an error, or a note). */
-interface RowState { pending?: CandidateAction; error?: string; note?: string }
-
-function CandidateRow({ candidate, candidates, busy, state, open, run }: {
-  candidate: Candidate; candidates: readonly Candidate[]; busy?: CandidateAction; state: RowState; open: () => void; run: (action: CandidateAction) => Promise<void>;
-}) {
-  return <article className="oc-candidate" aria-busy={busy !== undefined}>
-    <div className="oc-candidate-main">
-      <div className="oc-candidate-title"><button type="button" className="oc-title-button" onClick={open}>{candidate.title}</button><StatusBadge status={candidate.status} busy={busy} /></div>
-      {candidate.summary && <p className="oc-candidate-summary">{candidate.summary}</p>}
-      <Meta candidate={candidate} candidates={candidates} />
-      <RowMessages state={state} />
-    </div>
-    <CandidateActions candidate={candidate} busy={busy !== undefined} run={run} view={open} />
-  </article>;
 }
 
 function RowMessages({ state }: { state: RowState }) {
@@ -249,10 +114,10 @@ function EvidenceList({ evidence }: { evidence: readonly Evidence[] }) {
 }
 
 /** What the detail view reads for one candidate: the whole record (evidence excerpts) and the report text. */
-interface Detail { id: string; loading: boolean; candidate?: Candidate; candidateError?: string; report?: ReportText; reportError?: string }
+interface Detail { id: string; loading: boolean; candidate?: ClientCandidate; candidateError?: string; report?: ReportText; reportError?: string }
 
 function CandidateDetail({ candidate, candidates, detail, busy, state, run, back, openSession }: {
-  candidate: Candidate; candidates: readonly Candidate[]; detail?: Detail; busy?: CandidateAction; state: RowState;
+  candidate: ClientCandidate; candidates: readonly ClientCandidate[]; detail?: Detail; busy?: CandidateAction; state: RowState;
   run: (action: CandidateAction) => Promise<void>; back: () => void; openSession?: OpenSession;
 }) {
   const { classification, started, window: range } = candidate;
@@ -301,72 +166,17 @@ function CandidateDetail({ candidate, candidates, detail, busy, state, run, back
   </section>;
 }
 
-function SettingsForm({ settings, saving, error, save }: { settings: Settings; saving: boolean; error?: string; save: (patch: Partial<Settings>) => Promise<boolean> }) {
-  const [draft, setDraft] = useState(() => draftOf(settings));
-  const [saved, setSaved] = useState(false);
-  /** The last save's error describes values the user has edited since. */
-  const [edited, setEdited] = useState(false);
-  /** The settings the draft was last brought up to date with: a field that still holds its value there is one the user has not changed. */
-  const base = useRef(draftOf(settings));
-  const stored = JSON.stringify(settings);
-  // New settings from the Host (after a save, or a refresh that brings a change made elsewhere) go into the fields the user has not
-  // changed and the ones the user changed to just that value; what the user is still typing stays.
-  useEffect(() => {
-    const next = draftOf(JSON.parse(stored) as Settings), previous = base.current;
-    base.current = next;
-    setDraft(current => {
-      const merged = { ...current };
-      for (const key of Object.keys(next) as (keyof SettingsDraft)[]) {
-        if (current[key] === previous[key] || current[key].trim() === next[key]) merged[key] = next[key];
-      }
-      return merged;
-    });
-  }, [stored]);
-  const patch = settingsPatch(settings, draft);
-  const dirty = Object.keys(patch).length > 0;
-  const field = (name: keyof SettingsDraft, label: string, attributes: InputHTMLAttributes<HTMLInputElement> = {}) =>
-    <label>{label}<input name={name} value={draft[name]} spellCheck={false} {...attributes}
-      onChange={event => { const value = event.target.value; setSaved(false); setEdited(true); setDraft(current => ({ ...current, [name]: value })); }} /></label>;
-  const submit = async () => {
-    if (!dirty || saving) return;
-    setEdited(false);
-    if (await save(patch)) setSaved(true);
-  };
-  return <form className="oc-form" onSubmit={event => { event.preventDefault(); return submit(); }}>
-    <h3>镜像与桌面端</h3>
-    {field('dshMirrorPath', 'DSH 镜像路径', { placeholder: '/Users/…/deepseek-harness' })}
-    <p className="oc-hint">报告里的 DSH 引用都相对这个目录；改了以后马上重建索引。</p>
-    {field('desktopPlistPath', '桌面端 Info.plist 路径')}
-    <p className="oc-hint">ChatGPT.app 的 Info.plist；留空就不检查桌面端。</p>
-    {field('desktopLocale', '桌面端文案语言', { placeholder: 'zh-CN' })}
-    <h3>模型</h3>
-    <div className="oc-two-columns">{field('classifyProvider', '归类模型的提供方')}{field('classifyModel', '归类模型')}</div>
-    <div className="oc-two-columns">{field('reportProvider', '报告模型的提供方')}{field('reportModel', '报告模型')}</div>
-    <div className="oc-two-columns">{field('startProvider', '开工模型的提供方')}{field('startModel', '开工模型')}</div>
-    <h3>会话</h3>
-    <div className="oc-two-columns">
-      {field('reportPreset', '报告会话的 Agent 预设', { placeholder: '留空用 DSH 默认预设' })}
-      {field('startPreset', '开工会话的 Agent 预设', { placeholder: '留空用 DSH 默认预设' })}
-    </div>
-    <p className="oc-hint">cordis 是创造模式。</p>
-    <h3>频率</h3>
-    <div className="oc-two-columns">
-      {field('dailyReportLimit', '每天最多生成报告（份）', { type: 'number', min: 1, step: 1, required: true })}
-      {field('checkIntervalHours', '检查间隔（小时）', { type: 'number', min: 1, max: 168, step: 1, required: true })}
-    </div>
-    <div className="oc-form-actions">
-      <button type="submit" disabled={saving || !dirty}>{saving ? '保存中…' : '保存'}</button>
-      {saved && !dirty && <span className="oc-muted" role="status">已保存</span>}
-    </div>
-    {error && !edited && <p className="oc-error" role="alert">{error}</p>}
-  </form>;
+/** The page, with `ui` the DSH controls its parts are built from: the real ones in the plugin (ui.ts), stand-ins in tests. */
+export function OpenCodexPage({ ui, ...props }: { call: Call; openSession?: OpenSession; ui: Ui }) {
+  return <UiContext.Provider value={ui}><Page {...props} /></UiContext.Provider>;
 }
 
-export function OpenCodexPage({ call, openSession }: { call: Call; openSession?: OpenSession }) {
-  const [data, setData] = useState<OpenCodexResponse>();
+function Page({ call, openSession }: { call: Call; openSession?: OpenSession }) {
+  const { Button } = useUi();
+  const [data, setData] = useState<ClientResponse>();
   const [loadError, setLoadError] = useState('');
-  const [tab, setTab] = useState<Tab>('candidates');
-  const [filters, setFilters] = useState(DEFAULT_FILTERS);
+  const [view, setView] = useState<View>('todo');
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [selected, setSelected] = useState<string>();
   const [detail, setDetail] = useState<Detail>();
   const [rows, setRows] = useState<Record<string, RowState>>({});
@@ -379,7 +189,7 @@ export function OpenCodexPage({ call, openSession }: { call: Call; openSession?:
   /** Counts the responses shown, so a snapshot asked for before another response arrived does not replace it. */
   const shownCount = useRef(0);
 
-  const show = useCallback((response: OpenCodexResponse) => { shownCount.current++; setData(response); }, []);
+  const show = useCallback((response: ClientResponse) => { shownCount.current++; setData(response); }, []);
   const refresh = useCallback(async () => {
     const signal = lifetime.current?.signal, before = shownCount.current;
     try {
@@ -398,7 +208,8 @@ export function OpenCodexPage({ call, openSession }: { call: Call; openSession?:
     void refresh();
     return () => controller.abort();
   }, [refresh]);
-  const hostBusy = Boolean(data?.busy?.check) || Object.keys(data?.busy?.candidates ?? {}).length > 0;
+  // A queue waiting for automatic research counts as busy too: its rows move on without the page asking.
+  const hostBusy = Boolean(data?.busy?.check) || Object.keys(data?.busy?.candidates ?? {}).length > 0 || (data?.researchQueue?.length ?? 0) > 0;
   useEffect(() => {
     const timer = setInterval(() => { if (typeof document === 'undefined' || document.visibilityState === 'visible') void refresh(); }, hostBusy ? BUSY_POLL_MS : POLL_MS);
     return () => clearInterval(timer);
@@ -428,8 +239,12 @@ export function OpenCodexPage({ call, openSession }: { call: Call; openSession?:
       await refresh(); // the action may have changed something before it failed
     }
   };
+  /** Shows a candidate's creator session, or says on its row that the workspace did not switch. */
+  const showSession = (id: string, sessionId: string) => {
+    try { openSession?.(sessionId); } catch { setRow(id, () => ({ note: `会话 ${sessionId} 没能自动打开` })); }
+  };
   /** A request from one of the controls outside the list; true when it went through. */
-  const control = async (name: Control, request: OpenCodexRequest): Promise<boolean> => {
+  const control = async (name: Control, request: ClientRequest): Promise<boolean> => {
     const signal = lifetime.current?.signal;
     setBusy(current => ({ ...current, [name]: true }));
     setControlErrors(current => ({ ...current, [name]: undefined }));
@@ -469,49 +284,35 @@ export function OpenCodexPage({ call, openSession }: { call: Call; openSession?:
     return () => controller.abort();
   }, [call, selected, listed?.updatedAt, hasReport]);
 
-  // The list keeps its scroll position while a detail is open; a detail starts at the top.
-  useLayoutEffect(() => { if (page.current) page.current.scrollTop = selected ? 0 : listScroll.current; }, [selected]);
+  // The list keeps its scroll position while a detail or the settings are open; those start at the top.
+  const away = selected !== undefined || settingsOpen;
+  useLayoutEffect(() => { if (page.current) page.current.scrollTop = away ? 0 : listScroll.current; }, [away, selected, settingsOpen]);
+  const leaveList = () => { if (!away) listScroll.current = page.current?.scrollTop ?? 0; };
+  /** Opens a candidate's detail. A row asks for the part it means (the report, the execute step); this detail shows them all on one page. */
   const open = (id: string) => {
-    listScroll.current = page.current?.scrollTop ?? 0;
+    leaveList();
     setDetail(undefined);
     setSelected(id);
   };
+  const toggleSettings = () => { leaveList(); setSettingsOpen(current => !current); };
 
-  const shown = visibleCandidates(candidates, filters);
-  const waiting = shown.filter(item => item.status === 'new').length;
   // `busy` and the counts are read with care: right after the plugin is reinstalled, this page can still be talking to the previous Host.
   const checking = Boolean(busy.check || data?.busy?.check);
   /** The action running on a candidate: the one this page asked for, else the one the Host reports. */
   const busyOf = (id: string): CandidateAction | undefined => rows[id]?.pending ?? data?.busy?.candidates?.[id];
   const omitted = data?.omittedCandidates ?? 0;
-  const total = data?.totalCandidates ?? candidates.length;
   return <div className="oc-page" ref={page}>
-    <header className="oc-header">
-      <div className="oc-brand">OpenCodex</div>
-      <button type="button" disabled={!data || checking} onClick={() => control('check', { action: 'check' })}>
-        <Icon name="refresh" />{checking ? '检查中…' : '检查更新'}
-      </button>
-    </header>
-    {!data ? <div className="oc-overview">
+    <Header data={data} checking={checking} indexBusy={Boolean(busy.index)} settingsOpen={settingsOpen}
+      errors={{ check: controlErrors.check, index: controlErrors.index, refresh: data && loadError ? loadError : undefined }}
+      check={() => control('check', { action: 'check' })} rebuildIndex={() => control('index', { action: 'rebuildIndex' })} toggleSettings={toggleSettings} />
+    {!data ? <div className="oc-loading">
       {loadError
-        ? <><p className="oc-error" role="alert">读不到 OpenCodex：{loadError}</p><button type="button" onClick={refresh}>重试</button></>
+        ? <><p className="oc-error" role="alert">读不到 OpenCodex：{loadError}</p><Button variant="outline" size="sm" onClick={refresh}>重试</Button></>
         : <p className="oc-muted" role="status">正在读取…</p>}
-    </div> : <>
-      <section className="oc-overview" aria-label="检查与索引">
-        {data.notice && <p className="oc-notice" role="status">{data.notice}</p>}
-        <LastCheckLine lastCheck={data.lastCheck} at={data.lastCheckAt} />
-        {controlErrors.check && <p className="oc-error" role="alert">{controlErrors.check}</p>}
-        <IndexLine summary={data.indexSummary} mirrorSet={data.settings.dshMirrorPath !== ''} busy={Boolean(busy.index)} rebuild={() => control('index', { action: 'rebuildIndex' })} />
-        {controlErrors.index && <p className="oc-error" role="alert">{controlErrors.index}</p>}
-        {loadError && <p className="oc-error" role="alert">刷新失败：{loadError}</p>}
-      </section>
-      <nav className="oc-tabs" aria-label="OpenCodex"><div>
-        {TABS.map(([id, label, icon]) => <button type="button" key={id} aria-current={tab === id ? 'page' : undefined} onClick={() => { setTab(id); setSelected(undefined); }}>
-          <Icon name={icon} />{label}{id === 'candidates' && waiting > 0 && <span className="oc-count" title="列表里显示的新发现">{waiting}</span>}
-        </button>)}
-      </div></nav>
-      {tab === 'settings'
-        ? <SettingsForm settings={data.settings} saving={Boolean(busy.settings)} error={controlErrors.settings} save={patch => control('settings', { action: 'settings', patch })} />
+    </div>
+      : settingsOpen
+        ? <SettingsView settings={data.settings} call={call} saving={Boolean(busy.settings)} error={controlErrors.settings}
+          save={patch => control('settings', { action: 'settings', patch })} back={() => setSettingsOpen(false)} />
         : selected
           ? listed
             ? <CandidateDetail candidate={listed} candidates={candidates} detail={detail?.id === selected ? detail : undefined}
@@ -521,17 +322,12 @@ export function OpenCodexPage({ call, openSession }: { call: Call; openSession?:
               <p className="oc-muted">这条候选不在列表里了。</p>
             </section>
           : <>
-            <FilterBar filters={filters} change={setFilters} shown={shown.length} total={total} />
-            {shown.length === 0
-              ? <div className="oc-empty">
-                <h2>{candidates.length === 0 ? '还没有候选' : '没有符合筛选的候选'}</h2>
-                <p className="oc-muted">{candidates.length === 0 ? '点「检查更新」从发布说明、仓库文件、桌面端和 RSS 收集 Codex 的新功能。' : '换个筛选条件，或点「恢复默认」。'}</p>
-              </div>
-              : <div className="oc-list">{shown.map(item => <CandidateRow key={item.id} candidate={item} candidates={candidates} busy={busyOf(item.id)}
-                state={rows[item.id] ?? {}} open={() => open(item.id)} run={action => run(item.id, action)} />)}</div>}
-            {omitted > 0 && <p className="oc-muted oc-omitted">另有 {omitted.toLocaleString('zh-CN')} 条较旧的候选未列出</p>}
+            <Filters view={view} counts={countViews(candidates)} change={setView} />
+            <CandidateList shown={candidates.filter(item => viewOf(item) === view)} candidates={candidates} queue={data.researchQueue ?? []}
+              busyOf={busyOf} rows={rows} open={open} run={run} showSession={openSession && showSession}
+              empty={candidates.length === 0 ? NOTHING_YET : EMPTY[view]} />
+            {omitted > 0 && <p className="oc-muted oc-omitted">另有 {omitted.toLocaleString('zh-CN')} 条较旧的动态未列出</p>}
           </>}
-    </>}
     <footer className="oc-footer">
       <span>OpenCodex · 第三方插件</span>
       <a href="https://github.com/ZiyaZhang/opencodex" target="_blank" rel="noreferrer"><Icon name="code" />源码<Icon name="external" /></a>
