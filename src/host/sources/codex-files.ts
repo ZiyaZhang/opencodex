@@ -29,7 +29,8 @@ export interface ChangedFile extends ChangedPath {
   /** Why the content was not compared (a failed or refused request, the rate limit, or the fetch budget); `added` is then empty. Never set for a removed file, which is not read. */
   error?: string;
 }
-export interface FileGroup { key: string; title: string; kind: EvidenceKind; files: ChangedFile[]; excerpt: string }
+/** What becomes one candidate. `flag` is set on the group of one feature flag, and on no other group: the registry group of the leftover lines has none. */
+export interface FileGroup { key: string; title: string; kind: EvidenceKind; files: ChangedFile[]; excerpt: string; flag?: string }
 /**
  * What one check of this source did: the window it covered (none when there was nothing new), the candidates it created and the existing ones it added to.
  * `gap` is true when the stored checkpoint could not start the window (its tag is gone, or it is no stable tag at all), so that the window starts at the previous minor
@@ -211,33 +212,156 @@ function linesOf(file: ChangedFile): string[] {
 }
 const hasNews = (file: ChangedFile): boolean => file.status === 'removed' || file.added.length > 0 || file.error !== undefined;
 
+/**
+ * The registry group: what the feature-flag sources gained that no flag took, and every feature file without lines (removed, or not read). Before flags had groups of
+ * their own it held all of those sources, and with no flag found it still does.
+ */
+const REGISTRY = 'feature-flags';
 function groupOf(path: string): Pick<FileGroup, 'key' | 'kind'> {
   const family = familyOf(path);
-  if (family === 'feature-flag') return { key: 'feature-flags', kind: 'feature-flag' };
+  if (family === 'feature-flag') return { key: REGISTRY, kind: 'feature-flag' };
   if (family === 'schema') return { key: 'schema', kind: 'schema' };
   return { key: `doc:${path}`, kind: 'doc' };
 }
 const versionNote = (version?: string): string => (version ? `（${version}）` : '');
-/** `version` is the minor, or the full version of a candidate the user has already moved on from; `types` is how many type files the protocol candidate holds. */
-function titleOf(group: Pick<FileGroup, 'kind' | 'files'>, version?: string, types = group.files.length): string {
+/**
+ * `version` is the minor, or the full version of a candidate the user has already moved on from; `types` is how many type files the protocol candidate holds.
+ * A flag is named by itself and nothing more: the name is what tells one flag from the next, and the candidate's window already says which release it came with.
+ */
+function titleOf(group: Pick<FileGroup, 'kind' | 'files' | 'flag'>, version?: string, types = group.files.length): string {
+  if (group.flag !== undefined) return group.flag;
   if (group.kind === 'feature-flag') return `功能开关注册表有变化${versionNote(version)}`;
   if (group.kind === 'schema') return `协议类型有变化${versionNote(version)}：${types} 个类型`;
   return `文档有变化${versionNote(version)}：${group.files[0]!.path}`; // a doc group is the one file it is named after
 }
 
+/*
+ * Flags. A flag is defined by a field of a feature's config, `pub <name>: Option<…>`, or by an entry of the registry, `key: "<name>"`; a field and an entry of the
+ * same name are one flag. A field named `enabled` is no flag: it switches on the feature whose config it sits in. What describes a definition is the run of `///` lines
+ * right above it, attribute lines (`#[…]`) in the run passed over. An entry has no `///` of its own: the `id: Feature::<Variant>,` line above it names its variant
+ * of `pub enum Feature`, and the run above that variant describes it.
+ */
+const FLAG_FIELD = /^\s*pub\s+([a-z][a-z0-9_]*):\s*Option</;
+const FLAG_KEY = /^\s*key:\s*"([a-z][a-z0-9_]*)"/;
+const DOC_COMMENT = /^\s*\/\/\/(?!\/)/; // `////` is a plain comment
+const ATTRIBUTE = /^\s*#\[/;
+const VARIANT_ID = /^\s*id:\s*Feature::([A-Za-z_][A-Za-z0-9_]*)\s*,/;
+const FEATURE_ENUM = /^\s*pub(?:\([^)]*\))?\s+enum\s+Feature\b/;
+function definitionOf(line: string): { name: string; entry: boolean } | undefined {
+  const field = FLAG_FIELD.exec(line)?.[1];
+  if (field !== undefined) return field === 'enabled' ? undefined : { name: field, entry: false };
+  const key = FLAG_KEY.exec(line)?.[1];
+  return key === undefined ? undefined : { name: key, entry: true };
+}
+/**
+ * The line of `lines` (a new text) that each added line is, or undefined when the added lines cannot have come from that text. `addedLines` counts copies in order,
+ * so the added copies of a line are its last ones in the new text: which copy of a repeated attribute a definition owns is told by place, not by content alone.
+ */
+function placesIn(lines: string[], added: string[]): number[] | undefined {
+  const where = new Map<string, number[]>();
+  lines.forEach((line, at) => { const list = where.get(line); if (list) list.push(at); else where.set(line, [at]); });
+  const copies = new Map<string, number>();
+  for (const line of added) copies.set(line, (copies.get(line) ?? 0) + 1);
+  const seen = new Map<string, number>();
+  const places: number[] = [];
+  for (const line of added) {
+    const all = where.get(line) ?? [];
+    const copy = seen.get(line) ?? 0;
+    seen.set(line, copy + 1);
+    const place = all[all.length - copies.get(line)! + copy];
+    if (place === undefined || place <= (places.at(-1) ?? -1)) return undefined; // a copy the text does not have, or the lines out of its order
+    places.push(place);
+  }
+  return places;
+}
+/**
+ * The first line of the run of `///` and attribute lines right above line `end`; `end` itself when there is none. Only one-line attributes are read: one that rustfmt
+ * broke over several lines ends the run, and what stands above it is not taken.
+ */
+function runAbove(lines: string[], end: number): number {
+  let top = end;
+  while (top > 0 && (DOC_COMMENT.test(lines[top - 1]!) || ATTRIBUTE.test(lines[top - 1]!))) top--;
+  return top;
+}
+/** The line of variant `name` in `pub enum Feature`, or -1. A variant may have a value (`Name = 3,`); its attributes stand above it, in its run. */
+function variantLine(lines: string[], name: string): number {
+  const start = lines.findIndex(line => FEATURE_ENUM.test(line));
+  if (start < 0) return -1;
+  const variant = new RegExp(`^\\s*${name}\\s*(?:=[^,]*)?,?\\s*$`); // `name` is an identifier: nothing in it needs escaping
+  let depth = 0, opened = false;
+  for (let at = start; at < lines.length; at++) {
+    const code = lines[at]!.replace(/\/\/.*$/, ''); // a doc comment may hold braces
+    if (depth === 1 && variant.test(code)) return at;
+    for (const char of code) {
+      if (char === '{') { depth++; opened = true; } else if (char === '}') depth--;
+    }
+    if (opened && depth <= 0) return -1; // past the end of the enum
+  }
+  return -1;
+}
+/**
+ * The flags a feature file defines among its added lines, in the order they are defined, each with the lines it shows, and the added lines no flag took.
+ * A definition takes the run above it, and an entry also its variant with the run above that; a flag shows the `///` lines of what it took and its definitions, in the
+ * order of the file, and hides the attributes and the variant line. The rest is the added lines less the copies the flags took.
+ * The runs are read in `text`, the new version of the file, when the added lines come from it: a description the window left as it was is shown as well, and lines
+ * that are next to each other among the added lines but not in the file stay apart. Without it they are read among the added lines, and an entry gets no description,
+ * since its variant cannot be looked up.
+ */
+function flagsOf(file: ChangedFile, text?: string): { flags: Array<{ name: string; lines: string[] }>; rest: string[] } {
+  const definitions = file.added.flatMap((line, index) => { const found = definitionOf(line); return found ? [{ ...found, index }] : []; });
+  if (definitions.length === 0) return { flags: [], rest: file.added };
+  const textLines = text?.split(LINE_BREAK);
+  const placed = textLines && placesIn(textLines, file.added);
+  const lines = textLines && placed ? textLines : file.added;
+  const places = placed ?? file.added.map((_, index) => index);
+  const addedAt = new Map(places.map((place, index) => [place, index]));
+  const taken = new Set<number>(); // indices into `file.added`
+  const shown = new Map<string, Set<number>>(); // lines of `lines`, per flag
+  for (const { name, entry, index } of definitions) {
+    const end = places[index]!;
+    const runs: Array<{ from: number; to: number; showsEnd: boolean }> = [{ from: runAbove(lines, end), to: end, showsEnd: true }];
+    const variant = entry && placed ? VARIANT_ID.exec(lines[end - 1] ?? '')?.[1] : undefined;
+    const variantAt = variant === undefined ? -1 : variantLine(lines, variant);
+    if (variantAt >= 0) runs.push({ from: runAbove(lines, variantAt), to: variantAt, showsEnd: false });
+    const own = shown.get(name) ?? new Set<number>();
+    for (const { from, to, showsEnd } of runs) {
+      for (let line = from; line <= to; line++) {
+        const added = addedAt.get(line);
+        if (added !== undefined) taken.add(added);
+        if (line === to ? showsEnd : DOC_COMMENT.test(lines[line]!)) own.add(line);
+      }
+    }
+    shown.set(name, own);
+  }
+  return {
+    flags: [...shown].map(([name, own]) => ({ name, lines: [...own].sort((a, b) => a - b).map(line => lines[line]!) })),
+    rest: file.added.filter((_, index) => !taken.has(index)),
+  };
+}
+
 /**
  * The watched files that have something to report, grouped into what becomes one candidate each, in the order the groups first appear:
- * the feature-flag sources are one group (`feature-flags`), every protocol type of the window is one group (`schema`, without the `index.ts` re-exports), a doc is one group per path (`doc:<path>`).
+ * - a flag the feature-flag sources define among their added lines is a group of its own (`feature-flag:<name>`, kind `feature-flag`), whose files are copies that
+ *   keep only the lines of the flag (see `flagsOf`); a flag defined in two files has both;
+ * - the registry group (`feature-flags`) holds what those sources gained that no flag took: the lines a file's flags left, if any are left, and a file that defines no
+ *   flag (a removed or unread one too) as it is. Of the groups a feature file adds to, the registry group comes first, then the file's flags in the order they are defined;
+ * - every protocol type of the window is one group (`schema`, without the `index.ts` re-exports), a doc is one group per path (`doc:<path>`).
  * The excerpt is the group's added lines as `<name>: <line>`, or the reason a file has none, cut at a whole line within 6,000 characters. `version` goes into the titles.
+ * `texts` holds the new version of a feature file by path, where the descriptions of its flags are read; a file not in it is read among its added lines alone.
  */
-export function groupWatchedFiles(files: ChangedFile[], version?: string): FileGroup[] {
+export function groupWatchedFiles(files: ChangedFile[], version?: string, texts?: ReadonlyMap<string, string>): FileGroup[] {
   const groups = new Map<string, FileGroup>();
-  for (const file of files) {
-    if (!WATCHED(file.path) || isIndex(file.path) || !hasNews(file)) continue;
-    const head = groupOf(file.path);
+  const put = (head: Pick<FileGroup, 'key' | 'kind' | 'flag'>, file: ChangedFile) => {
     const group = groups.get(head.key) ?? { ...head, title: '', files: [], excerpt: '' };
     group.files.push(file);
     groups.set(head.key, group);
+  };
+  for (const file of files) {
+    if (!WATCHED(file.path) || isIndex(file.path) || !hasNews(file)) continue;
+    const { flags, rest } = familyOf(file.path) === 'feature-flag' ? flagsOf(file, texts?.get(file.path)) : { flags: [], rest: file.added };
+    if (flags.length === 0) { put(groupOf(file.path), file); continue; }
+    if (rest.length > 0) put(groupOf(file.path), { ...file, added: rest });
+    for (const flag of flags) put({ key: `feature-flag:${flag.name}`, kind: 'feature-flag', flag: flag.name }, { ...file, added: flag.lines });
   }
   for (const group of groups.values()) {
     group.title = titleOf(group, version);
@@ -295,15 +419,16 @@ const isRateLimit = (error: unknown): boolean => error instanceof GitHubError &&
 
 /**
  * Both versions of one added or modified file, compared line by line (an added file has no old version). A file that cannot be read is recorded with its error so that the
- * rest of the run goes on; an abort ends the run. `rateLimited` tells the caller to stop asking, `resetAt` when the limit lifts.
+ * rest of the run goes on; an abort ends the run. `text` is the new version, where the descriptions of the flags a feature file defines are read. `rateLimited` tells the
+ * caller to stop asking, `resetAt` when the limit lifts.
  */
-async function readChange(github: Pick<GitHubClient, 'fileAt'>, window: StableWindow, change: ChangedPath, signal?: AbortSignal): Promise<{ file: ChangedFile; rateLimited: boolean; resetAt?: Date }> {
+async function readChange(github: Pick<GitHubClient, 'fileAt'>, window: StableWindow, change: ChangedPath, signal?: AbortSignal): Promise<{ file: ChangedFile; text?: string; rateLimited: boolean; resetAt?: Date }> {
   // An async wrapper, so that a call which throws instead of rejecting still leaves both reads for `Promise.all` to settle.
   const read = async (tag: string) => github.fileAt(tag, change.path, signal);
   try {
     const [before, after] = await Promise.all([change.status === 'added' ? '' : read(window.from), read(window.to)]);
     const added = familyOf(change.path) === 'schema' ? newLines(schemaLines(before), schemaLines(after)) : addedLines(before, after);
-    return { file: { ...change, added }, rateLimited: false };
+    return { file: { ...change, added }, text: after, rateLimited: false };
   } catch (error) {
     if (signal?.aborted) throw error;
     const rateLimited = isRateLimit(error);
@@ -352,18 +477,21 @@ async function planWindow(github: Pick<GitHubClient, 'stableTags' | 'treePaths'>
 
 /**
  * Finds the window of stable releases this source has not covered yet (from `lastFilesTag`; see `planWindow`), and stores one `codex-files` candidate per group of watched files
- * that changed in it: the feature-flag sources, all protocol types together, and each doc on its own. `added` counts the candidates created, `merged` the existing ones added to,
+ * that changed in it: each flag the feature-flag sources define in it, the rest of those sources if anything is left, all protocol types together, and each doc on its own
+ * (see `groupWatchedFiles`). `added` counts the candidates created, `merged` the existing ones added to,
  * `gap` says whether the window had to start at the previous minor because the stored tag could not start it.
  * The checkpoint moves only after the snapshot and every candidate are stored: a failed tag or tree request, or a failed store, throws and the next check retries the window
  * (a candidate the earlier attempt already stored is recognised by its `toTag` and left alone). A file that cannot be read, or is past the budget, is recorded and does not hold
  * the checkpoint back. A rate limit does: the files it kept unread are counted, the checkpoint stays, and the next check retries the window. Because a stored group is left alone
  * on a retry, a group with a file the rate limit kept unread is not stored yet: it waits for the retry, which can store it complete. The groups read in full are stored now.
+ * A feature file kept unread holds back every flag with the registry group, since it may define a part of any of them.
  * The candidate is keyed by the minor version, so a patch release adds to the candidate of its minor while that is still `new`: its evidence is kept (matched by `ref`, the lines of a
  * file found by both windows are merged), `window.fromTag` stays at the first window's, and the summary is rebuilt from all of it. Once the user has moved the candidate on, the
  * findings go to a candidate of the full version instead.
  * At most `options.budget` files are read (default 60), flags first, then `codex-rs/config.md`, docs and protocol types (alphabetical within each). A removed file and an `index.ts`
  * are not read and take no slot; both are listed in the snapshot with no added lines. The rest are recorded unread, and so are all that follow a rate limit.
- * The result is also saved as `<snapshotDir>/codex-files/<from>__<to>.json`, which keeps the added lines of every changed file, candidate or not.
+ * The result is also saved as `<snapshotDir>/codex-files/<from>__<to>.json`, which keeps the added lines of every changed file, candidate or not; the new text of a feature
+ * file, read to describe its flags, is not kept.
  */
 export async function collectFileChanges(
   store: CandidateStore, github: Pick<GitHubClient, 'stableTags' | 'treePaths' | 'fileAt'>, snapshotDir: string, signal?: AbortSignal, options: { budget?: number } = {},
@@ -376,6 +504,7 @@ export async function collectFileChanges(
   if (!window) return { added: 0, merged: 0, gap, unread };
   const changes = changedWatched(before, after);
   const loaded = new Map<string, ChangedFile>();
+  const texts = new Map<string, string>(); // the new version of each feature file read, where the descriptions of its flags are
   const held = new Set<string>(); // the files the rate limit kept unread
   let slots = budget, limited = false, resetAt: Date | undefined;
   for (const change of [...changes].sort(byPriority)) {
@@ -393,6 +522,7 @@ export async function collectFileChanges(
       } else {
         const reading = await readChange(github, window, change, signal);
         loaded.set(change.path, reading.file);
+        if (reading.text !== undefined && familyOf(change.path) === 'feature-flag') texts.set(change.path, reading.text);
         if (reading.rateLimited) { limited = true; resetAt = reading.resetAt; held.add(change.path); unread.rateLimited++; }
         else if (reading.file.error !== undefined) unread.failed++;
       }
@@ -403,9 +533,12 @@ export async function collectFileChanges(
   await writeJsonAtomic(join(snapshotDir, 'codex-files', `${window.from}__${window.to}.json`), { window, files });
 
   let added = 0, merged = 0;
+  // `groupOf` gives every held feature file the registry key, `feature-flags` (with no lines it defines no flag and sits in the registry group). Every group of the
+  // family waits on that key, the flags as well: a held file may define a part of any flag, and a flag stored without that part would never get it, because the retry
+  // leaves a stored group alone.
   const waiting = new Set([...held].map(path => groupOf(path).key));
-  for (const group of groupWatchedFiles(files)) {
-    if (waiting.has(group.key)) continue; // stored half-read it would be left alone by the retry, with its unread marker in it
+  for (const group of groupWatchedFiles(files, undefined, texts)) {
+    if (waiting.has(group.kind === 'feature-flag' ? REGISTRY : group.key)) continue; // stored half-read it would be left alone by the retry, with its unread marker in it
     const { key, version, existing, stored } = await targetFor(store, group.key, window.to);
     // Merging a window again would count the lines its stored excerpt left out twice, and a candidate the user has moved on would get a copy.
     if (stored) continue;

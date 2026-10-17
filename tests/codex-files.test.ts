@@ -215,6 +215,126 @@ test('the excerpt ends at a whole line and a count of the lines left out, within
   assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(emoji!.excerpt));
 });
 
+/** The two feature-flag sources of the 0.162.1 to 0.163.0 window as the snapshot keeps them: their added lines, without the new text of the files. */
+const FEATURES_0163 = JSON.parse(await readFile(new URL('./fixtures/codex-files-0.162.1-0.163.0.json', import.meta.url), 'utf8')) as ChangedFile[];
+
+test('groupWatchedFiles: each flag 0.163.0 added is a group named after it, and the lines no flag took are the registry group', () => {
+  const [configs, lib] = FEATURES_0163 as [ChangedFile, ChangedFile];
+  const groups = groupWatchedFiles(FEATURES_0163, '0.163');
+  const keyed = ['code_mode_host_grpc', 'code_mode_tool_description_first', 'credential_masking', 'subagent_default_context_limits', 'output_token_replay', 'guardian_trust_orchestrator_connectors'];
+  // The registry group first, as feature_configs.rs has a rest; then the flags in the order they are defined. `enabled` only switches the feature it sits in.
+  assert.deepEqual(groups.map(g => [g.key, g.kind, g.title]), [
+    ['feature-flags', 'feature-flag', '功能开关注册表有变化（0.163）'],
+    ...['preserve_fork_prefix', 'disable_native_tools', 'model_async_compact_threshold_percent', 'async_compaction', ...keyed, 'retain_client_tool_outputs']
+      .map(name => [`feature-flag:${name}`, 'feature-flag', name]),
+  ]);
+  const files = (name: string) => groups.find(g => g.key === `feature-flag:${name}`)!.files;
+  // Without the new text, a description is the run of `///` lines right above the definition among the added lines; the attributes in the run are passed over.
+  assert.deepEqual(files('preserve_fork_prefix'), [{ ...configs, added: [
+    "    /// Preserve the parent's model-visible history on full forks and append child instructions.",
+    '    /// Defaults to false. Legacy compaction without a reusable context baseline still rebuilds.',
+    '    pub preserve_fork_prefix: Option<bool>,',
+  ] }]);
+  assert.deepEqual(files('disable_native_tools'), [{ ...configs, added: ['    /// Hide native multi-agent tools while retaining the V2 runtime for host-provided tools.', '    pub disable_native_tools: Option<bool>,'] }]);
+  assert.deepEqual(files('model_async_compact_threshold_percent'), [{ ...configs, added: [
+    "    /// Percentage of the model's full context window that starts background compaction.",
+    '    /// Defaults to 65; valid values are 1–100, including when disabled.',
+    '    pub model_async_compact_threshold_percent: Option<u8>,',
+  ] }]);
+  // A field and a registry entry of the same name are one flag. The entries have no `///` of their own; the variants they name are only read in the new text.
+  assert.deepEqual(files('async_compaction'), [{ ...lib, added: ['    pub async_compaction: Option<FeatureToml<AsyncCompactionConfigToml>>,', '        key: "async_compaction",'] }]);
+  for (const name of [...keyed, 'retain_client_tool_outputs']) assert.deepEqual(files(name), [{ ...lib, added: [`        key: "${name}",`] }], name);
+  // The registry group keeps every other added line, in order: the struct the threshold sits in, its `enabled` switch, the impl, and in lib.rs all but the field and
+  // the keys. The two attributes between the threshold's description and its field went with the flag.
+  const without = (file: ChangedFile, ...taken: number[]) => ({ ...file, added: file.added.filter((_, at) => !taken.includes(at)) });
+  assert.deepEqual(groups[0]!.files, [without(configs, 0, 1, 2, 3, 4, 13, 14, 15, 16, 17), without(lib, 34, 43, 45, 47, 49, 51, 53, 64, 78)]);
+  assert.deepEqual(groups[0]!.files.map(f => f.added.length), [14, 82]);
+  assert.deepEqual([configs.added[15], configs.added[16]], ['    #[serde(skip_serializing_if = "Option::is_none")]', '    #[schemars(range(min = 1, max = 100))]']);
+});
+
+test('groupWatchedFiles: with the new text, a description is read where the definition stands, and a registry entry is described by the variant it names', () => {
+  const path = 'codex-rs/features/src/lib.rs';
+  const before = [
+    'pub enum Feature {', '    /// Old one.', '    Old,', '}', '',
+    'pub struct FeaturesToml {', '    #[serde(default)]', '    pub old: Option<bool>,', '}', '',
+    'pub const FEATURES: &[FeatureSpec] = &[', '    FeatureSpec {', '        id: Feature::Old,', '        key: "old",', '    },', '];', '',
+  ].join('\n');
+  const after = [
+    'pub enum Feature {', '    /// Old one.', '    Old,', '    /// Prepare compaction in the background.', '    #[doc(hidden)]', '    AsyncCompaction = 7,', '}', '',
+    'pub struct FeaturesToml {', '    #[serde(default)]', '    pub old: Option<bool>,', '    #[serde(default)]', '    pub async_compaction: Option<bool>,', '    pub enabled: Option<bool>,', '}', '',
+    'pub const FEATURES: &[FeatureSpec] = &[', '    FeatureSpec {', '        id: Feature::Old,', '        key: "old",', '    },', '    FeatureSpec {', '        id: Feature::AsyncCompaction,', '        key: "async_compaction",', '    },', '];', '',
+  ].join('\n');
+  const file: ChangedFile = { path, status: 'modified', added: addedLines(before, after) };
+  assert.deepEqual(file.added, [
+    '    /// Prepare compaction in the background.', '    #[doc(hidden)]', '    AsyncCompaction = 7,', '    #[serde(default)]', '    pub async_compaction: Option<bool>,', '    pub enabled: Option<bool>,',
+    '    FeatureSpec {', '        id: Feature::AsyncCompaction,', '        key: "async_compaction",', '    },',
+  ]);
+  // The `id:` above the key names the variant; its `///` line, across the attribute and whatever the value, describes the flag. The attributes and the variant line go
+  // with the flag and are not shown.
+  const [rest, flag] = groupWatchedFiles([file], '0.163', new Map([[path, after]]));
+  assert.deepEqual(flag, {
+    key: 'feature-flag:async_compaction', kind: 'feature-flag', flag: 'async_compaction', title: 'async_compaction',
+    files: [{ ...file, added: ['    /// Prepare compaction in the background.', '    pub async_compaction: Option<bool>,', '        key: "async_compaction",'] }],
+    excerpt: 'lib.rs:     /// Prepare compaction in the background.\nlib.rs:     pub async_compaction: Option<bool>,\nlib.rs:         key: "async_compaction",',
+  });
+  assert.deepEqual(rest!.files, [{ ...file, added: ['    pub enabled: Option<bool>,', '    FeatureSpec {', '        id: Feature::AsyncCompaction,', '    },'] }]);
+  // Without the text there is no variant to look up: the key has no description, and the variant's lines are a change of the registry.
+  const [restWithout, flagWithout] = groupWatchedFiles([file], '0.163');
+  assert.deepEqual(flagWithout!.files, [{ ...file, added: ['    pub async_compaction: Option<bool>,', '        key: "async_compaction",'] }]);
+  assert.deepEqual(restWithout!.files[0]!.added, [
+    '    /// Prepare compaction in the background.', '    #[doc(hidden)]', '    AsyncCompaction = 7,', '    pub enabled: Option<bool>,', '    FeatureSpec {', '        id: Feature::AsyncCompaction,', '    },',
+  ]);
+});
+
+test('groupWatchedFiles: lines next to each other among the added lines need not be next to each other in the file', () => {
+  const path = 'codex-rs/features/src/feature_configs.rs';
+  const after = 'pub struct Toml {\n    /// Now documented.\n    pub a: Option<bool>,\n    pub b: Option<bool>,\n}\n';
+  const file: ChangedFile = { path, status: 'modified', added: addedLines('pub struct Toml {\n    pub a: Option<bool>,\n}\n', after) };
+  assert.deepEqual(file.added, ['    /// Now documented.', '    pub b: Option<bool>,']);
+  // In the file the comment documents `a`, which did not change: `b` has no description, and the comment is a change of the registry.
+  assert.deepEqual(groupWatchedFiles([file], undefined, new Map([[path, after]])).map(g => [g.key, g.files.map(f => f.added)]), [
+    ['feature-flags', [['    /// Now documented.']]], ['feature-flag:b', [['    pub b: Option<bool>,']]],
+  ]);
+  // Without the text the comment passes for b's.
+  assert.deepEqual(groupWatchedFiles([file]).map(g => [g.key, g.files.map(f => f.added)]), [['feature-flag:b', [['    /// Now documented.', '    pub b: Option<bool>,']]]]);
+  // A text the added lines cannot have come from counts as none.
+  assert.deepEqual(groupWatchedFiles([file], undefined, new Map([[path, 'pub struct Other {}\n']])).map(g => [g.key, g.files.map(f => f.added)]), [['feature-flag:b', [['    /// Now documented.', '    pub b: Option<bool>,']]]]);
+});
+
+test('groupWatchedFiles: only a variant of `pub enum Feature` describes a registry entry, not one of the same name in another enum', () => {
+  const path = 'codex-rs/features/src/lib.rs';
+  const text = [
+    'pub enum Feature {', '    /// Old one.', '    Old,', '}', '',
+    'pub enum LegacyFeature {', '    /// Not the flag.', '    Masking,', '}', '',
+    'pub const FEATURES: &[FeatureSpec] = &[', '    FeatureSpec {', '        id: Feature::Masking,', '        key: "masking",', '    },', '];', '',
+  ].join('\n');
+  const file: ChangedFile = { path, status: 'modified', added: ['    /// Not the flag.', '    Masking,', '        id: Feature::Masking,', '        key: "masking",'] };
+  const [rest, flag] = groupWatchedFiles([file], undefined, new Map([[path, text]]));
+  assert.deepEqual(flag!.files, [{ ...file, added: ['        key: "masking",'] }]);
+  assert.deepEqual(rest!.files, [{ ...file, added: ['    /// Not the flag.', '    Masking,', '        id: Feature::Masking,'] }]);
+});
+
+test('groupWatchedFiles: a flag defined in two files is one group; the registry group holds only what no flag took, and a file without a flag goes to it as it is', () => {
+  const configs: ChangedFile = { path: 'codex-rs/features/src/feature_configs.rs', status: 'modified', added: ['    /// Shared.', '    pub shared: Option<bool>,'] };
+  const lib: ChangedFile = { path: 'codex-rs/features/src/lib.rs', status: 'modified', added: ['        key: "shared",', '        key: "other",'] };
+  const legacy: ChangedFile = { path: 'codex-rs/features/src/legacy.rs', status: 'modified', added: ['const OLD: u8 = 2;'] };
+  const unread: ChangedFile = { path: 'codex-rs/features/src/z.rs', status: 'modified', added: [], error: 'GitHub HTTP 502' };
+  // Every added line belongs to a flag: there is no registry group.
+  assert.deepEqual(groupWatchedFiles([configs, lib]).map(g => [g.key, g.files]), [
+    ['feature-flag:shared', [configs, { ...lib, added: ['        key: "shared",'] }]],
+    ['feature-flag:other', [{ ...lib, added: ['        key: "other",'] }]],
+  ]);
+  const groups = groupWatchedFiles([configs, legacy, lib, unread], '0.163');
+  assert.deepEqual(groups.map(g => [g.key, g.title, g.files.map(f => f.path)]), [
+    ['feature-flag:shared', 'shared', [configs.path, lib.path]],
+    ['feature-flags', '功能开关注册表有变化（0.163）', [legacy.path, unread.path]],
+    ['feature-flag:other', 'other', [lib.path]],
+  ]);
+  assert.equal(groups[1]!.files[0], legacy);
+  assert.equal(groups[1]!.excerpt, 'legacy.rs: const OLD: u8 = 2;\nz.rs: （内容未读取：GitHub HTTP 502）');
+  assert.ok(!('flag' in groups[1]!));
+});
+
 // --- collectFileChanges: a temp-dir store and a stub GitHub client, no network ---
 
 type FilesGitHub = Pick<GitHubClient, 'stableTags' | 'treePaths' | 'fileAt'>;
@@ -1336,4 +1456,89 @@ test('collectFileChanges: protocol types found by a patch release join the candi
     assert.equal(all[1]!.title, '协议类型有变化（0.163）：1 个类型');
     assert.deepEqual(all[1]!.window, { fromTag: 'rust-v0.162.1', toTag: 'rust-v0.163.0' });
   }, 'rust-v0.161.0');
+});
+
+test('collectFileChanges: every flag a window adds is a candidate of its own, described from the new text; the rest of the registry is one more, if there is a rest', async () => {
+  await withStore(async (store, snapshotDir) => {
+    const configs = 'codex-rs/features/src/feature_configs.rs', lib = 'codex-rs/features/src/lib.rs';
+    const serde = '    #[serde(skip_serializing_if = "Option::is_none")]';
+    const config = (fields: string[]) => ['pub struct MultiAgentConfigToml {', ...fields, '}', ''].join('\n');
+    const registry = (variants: string[], entries: string[]) => [
+      'pub enum Feature {', '    /// Old one.', '    Old,', ...variants, '}', '',
+      'pub const FEATURES: &[FeatureSpec] = &[', '    FeatureSpec {', '        id: Feature::Old,', '        key: "old",', '    },', ...entries, '];', '',
+    ].join('\n');
+    const stub = stubGitHub(
+      { 'rust-v0.162.0': new Map([[configs, '1'], [lib, '1']]), 'rust-v0.162.1': new Map([[configs, '2'], [lib, '2']]) },
+      {
+        [`rust-v0.162.0:${configs}`]: config(['    /// Hint text.', serde, '    pub usage_hint_text: Option<String>,', '    /// Wait for agents.', serde, '    pub wait_agent_enabled: Option<bool>,']),
+        // A new field, and a field whose type changed under the description it already had.
+        [`rust-v0.162.1:${configs}`]: config([
+          '    /// Hint text.', serde, '    pub usage_hint_text: Option<String>,', "    /// Preserve the parent's history on full forks.", serde, '    pub preserve_fork_prefix: Option<bool>,',
+          '    /// Wait for agents.', serde, '    pub wait_agent_enabled: Option<u8>,',
+        ]),
+        [`rust-v0.162.0:${lib}`]: registry([], []),
+        [`rust-v0.162.1:${lib}`]: `pub use feature_configs::MultiAgentConfigToml;\n${registry(
+          ['    /// Mask credentials before they reach the model.', '    CredentialMasking,'],
+          ['    FeatureSpec {', '        id: Feature::CredentialMasking,', '        key: "credential_masking",', '    },'],
+        )}`,
+      },
+    );
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 4, merged: 0, gap: false, unread: NONE });
+    // The snapshot keeps the added lines of each file, as before; the new text is not kept.
+    assert.deepEqual((await readSnapshot(snapshotDir, WINDOW)).files, [
+      { path: configs, status: 'modified', added: ["    /// Preserve the parent's history on full forks.", '    pub preserve_fork_prefix: Option<bool>,', serde, '    pub wait_agent_enabled: Option<u8>,'] },
+      { path: lib, status: 'modified', added: ['pub use feature_configs::MultiAgentConfigToml;', '    /// Mask credentials before they reach the model.', '    CredentialMasking,', '    FeatureSpec {', '        id: Feature::CredentialMasking,', '        key: "credential_masking",', '    },'] },
+    ]);
+
+    const stored = await filesCandidates(store);
+    assert.deepEqual(stored.map(c => [c.fingerprint, c.title]), [
+      ['codex-files:feature-flag:credential_masking:0.162', 'credential_masking'],
+      ['codex-files:feature-flag:preserve_fork_prefix:0.162', 'preserve_fork_prefix'],
+      ['codex-files:feature-flag:wait_agent_enabled:0.162', 'wait_agent_enabled'],
+      ['codex-files:feature-flags:0.162', '功能开关注册表有变化（0.162）'],
+    ]);
+    assert.ok(stored.every(c => c.status === 'new' && c.window?.fromTag === 'rust-v0.162.0' && c.window?.toTag === 'rust-v0.162.1'));
+    const [masking, preserve, wait, rest] = stored;
+    // The variant the registry entry names carries the description. A field's description is read where the field stands, also when only the field changed.
+    assert.deepEqual(masking!.evidence, [{ kind: 'feature-flag', ref: lib, url: urlOf(WINDOW, lib), excerpt: '    /// Mask credentials before they reach the model.\n        key: "credential_masking",' }]);
+    assert.equal(masking!.summary, 'lib.rs:     /// Mask credentials before they reach the model.\nlib.rs:         key: "credential_masking",');
+    assert.deepEqual(preserve!.evidence, [{ kind: 'feature-flag', ref: configs, url: urlOf(WINDOW, configs), excerpt: "    /// Preserve the parent's history on full forks.\n    pub preserve_fork_prefix: Option<bool>," }]);
+    assert.equal(wait!.evidence[0]!.excerpt, '    /// Wait for agents.\n    pub wait_agent_enabled: Option<u8>,');
+    // The added attribute went with a field, so nothing of feature_configs.rs is left; the other lines of the new registry entry are.
+    assert.deepEqual(rest!.evidence, [{ kind: 'feature-flag', ref: lib, url: urlOf(WINDOW, lib), excerpt: 'pub use feature_configs::MultiAgentConfigToml;\n    FeatureSpec {\n        id: Feature::CredentialMasking,\n    },' }]);
+  });
+});
+
+test('collectFileChanges: a feature file the rate limit kept unread holds back every flag group with the registry group, so that no flag is stored half', async () => {
+  const a = 'codex-rs/features/src/a.rs', b = 'codex-rs/features/src/b.rs', doc = 'docs/x.md';
+  const scene = () => stubGitHub(
+    { 'rust-v0.162.0': new Map(), 'rust-v0.162.1': new Map([[a, '1'], [b, '1'], [doc, '1']]) },
+    {
+      [`rust-v0.162.1:${a}`]: '    /// Shared by both files.\n    pub shared: Option<bool>,\n    pub only_a: Option<bool>,\n',
+      [`rust-v0.162.1:${b}`]: '        key: "shared",\n',
+      [`rust-v0.162.1:${doc}`]: 'text\n',
+    },
+  );
+  await withStore(async (store, snapshotDir) => {
+    const stub = scene();
+    stub.failing.set(b, rateLimit(b, RESET));
+    // a.rs is read in full, but b.rs may define the same flags (it does): stored now, `shared` would miss the line of b.rs for good, since the retry leaves a stored
+    // group alone. The wait goes by the registry group's key: b.rs has no lines, so `groupOf` puts it in `feature-flags`, and every flag group waits with that.
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 0, merged: 0, gap: false, unread: { overBudget: 0, rateLimited: 2, failed: 0 }, rateLimitResetAt: RESET });
+    assert.deepEqual(await store.list(), []);
+    assert.equal(await store.checkpoint('lastFilesTag'), 'rust-v0.162.0');
+
+    stub.failing.clear();
+    assert.deepEqual(await collectFileChanges(store, stub.github, snapshotDir), { window: WINDOW, added: 3, merged: 0, gap: false, unread: NONE });
+    const stored = await filesCandidates(store);
+    assert.deepEqual(stored.map(c => c.fingerprint), ['codex-files:doc:docs/x.md:0.162', 'codex-files:feature-flag:only_a:0.162', 'codex-files:feature-flag:shared:0.162']);
+    assert.deepEqual(stored[2]!.evidence.map(e => [e.ref, e.excerpt]), [[a, '    /// Shared by both files.\n    pub shared: Option<bool>,'], [b, '        key: "shared",']]);
+  });
+  // A limit that hits a file of another family does not hold the flags back.
+  await withStore(async (store, snapshotDir) => {
+    const stub = scene();
+    stub.failing.set(doc, rateLimit(doc, RESET));
+    assert.equal((await collectFileChanges(store, stub.github, snapshotDir)).added, 2);
+    assert.deepEqual((await filesCandidates(store)).map(c => c.fingerprint), ['codex-files:feature-flag:only_a:0.162', 'codex-files:feature-flag:shared:0.162']);
+  });
 });
