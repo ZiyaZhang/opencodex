@@ -1,10 +1,13 @@
-/* DSH-native surfaces, compact typography and a single restrained accent. */
+/* DSH-native surfaces, compact typography and a single restrained accent. The controls are DSH's own (Button, Pill, Tag, Input); the rules
+ * here lay them out and never style a control by its element, which would override the look their own classes give them. */
 .oc-page {
   --oc-text: var(--dsw-alias-label-primary, #25272b);
   --oc-muted: var(--dsw-alias-label-secondary, #686d75);
+  --oc-faint: var(--dsw-alias-label-tertiary, #8b9097);
   --oc-bg: var(--dsw-alias-bg-layer-1, #fff);
   --oc-layer: var(--dsw-alias-bg-layer-2, #f5f6f7);
   --oc-line: var(--dsw-alias-border-main, rgba(128, 128, 128, .2));
+  --oc-field-line: var(--dsw-alias-border-l4, rgba(128, 128, 128, .35));
   --oc-accent: color-mix(in srgb, var(--oc-text) 28%, #638ad0);
   --oc-accent-soft: color-mix(in srgb, var(--oc-accent) 8%, var(--oc-bg));
   --oc-warn: color-mix(in srgb, var(--oc-text) 30%, #c08a2e);
@@ -26,19 +29,7 @@
 .oc-page *, .oc-page *::before, .oc-page *::after { box-sizing: border-box; }
 .oc-page > * { max-width: 1040px; margin-left: auto; margin-right: auto; }
 .oc-icon { display: inline-block; flex: 0 0 auto; vertical-align: middle; }
-.oc-page button, .oc-page input, .oc-page select { font: inherit; }
-.oc-page button {
-  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-  border: 1px solid var(--oc-line); border-radius: var(--oc-radius);
-  background: var(--oc-bg); color: inherit; padding: 6px 10px;
-  min-height: 32px; line-height: 1.35; font-weight: 500; cursor: pointer;
-  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
-}
-.oc-page button:not(:disabled):hover { background: var(--oc-layer); border-color: color-mix(in srgb, var(--oc-text) 24%, transparent); }
-.oc-page button:not(:disabled):active { background: color-mix(in srgb, var(--oc-text) 9%, var(--oc-bg)); }
-.oc-page button:disabled { opacity: .45; cursor: default; }
-.oc-page :is(button, input, select, a, summary):focus-visible { outline: 2px solid var(--oc-accent); outline-offset: 3px; }
-.oc-page .oc-small { min-height: 26px; padding: 3px 8px; font-size: 12px; }
+.oc-page :is(a, summary, .oc-row-link):focus-visible { outline: 2px solid var(--oc-accent); outline-offset: 3px; }
 .oc-page a { display: inline-flex; align-items: center; gap: 4px; color: inherit; text-underline-offset: 3px; }
 .oc-page a:hover { color: var(--oc-accent); }
 .oc-page h2, .oc-page h3 { display: flex; align-items: center; gap: 7px; font-weight: 600; }
@@ -56,63 +47,83 @@
 .oc-warning { color: var(--oc-warn); background: color-mix(in srgb, var(--oc-warn) 8%, var(--oc-bg)); border-radius: 5px; padding: 5px 9px; font-size: 13px; }
 .oc-notice { border: 1px solid var(--oc-line); background: var(--oc-layer); padding: 10px 12px; border-radius: var(--oc-radius); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; }
 
-/* Header, the check and index lines, tabs */
-.oc-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
-.oc-header > button { flex-shrink: 0; white-space: nowrap; }
-.oc-brand { font-size: 22px; line-height: 1.25; font-weight: 600; letter-spacing: -.55px; }
-.oc-overview { margin-bottom: 14px; }
+/* Header: the title and its two buttons on one 28px line, the height of a small DSH button, then the lines about checks and the index. */
+.oc-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.oc-page .oc-title { margin: 0; font-size: 20px; line-height: 28px; font-weight: 600; letter-spacing: -.3px; }
+.oc-header-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+.oc-page .oc-icon-button { width: 28px; padding: 0; }
+.oc-overview { margin-bottom: 16px; }
 .oc-overview > .oc-error { margin: 2px 0 8px; }
-.oc-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; margin: 4px 0; font-size: 13px; color: var(--oc-muted); }
+.oc-overview > .oc-notice { margin: 8px 0; }
+.oc-page .oc-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; margin: 4px 0; font-size: 13px; line-height: 20px; color: var(--oc-muted); }
 .oc-line > strong { color: var(--oc-text); font-weight: 500; }
-.oc-line > .oc-small { align-self: center; }
+.oc-line > button { align-self: center; }
+.oc-page .oc-attention { color: var(--oc-warn); }
 .oc-errors summary { cursor: pointer; }
 .oc-errors[open] { flex-basis: 100%; }
 .oc-errors ul { margin: 6px 0 4px; padding-left: 18px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.oc-tabs { display: flex; align-items: center; gap: 14px; border-bottom: 1px solid var(--oc-line); margin-bottom: 14px; }
-.oc-tabs > div { display: flex; align-items: center; gap: 20px; }
-.oc-page .oc-tabs button { position: relative; min-height: 42px; border: 0; border-radius: 0; padding: 8px 1px 12px; color: var(--oc-muted); background: none; font-size: 13px; }
-.oc-page .oc-tabs button::after { content: ''; position: absolute; bottom: -1px; left: 0; right: 0; height: 2px; border-radius: 1px; background: transparent; }
-.oc-page .oc-tabs button:hover { color: var(--oc-text); background: none; }
-.oc-page .oc-tabs button[aria-current=page] { color: var(--oc-text); }
-.oc-page .oc-tabs button[aria-current=page]::after { background: var(--oc-accent); }
-.oc-page .oc-tabs button[aria-current=page] > .oc-icon { color: var(--oc-accent); }
-.oc-count { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; padding: 1px 5px; border-radius: 4px; font-size: 12px; font-weight: 500; background: var(--oc-layer); color: var(--oc-muted); font-variant-numeric: tabular-nums; }
+.oc-loading { margin-top: 16px; }
 
-/* Filters and the candidate list */
-.oc-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-top: 0; margin-bottom: 12px; }
-.oc-page .oc-filters label { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 400; color: var(--oc-muted); }
-.oc-page .oc-filters select { width: auto; min-height: 30px; margin: 0; padding: 4px 8px; }
-.oc-filter-count { font-size: 12px; color: var(--oc-muted); font-variant-numeric: tabular-nums; }
-.oc-list { border-top: 1px solid var(--oc-line); }
-.oc-candidate { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 8px 16px; padding: 14px 4px; border-bottom: 1px solid var(--oc-line); }
-.oc-candidate-main { min-width: 0; }
-/* A long title wraps inside its own box, so the badges stay beside it instead of falling onto a line of their own. */
-.oc-candidate-title { display: flex; align-items: baseline; gap: 8px; }
-.oc-candidate-title > .oc-status, .oc-detail-head > .oc-status { flex-shrink: 0; }
-.oc-page .oc-title-button { display: block; flex: 0 1 auto; min-width: 0; min-height: 0; padding: 0; border: 0; border-radius: 0; background: none; text-align: left; font-size: 14px; font-weight: 600; line-height: 1.5; overflow-wrap: anywhere; }
-.oc-page .oc-title-button:not(:disabled):hover { background: none; color: var(--oc-accent); }
-.oc-candidate-summary { margin: 2px 0 6px; color: var(--oc-muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Views */
+.oc-views { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+.oc-view-count { color: var(--oc-faint); font-variant-numeric: tabular-nums; }
+
+/* Version groups. A group title is one 36px line: a 20px line with 8px above and below. */
+.oc-group + .oc-group { margin-top: 20px; }
+.oc-group-head { display: flex; align-items: baseline; gap: 10px; min-height: 36px; padding: 8px 4px; border-bottom: 1px solid var(--oc-line); }
+.oc-page .oc-group-title { display: block; margin: 0; font-size: 14px; line-height: 20px; font-weight: 600; }
+.oc-group-meta { font-size: 12px; line-height: 18px; color: var(--oc-faint); font-variant-numeric: tabular-nums; }
+
+/* Rows: text | buttons, 12px above and below, 4px at the sides. The buttons start at the top of the row, beside the title line, rather than
+ * centred against the whole row; 3px above the 22px title line centre it on the 28px buttons. */
+.oc-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 6px 16px; padding: 12px 4px; border-bottom: 1px solid var(--oc-line); }
+.oc-row-main { min-width: 0; }
+/* A long title wraps in its own box, so the tag stays beside its first line instead of falling onto a line of its own. */
+.oc-row-head { display: flex; align-items: flex-start; gap: 8px; padding-top: 3px; }
+.oc-page .oc-row-title { display: block; flex: 0 1 auto; min-width: 0; margin: 0; font-size: 14px; line-height: 22px; font-weight: 600; overflow-wrap: anywhere; }
+.oc-page .oc-row-link { display: inline; margin: 0; padding: 0; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.oc-page .oc-row-link:hover { color: var(--oc-accent); }
+.oc-row-status { display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0; height: 22px; }
+.oc-page .oc-row-gist { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; margin: 2px 0 0; font-size: 13px; line-height: 20px; color: var(--oc-muted); overflow-wrap: anywhere; }
+/* The third line: small facts 12px apart, a fact that does not fit moving to the next line whole. */
+.oc-page .oc-row-info { display: flex; flex-wrap: wrap; column-gap: 12px; row-gap: 2px; margin: 4px 0 0; font-size: 12px; line-height: 18px; color: var(--oc-faint); }
+.oc-row-info > * { overflow-wrap: anywhere; }
+.oc-row-failure { color: var(--oc-warn); }
+.oc-row-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 6px; }
+.oc-progress { display: inline-flex; align-items: center; min-height: 28px; font-size: 12px; color: var(--oc-muted); white-space: nowrap; }
+.oc-page .oc-row-note { margin: 6px 0 0; font-size: 12px; color: var(--oc-accent); }
+.oc-page .oc-row .oc-error { margin: 6px 0 0; font-size: 12px; }
+.oc-page > .oc-omitted { margin: 12px auto; padding: 0 4px; font-size: 12px; }
+.oc-empty { text-align: center; padding: 40px 16px 48px; }
+.oc-empty h2 { display: block; font-size: 16px; }
+
+/* Detail view. It still draws its own buttons, so the plain-button look below is scoped to it. */
+.oc-detail button, .oc-page select { font: inherit; }
+.oc-detail button {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  border: 1px solid var(--oc-line); border-radius: var(--oc-radius);
+  background: var(--oc-bg); color: inherit; padding: 6px 10px;
+  min-height: 32px; line-height: 1.35; font-weight: 500; cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+}
+.oc-detail button:not(:disabled):hover { background: var(--oc-layer); border-color: color-mix(in srgb, var(--oc-text) 24%, transparent); }
+.oc-detail button:not(:disabled):active { background: color-mix(in srgb, var(--oc-text) 9%, var(--oc-bg)); }
+.oc-detail button:disabled { opacity: .45; cursor: default; }
+.oc-detail button:focus-visible { outline: 2px solid var(--oc-accent); outline-offset: 3px; }
+.oc-page .oc-small { min-height: 26px; padding: 3px 8px; font-size: 12px; }
+.oc-page .oc-back { border: 0; padding: 0; min-height: 26px; color: var(--oc-muted); background: none; font-size: 13px; }
+.oc-detail-head { display: flex; align-items: baseline; gap: 10px; margin: 10px 0 4px; }
+.oc-detail-head h2 { display: block; flex: 0 1 auto; min-width: 0; font-size: 17px; overflow-wrap: anywhere; }
+.oc-detail-head > .oc-status { flex-shrink: 0; }
 .oc-row-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; margin: 4px 0; color: var(--oc-muted); font-size: 12px; line-height: 1.4; }
-.oc-row-note { margin: 6px 0 0; font-size: 12px; color: var(--oc-accent); }
-.oc-candidate .oc-error { margin: 6px 0 0; font-size: 12px; }
 .oc-candidate-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-.oc-candidate .oc-candidate-actions { justify-content: flex-end; }
 .oc-page .oc-candidate-actions button { min-height: 28px; padding: 4px 9px; font-size: 12px; }
+.oc-detail > .oc-candidate-actions { margin: 12px 0; }
+.oc-detail > .oc-error, .oc-detail > .oc-row-note { margin: 0 0 10px; }
 .oc-status { display: inline-flex; align-items: center; flex-shrink: 0; font-size: 12px; line-height: 1.5; white-space: nowrap; padding: 1px 6px; background: var(--oc-layer); border-radius: 4px; font-weight: 500; color: var(--oc-muted); }
 .oc-status-reported, .oc-status-started { color: var(--oc-accent); background: var(--oc-accent-soft); }
 .oc-status-ignored { opacity: .7; }
 .oc-busy { color: var(--oc-warn); background: color-mix(in srgb, var(--oc-warn) 10%, var(--oc-bg)); }
-.oc-page > .oc-omitted { margin: 12px auto; padding: 0 4px; font-size: 12px; }
-.oc-overview > .oc-notice { margin: 0 0 8px; }
-.oc-empty { text-align: center; padding: 40px 16px 48px; }
-.oc-empty h2 { display: block; font-size: 16px; }
-
-/* Detail: summary, classification, report, evidence */
-.oc-page .oc-back { border: 0; padding: 0; min-height: 26px; color: var(--oc-muted); background: none; font-size: 13px; }
-.oc-detail-head { display: flex; align-items: baseline; gap: 10px; margin: 10px 0 4px; }
-.oc-detail-head h2 { display: block; flex: 0 1 auto; min-width: 0; font-size: 17px; overflow-wrap: anywhere; }
-.oc-detail > .oc-candidate-actions { margin: 12px 0; }
-.oc-detail > .oc-error, .oc-detail > .oc-row-note { margin: 0 0 10px; }
 .oc-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.6; max-width: 85ch; }
 .oc-section { border-top: 1px solid var(--oc-line); padding-top: 14px; margin-top: 18px; }
 .oc-report-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; font-size: 12px; margin-bottom: 8px; }
@@ -148,15 +159,27 @@
 .oc-evidence .oc-raw { max-height: 320px; margin-top: 6px; }
 .oc-tag { font-size: 12px; padding: 1px 6px; border-radius: 4px; background: var(--oc-layer); color: var(--oc-muted); white-space: nowrap; }
 
-/* Settings */
+/* Settings. Text fields are DSH Inputs; the selects are drawn to match them: 32px tall, the same hairline border, corners and text size. */
+.oc-page .oc-back-button { margin-left: -10px; }
+.oc-page .oc-settings-title { margin: 6px 0 4px; font-size: 16px; }
 .oc-form > * { max-width: 720px; }
 .oc-form h3 { margin: 22px 0 10px; }
 .oc-form h3:first-child { margin-top: 4px; }
-.oc-page label { display: block; font-size: 13px; font-weight: 500; }
-.oc-page input, .oc-page select { display: block; width: 100%; min-height: 34px; border: 1px solid var(--oc-line); border-radius: var(--oc-radius); padding: 8px 10px; background: var(--oc-bg); color: var(--oc-text); margin: 6px 0 14px; font-size: 13px; font-weight: 400; line-height: 1.45; }
-.oc-page input::placeholder { color: var(--oc-muted); opacity: .85; }
+/* The weight is on the label's text, not the label: a DSH Input inside it may inherit the label's font. */
+.oc-page label { display: block; font-size: 13px; }
+.oc-label { font-weight: 500; }
+.oc-page .oc-field { display: flex; width: 100%; margin: 6px 0 14px; }
+.oc-page select {
+  display: block; width: 100%; height: 32px; margin: 6px 0 14px; padding: 0 8px;
+  border: .5px solid var(--oc-field-line); border-radius: var(--dsw-radius-md, 8px);
+  background: var(--oc-bg); color: var(--oc-text); font-size: 14px; font-weight: 400;
+}
+.oc-page select:focus-visible { outline: none; border-color: var(--dsw-alias-state-business-primary, var(--oc-accent)); }
+.oc-page select:disabled { opacity: .6; }
 .oc-two-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 18px; }
 .oc-hint { margin: -8px 0 14px !important; font-size: 12px; color: var(--oc-muted); }
+.oc-page .oc-field-note { margin: 0 0 10px; font-size: 12px; }
+.oc-form .oc-warning, .oc-form .oc-notice { margin: 0 0 12px; }
 .oc-form-actions { display: flex; align-items: center; gap: 10px; margin: 8px 0; font-size: 13px; }
 
 .oc-footer { border-top: 1px solid var(--oc-line); margin-top: 32px; padding-top: 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--oc-muted); }
@@ -164,14 +187,14 @@
 
 @media (max-width: 700px) {
   .oc-page { padding: 18px 16px; }
-  .oc-brand { font-size: 19px; }
+  .oc-page .oc-title { font-size: 18px; }
   .oc-two-columns { grid-template-columns: minmax(0, 1fr); }
-  .oc-candidate { grid-template-columns: minmax(0, 1fr); }
-  .oc-candidate .oc-candidate-actions { justify-content: flex-start; }
+  .oc-row { grid-template-columns: minmax(0, 1fr); }
+  .oc-row-actions { justify-content: flex-start; }
 }
 @media (max-width: 420px) {
   .oc-header, .oc-footer { flex-wrap: wrap; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .oc-page button { transition: none; }
+  .oc-detail button { transition: none; }
 }
