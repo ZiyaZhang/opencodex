@@ -288,3 +288,31 @@ OpenCodex uses it under the Apache License 2.0, whose text follows. Source: http
 The published DOMPurify build inlines Babel helper functions, among them regenerator-runtime (Copyright (c) 2014-present, Facebook, Inc.),
 under the MIT License: https://github.com/babel/babel/blob/main/packages/babel-helpers/LICENSE. The license comments of DOMPurify and of
 these helpers are kept at the end of `dist/client.js`.
+
+The prompts of the OpenCodex Host (the gap-report template and the prompts of the analyst and creator sessions, in `dist/host/index.js`)
+include evidence rules translated into Chinese and adapted from the documentation of `rea-agents`.
+Source: https://github.com/morluto/rea
+
+```text
+MIT License
+
+Copyright (c) 2026 morluto
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
