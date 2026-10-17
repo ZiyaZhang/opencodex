@@ -31,6 +31,7 @@ const TURNOVER_BYTES = 2 * 1024 * 1024;
 /** How much of the end of the log is read for its last line: far more than one line, so a whole one is still found behind a damaged one. */
 const TAIL_BYTES = 64 * 1024;
 const TRIGGERS: ReadonlySet<string> = new Set<CheckTrigger>(['startup', 'timer', 'manual', 'run-once']);
+const NEWLINE = 0x0a;
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const isCount = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
@@ -50,7 +51,7 @@ function entryOf(value: unknown): CheckLogEntry | undefined {
 
 /**
  * Appends `entry` to `<directory>/checks.jsonl` as one line and syncs it to disk. A log over 2 MB is first renamed to checks.1.jsonl,
- * replacing the one before. Callers hold the data-directory lock, so two processes never turn the log over at once.
+ * replacing the one before. Callers hold the data-directory lock, so appends of two processes never meet.
  */
 export async function appendCheckLog(directory: string, entry: CheckLogEntry): Promise<void> {
   const path = join(directory, LOG);
@@ -59,9 +60,20 @@ export async function appendCheckLog(directory: string, entry: CheckLogEntry): P
   await mkdir(directory, { recursive: true, mode: 0o700 });
   let size = 0;
   try { ({ size } = await stat(path)); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-  if (size > TURNOVER_BYTES) await rename(path, join(directory, TURNED_OVER));
-  const handle = await open(path, 'a', 0o600);
-  try { await handle.writeFile(line, 'utf8'); await handle.sync(); } finally { await handle.close(); }
+  if (size > TURNOVER_BYTES) {
+    try { await rename(path, join(directory, TURNED_OVER)); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; // turned over by another append already
+    }
+  }
+  const handle = await open(path, 'a+', 0o600);
+  try {
+    // A write that broke off (a full disk) leaves half a line, which would swallow this one: it is ended first.
+    const { size: end } = await handle.stat();
+    const last = Buffer.alloc(1);
+    if (end > 0) await handle.read(last, 0, 1, end - 1);
+    await handle.writeFile(end > 0 && last[0] !== NEWLINE ? `\n${line}` : line, 'utf8');
+    await handle.sync();
+  } finally { await handle.close(); }
 }
 
 /**

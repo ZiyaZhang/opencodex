@@ -1,6 +1,7 @@
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import fsp, { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendCheckLog, readLastCheckLog, type CheckLogEntry } from '../src/core/run-log.ts';
@@ -42,6 +43,25 @@ test('a log over 2 MB is turned over to checks.1.jsonl, replacing the older one,
   assert.equal(await readFile(turned, 'utf8'), full);
   assert.equal(await readFile(log, 'utf8'), `${JSON.stringify(entry(2))}\n`);
   assert.deepEqual(await readLastCheckLog(directory), { entry: entry(2) });
+}));
+
+test('a turnover that another append made first is no failure', () => inDirectory(async (directory, log) => {
+  await writeFile(log, `${'x'.repeat(2 * MB)}\n`);
+  mock.method(fsp, 'rename', async () => { throw Object.assign(new Error('ENOENT: no such file or directory, rename'), { code: 'ENOENT' }); });
+  syncBuiltinESMExports();
+  try { await appendCheckLog(directory, entry(1)); } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual(await readLastCheckLog(directory), { entry: entry(1) });
+}));
+
+test('a line left half written is ended before the next one, so the next one reads back', () => inDirectory(async (directory, log) => {
+  // A write that broke off (a full disk) leaves half a line, which would otherwise swallow the next one.
+  await writeFile(log, `${JSON.stringify(entry(1))}\n{"at":"2026-10-15T08:02`);
+  await appendCheckLog(directory, entry(3));
+  assert.equal(await readFile(log, 'utf8'), `${JSON.stringify(entry(1))}\n{"at":"2026-10-15T08:02\n${JSON.stringify(entry(3))}\n`);
+  assert.deepEqual(await readLastCheckLog(directory), { entry: entry(3) });
 }));
 
 test('a damaged last line gives way to the newest whole one, and a log with none says so', () => inDirectory(async (directory, log) => {

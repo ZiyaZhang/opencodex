@@ -11,7 +11,7 @@ import type {} from '@deepseek-ai/dsh-api-session-controller';
 import type {} from '@deepseek-ai/dsh-llm';
 import type {} from '@deepseek-ai/dsh-typert-registry';
 import { ValidationError } from '../core/check.js';
-import { LockedError, acquireLock, type LockKind, type LockResult } from '../core/lock.js';
+import { LockedError, acquireLock, type LockKind, type LockOptions, type LockResult } from '../core/lock.js';
 import type { CheckTrigger } from '../core/run-log.js';
 import { CandidateStore } from '../core/store.js';
 import { loadIndex, type CheckResult } from './collector.js';
@@ -41,6 +41,8 @@ export interface Dependencies {
   now?: () => Date;
   /** Node's timers, unref'd, by default. */
   timers?: Timers;
+  /** The timers of the data-directory lock's heartbeat and second look; Node's timers, unref'd, by default. */
+  lockTimers?: Timers;
   /** How often a report session is polled; 3 seconds by default. */
   reportPollMs?: number;
   /** In ms: a check, a `classify` action and the GitHub part of a report; 30, 15 and 10 minutes by default. */
@@ -148,7 +150,7 @@ export default class OpenCodex extends TypertRemoteService {
       settings: () => settings,
       setSettings: next => { settings = next; this.rearm(host); },
       github: () => deps.github ?? new GitHubClient(),
-      lock: kind => this.lock(kind, now),
+      lock: kind => this.lock(kind, { now, timers: deps.lockTimers }),
       fetcher: deps.fetcher, reportPollMs: deps.reportPollMs, timeouts: { ...TIMEOUTS, ...deps.timeouts },
       classifyRetryDelaysMs: deps.classifyRetryDelaysMs ?? CLASSIFY_RETRY_DELAYS_MS,
       index: await loadIndex(this.directory),
@@ -160,11 +162,11 @@ export default class OpenCodex extends TypertRemoteService {
   }
 
   /** The data-directory lock under the Host clock and lifetime. A hold is kept here until released, so that one still held at unload is released then. */
-  private async lock(kind: LockKind, now: () => Date): Promise<LockResult> {
-    const taken = await acquireLock(this.directory, kind, { now, signal: this.lifetime.signal });
+  private async lock(kind: LockKind, options: Pick<LockOptions, 'now' | 'timers'>): Promise<LockResult> {
+    const taken = await acquireLock(this.directory, kind, { ...options, signal: this.lifetime.signal });
     if (!taken.held) return taken;
     this.locks.add(taken);
-    return { held: true, release: () => { this.locks.delete(taken); return taken.release(); } };
+    return { held: true, release: () => { this.locks.delete(taken); return taken.release(); }, signal: taken.signal };
   }
 
   /**

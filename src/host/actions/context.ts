@@ -102,12 +102,12 @@ export function joined<T>(ctx: HostContext, key: string, work: () => Promise<T>)
 }
 
 /**
- * `work` under the plugin's lifetime and a deadline of `ms`: a run that outlives the deadline is aborted, and its failure becomes an Error
- * with `late` as the message. An unload stays the abort it is.
+ * `work` under the plugin's lifetime, a deadline of `ms` and `also` when given (the signal of the lock the run holds): a run that outlives
+ * the deadline is aborted, and its failure becomes an Error with `late` as the message. An unload, or `also`, stays the abort it is.
  */
-export async function withDeadline<T>(ctx: HostContext, ms: number, late: string, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+export async function withDeadline<T>(ctx: HostContext, ms: number, late: string, work: (signal: AbortSignal) => Promise<T>, also?: AbortSignal): Promise<T> {
   const deadline = AbortSignal.timeout(ms);
-  try { return await work(AbortSignal.any([ctx.signal, deadline])); } catch (error) {
+  try { return await work(AbortSignal.any([ctx.signal, deadline, ...(also ? [also] : [])])); } catch (error) {
     if (deadline.aborted && !ctx.signal.aborted) throw new Error(late, { cause: error });
     throw error;
   }

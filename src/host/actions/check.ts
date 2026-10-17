@@ -62,7 +62,7 @@ async function recordCheck(ctx: HostContext, result: CheckResult, startedAt: str
  * and a deadline (`timeouts.check`), never one request's signal: a run that stalls, even waiting for its turn at the classification, gives
  * up at the deadline instead of holding every later check. The run holds the data-directory lock, taken inside the joined run so that a
  * second request of this process joins rather than meets it; while another live process holds it, the check is refused with a LockedError
- * and records nothing.
+ * and records nothing. A check whose lock another process takes over stops, and is recorded as failed.
  */
 export function check(ctx: HostContext, trigger: CheckTrigger): Promise<CheckResult> {
   return joined(ctx, 'check', async () => {
@@ -80,7 +80,7 @@ export function check(ctx: HostContext, trigger: CheckTrigger): Promise<CheckRes
         const { index, errors } = await refreshIndexOf(ctx, signal);
         const problems = await classifyPending(ctx, signal);
         return { ...result, ...(index && { index }), errors: [...result.errors, ...errors, ...problems.map(problem => errorLine(`classify: ${problem}`))] };
-      });
+      }, lock.signal);
       await recordCheck(ctx, checked, startedAt, trigger);
       return checked;
     } catch (error) {

@@ -469,6 +469,24 @@ test('unloading during a check lets go of the lock and writes no line', async ()
   } finally { await f.close(); }
 });
 
+test('a check whose lock another process takes over stops, and is recorded as failed', async () => {
+  let calls = 0;
+  const f = await fixture({ gh: (args, signal) => { calls++; return stalledGh(args, signal); } });
+  try {
+    const running = f.call({ action: 'check' });
+    await until(() => calls > 0, 'the check to reach GitHub');
+    // This process stood still past the stale limit, and another one took the lock over: the next heartbeat finds out.
+    const successor = foreignLock();
+    await writeFile(lockFile(f), JSON.stringify(successor));
+    f.lockTimers.fire();
+    await assert.rejects(running, /数据目录锁被另一个 DSH 进程接管/);
+    const after = await f.call({ action: 'snapshot' });
+    assert.match(after.lastCheck!.errors[0]!, /^check: 数据目录锁被另一个 DSH 进程接管/);
+    assert.deepEqual(after.lastCheckLog?.errors, after.lastCheck!.errors);
+    assert.deepEqual(JSON.parse(await readFile(lockFile(f), 'utf8')), successor, 'the other process keeps its lock');
+  } finally { await f.close(); }
+});
+
 test('a check log that cannot be written becomes a log line of the check, and one that cannot be read a notice', async () => {
   const f = await fixture();
   try {

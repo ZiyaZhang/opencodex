@@ -4,7 +4,7 @@
  * only; other writes, such as an ignore, may still meet another process's in the directory.
  */
 import { randomUUID } from 'node:crypto';
-import { link, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
+import { constants, copyFile, link, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -16,7 +16,8 @@ export type LockKind = 'check' | 'research';
 export interface LockHolder { pid: number; kind: LockKind; startedAt: string }
 /** What `lock.json` holds: the holder, its last heartbeat and its machine. */
 export interface LockRecord extends LockHolder { heartbeatAt: string; hostname: string }
-export type LockResult = { held: true; release(): Promise<void> } | { held: false; by: LockHolder };
+/** A hold, whose `signal` aborts if another process takes the lock over (this one stood still past the stale limit), or a refusal. */
+export type LockResult = { held: true; release(): Promise<void>; signal: AbortSignal } | { held: false; by: LockHolder };
 export interface LockTimers { set(run: () => void, ms: number): unknown; clear(handle: unknown): void }
 export interface LockOptions {
   /** The clock of `startedAt`, of the heartbeats and of their age; the system clock by default. */
@@ -25,9 +26,11 @@ export interface LockOptions {
   timers?: LockTimers;
   /** Ends that wait. */
   signal?: AbortSignal;
-  /** Puts a new lock file in place, failing with EEXIST when there is one; `createLockFile` by default. Tests wrap it to let another process act around it. */
+  /** A test seam: puts a new lock file in place, failing with EEXIST when there is one; `createLockFile` by default. */
   create?: (path: string, text: string) => Promise<void>;
-  /** The pause between the looks that name the process a race was lost to; 20 ms by default. */
+  /** A test seam: moves the lock file a takeover replaces out of the way; `rename` by default. */
+  move?: (from: string, to: string) => Promise<void>;
+  /** A test seam: the pause between the looks that name the process a race was lost to; 20 ms by default. */
   rereadMs?: number;
 }
 
@@ -36,6 +39,8 @@ const FILE = 'lock.json', STALE_FILE = 'lock.stale.json';
 const HEARTBEAT_MS = 30_000;
 /** A heartbeat older than this means the holder stopped: it is frozen (a sleeping machine) or hung. */
 const STALE_MS = 5 * 60_000;
+/** The wait before a second look at a live holder that stopped beating: two heartbeats, so that one just woken from sleep has beaten by then. */
+const SECOND_LOOK_MS = 2 * HEARTBEAT_MS;
 /**
  * Looks at the file after a lost race, to name the winner, and the pause between them: the winner may still be between moving the old file
  * aside and putting its own in place.
@@ -43,8 +48,12 @@ const STALE_MS = 5 * 60_000;
 const WINNER_LOOKS = 5, REREAD_MS = 20;
 /** The pid of a winner whose file never read whole. No holder has it (a record with pid 0 counts as damaged), so it is never taken for a real one. */
 const UNKNOWN_PID = 0;
+/** What link() fails with where the file system has no hard links (exFAT, some network drives). */
+const NO_HARD_LINKS = new Set(['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS']);
 const NODE_TIMERS: LockTimers = { set: (run, ms) => setTimeout(run, ms).unref(), clear: handle => clearTimeout(handle as NodeJS.Timeout) };
 const KIND_TEXT: Record<LockKind, string> = { check: '检查', research: '调研' };
+
+const codeOf = (error: unknown) => (error as NodeJS.ErrnoException | null)?.code ?? '';
 
 /** `iso` in this machine's time zone, as the page shows times. */
 function localTime(iso: string): string {
@@ -55,29 +64,37 @@ function localTime(iso: string): string {
 /** A run refused because another live DSH process holds the data directory. A ValidationError, so the page shows its message as it is. */
 export class LockedError extends ValidationError {
   constructor(readonly by: LockHolder) {
-    super(`另一个 DSH 进程正在${KIND_TEXT[by.kind]}（${by.pid === UNKNOWN_PID ? 'pid 未知' : `pid ${by.pid}，开始于 ${localTime(by.startedAt)}`}）`);
+    super(by.pid === UNKNOWN_PID ? '另一个 DSH 进程正在使用数据目录' : `另一个 DSH 进程正在${KIND_TEXT[by.kind]}（pid ${by.pid}，开始于 ${localTime(by.startedAt)}）`);
     this.name = 'LockedError';
   }
+}
+
+/** Creates `path` with `text` and syncs it, failing with EEXIST when `path` exists. */
+async function createSynced(path: string, text: string): Promise<void> {
+  const handle = await open(path, 'wx', 0o600);
+  try { await handle.writeFile(text, 'utf8'); await handle.sync(); } finally { await handle.close(); }
 }
 
 /**
  * Puts `text` at `path` only where there is no file, whole or not at all: it is written and synced to a temp file beside `path`, then
  * linked there, which fails with EEXIST when `path` exists. Another process never sees a lock file half written, so never takes one over
- * as damaged while its writer is still at it.
+ * as damaged while its writer is still at it. A file system without hard links gets the plain exclusive create instead, and that window.
  */
 export async function createLockFile(path: string, text: string): Promise<void> {
   const temp = join(dirname(path), `lock.${process.pid}.${randomUUID()}.tmp`);
   try {
-    const handle = await open(temp, 'wx', 0o600);
-    try { await handle.writeFile(text, 'utf8'); await handle.sync(); } finally { await handle.close(); }
-    await link(temp, path);
+    await createSynced(temp, text);
+    try { await link(temp, path); } catch (error) {
+      if (!NO_HARD_LINKS.has(codeOf(error))) throw error;
+      await createSynced(path, text);
+    }
   } finally {
     await unlink(temp).catch(() => undefined); // a temp file left over is harmless: nothing reads lock.*.tmp
   }
 }
 
-/** This process's hold on one directory's lock file, shared by every run that took it. */
-interface Hold { count: number; path: string; record: LockRecord; now: () => Date; timers: LockTimers; heartbeat?: unknown }
+/** This process's hold on one directory's lock file, shared by every run that took it; `lost` aborts once another process takes it over. */
+interface Hold { count: number; path: string; record: LockRecord; now: () => Date; timers: LockTimers; heartbeat?: unknown; lost: AbortController }
 /** By resolved directory. */
 const holds = new Map<string, Hold>();
 /** Per resolved directory: acquisitions, heartbeats and releases run one at a time, so none reads the file while another is changing it. */
@@ -100,25 +117,30 @@ function recordOf(value: unknown): LockRecord | undefined {
   return whole ? { pid, kind, startedAt, heartbeatAt, hostname: host } as LockRecord : undefined;
 }
 
-/** The lock file: missing, damaged (anything that is no lock record, to be treated as missing), or a record. Other read failures throw. */
-async function readLock(path: string): Promise<{ exists: boolean; record?: LockRecord }> {
+/**
+ * The lock file: its text, or none when it is missing, and the record in it, or none when it is damaged (anything that is no lock record,
+ * to be treated as missing). Other read failures throw.
+ */
+async function readLock(path: string): Promise<{ text?: string; record?: LockRecord }> {
   let text: string;
   try { text = await readFile(path, 'utf8'); } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { exists: false };
+    if (codeOf(error) === 'ENOENT') return {};
     throw error;
   }
-  try { return { exists: true, record: recordOf(JSON.parse(text)) }; } catch { return { exists: true }; }
+  try { return { text, record: recordOf(JSON.parse(text)) }; } catch { return { text }; }
 }
 
 /** Whether a process with `pid` exists: signal 0 sends nothing, and only ESRCH says there is none (EPERM is another user's live process). */
 function alive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
+  try { process.kill(pid, 0); return true; } catch (error) { return codeOf(error) !== 'ESRCH'; }
 }
 
 const fresh = (record: LockRecord, now: Date) => now.getTime() - Date.parse(record.heartbeatAt) <= STALE_MS;
 const holderOf = ({ pid, kind, startedAt }: LockRecord): LockHolder => ({ pid, kind, startedAt });
 /** The same hold: a file this process wrote, not one written after it by another process or by an earlier hold of this one. */
 const same = (a: LockRecord, b: LockRecord) => a.pid === b.pid && a.startedAt === b.startedAt;
+/** A record of another process that is alive: one that may keep the lock, if it beats. */
+const otherLive = (record: LockRecord | undefined): record is LockRecord => record !== undefined && record.pid !== process.pid && alive(record.pid);
 
 /** Waits `ms` on `timers`; an abort of `signal` clears the timer and rejects with its reason. */
 function pause(ms: number, timers: LockTimers, signal?: AbortSignal): Promise<void> {
@@ -129,9 +151,6 @@ function pause(ms: number, timers: LockTimers, signal?: AbortSignal): Promise<vo
     signal?.addEventListener('abort', abort, { once: true });
   });
 }
-
-/** A record of another process that is alive: one that may keep the lock, if it beats. */
-const otherLive = (record: LockRecord | undefined): record is LockRecord => record !== undefined && record.pid !== process.pid && alive(record.pid);
 
 /**
  * The process a race for `path` was lost to, from the file it put there. It never throws and never takes anything over: a file that does
@@ -151,11 +170,42 @@ async function winner(path: string, options: LockOptions, now: () => Date): Prom
 }
 
 /**
+ * Puts a lock file moved aside by mistake back at `path`, unless another one is there by now (EEXIST: that one stands), and drops the
+ * aside copy. Never throws: whatever stops it, its holder finds out at its next heartbeat.
+ */
+async function putBack(aside: string, path: string): Promise<void> {
+  try { await link(aside, path); } catch (error) {
+    if (NO_HARD_LINKS.has(codeOf(error))) await copyFile(aside, path, constants.COPYFILE_EXCL).catch(() => undefined);
+  }
+  await unlink(aside).catch(() => undefined);
+}
+
+/**
+ * Moves the lock file a takeover replaces to lock.stale.json, making sure it is the file judged: another process may have taken the lock
+ * over since the look, and moving its lock would leave both holding. The file goes to a name of this process's own first and is compared
+ * with the text judged; a different one goes back, and the race is lost (false). A file already gone is another process's move: the
+ * create decides.
+ */
+async function moveAside(path: string, judged: string, options: LockOptions): Promise<boolean> {
+  const aside = join(dirname(path), `lock.${process.pid}.${randomUUID()}.aside`);
+  try { await (options.move ?? rename)(path, aside); } catch (error) {
+    if (codeOf(error) === 'ENOENT') return true;
+    throw error;
+  }
+  if (await readFile(aside, 'utf8').catch(() => undefined) !== judged) {
+    await putBack(aside, path);
+    return false;
+  }
+  await rename(aside, join(dirname(path), STALE_FILE));
+  return true;
+}
+
+/**
  * Makes `path` this process's lock file, or names the live process that keeps it. A holder that is alive with a heartbeat under 5 minutes
- * old keeps it; one whose heartbeat is older but whose pid is alive is looked at again a heartbeat (30 seconds) later and kept only if it
+ * old keeps it; one whose heartbeat is older but whose pid is alive is looked at again two heartbeats (a minute) later and kept only if it
  * beat meanwhile; a holder that is gone, a damaged file and one this process left without a hold are taken over at once. A takeover moves
- * the old file to lock.stale.json, puts the new one in place where there is none (`createLockFile`) and reads it back. A race lost to
- * another process, at the create or at the read-back, is a refusal naming the winner, never another takeover.
+ * the old file aside (`moveAside`), puts the new one in place where there is none (`createLockFile`) and reads it back. A race lost to
+ * another process, at the move, the create or the read-back, is a refusal naming the winner, never another takeover.
  */
 async function claim(path: string, kind: LockKind, options: LockOptions): Promise<{ record: LockRecord } | { held: false; by: LockHolder }> {
   const now = options.now ?? (() => new Date());
@@ -163,40 +213,46 @@ async function claim(path: string, kind: LockKind, options: LockOptions): Promis
   let found = await readLock(path);
   if (otherLive(found.record)) {
     if (fresh(found.record, now())) return { held: false, by: holderOf(found.record) };
-    await pause(HEARTBEAT_MS, options.timers ?? NODE_TIMERS, options.signal);
+    await pause(SECOND_LOOK_MS, options.timers ?? NODE_TIMERS, options.signal);
     found = await readLock(path);
     if (otherLive(found.record) && fresh(found.record, now())) return { held: false, by: holderOf(found.record) };
   }
+  if (found.text !== undefined && !await moveAside(path, found.text, options)) return { held: false, by: await winner(path, options, now) };
   const at = now().toISOString();
   const record: LockRecord = { pid: process.pid, kind, startedAt: at, heartbeatAt: at, hostname: hostname() };
-  if (found.exists) {
-    try { await rename(path, join(dirname(path), STALE_FILE)); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; // another process moved it first; the create below decides
-    }
-  }
   try {
     await (options.create ?? createLockFile)(path, `${JSON.stringify(record, null, 2)}\n`);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    if (codeOf(error) !== 'EEXIST') throw error;
     return { held: false, by: await winner(path, options, now) };
   }
-  // Another process that decided on the old file too may have moved this one aside and put its own in place.
+  // A process that judged the old file too may still have moved this one aside and put its own in place.
   const back = (await readLock(path)).record;
   if (back && same(back, record)) return { record };
   return { held: false, by: back ? holderOf(back) : await winner(path, options, now) };
 }
 
-/** Rewrites the heartbeat of `hold` every 30 seconds while the hold lasts, and stops once the file is no longer this process's. */
+/** Ends `hold` because another process took the lock over: the next acquisition claims anew, and the runs under it are told to stop. */
+function lose(key: string, hold: Hold): void {
+  if (holds.get(key) === hold) holds.delete(key);
+  hold.lost.abort(new Error('数据目录锁被另一个 DSH 进程接管，已停止'));
+}
+
+/**
+ * Rewrites the heartbeat of `hold` every 30 seconds while the hold lasts. A file that is missing or damaged skips one beat: another process
+ * may have it aside for a look, and puts it back. One that is another process's ends the hold, and its lock is left alone.
+ */
 function beat(key: string, hold: Hold): void {
   hold.heartbeat = hold.timers.set(() => {
     void serial(key, async () => {
       if (holds.get(key) !== hold) return;
       try {
-        const current = (await readLock(hold.path)).record;
-        // Another process took over while this one stood still (a sleeping machine): its lock is left alone, and this hold beats no more.
-        if (!current || !same(current, hold.record)) return;
-        hold.record = { ...hold.record, heartbeatAt: hold.now().toISOString() };
-        await writeJsonAtomic(hold.path, hold.record);
+        const { record } = await readLock(hold.path);
+        if (record && !same(record, hold.record)) { lose(key, hold); return; }
+        if (record) {
+          hold.record = { ...hold.record, heartbeatAt: hold.now().toISOString() };
+          await writeJsonAtomic(hold.path, hold.record);
+        }
       } catch {
         // The next beat tries again. Missing five minutes of them lets another process take over, as it should for a holder that cannot write.
       }
@@ -205,20 +261,23 @@ function beat(key: string, hold: Hold): void {
   }, HEARTBEAT_MS);
 }
 
-/** A release of one acquisition: the last one stops the heartbeat and deletes the file, unless another process has taken it over. Never rejects. */
+/**
+ * A release of one acquisition. The last one stops the heartbeat and deletes the file, unless another process has taken it over; a hold
+ * that was lost leaves the one this process holds since alone. Never rejects.
+ */
 function releaser(key: string, hold: Hold): () => Promise<void> {
   let released = false;
   return () => serial(key, async () => {
     if (released) return;
     released = true;
     if (--hold.count > 0) return;
-    holds.delete(key);
+    if (holds.get(key) === hold) holds.delete(key);
     hold.timers.clear(hold.heartbeat);
     try {
-      const current = (await readLock(hold.path)).record;
-      if (current && same(current, hold.record)) await unlink(hold.path);
+      const { record } = await readLock(hold.path);
+      if (record && same(record, hold.record)) await unlink(hold.path);
     } catch {
-      // A file left behind beats no more, so the next process takes it over within five and a half minutes.
+      // A file left behind beats no more, so the next process takes it over within six minutes.
     }
   });
 }
@@ -236,12 +295,12 @@ export function acquireLock(directory: string, kind: LockKind, options: LockOpti
       const path = join(key, FILE);
       const claimed = await claim(path, kind, options);
       if (!('record' in claimed)) return claimed;
-      hold = { count: 0, path, record: claimed.record, now: options.now ?? (() => new Date()), timers: options.timers ?? NODE_TIMERS };
+      hold = { count: 0, path, record: claimed.record, now: options.now ?? (() => new Date()), timers: options.timers ?? NODE_TIMERS, lost: new AbortController() };
       holds.set(key, hold);
       beat(key, hold);
     }
     hold.count++;
-    return { held: true, release: releaser(key, hold) };
+    return { held: true, release: releaser(key, hold), signal: hold.lost.signal };
   });
 }
 

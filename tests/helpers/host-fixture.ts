@@ -242,7 +242,7 @@ export interface FixtureOptions {
 /**
  * An OpenCodex Host loaded as a Cordis plugin (`ctx.plugin`, so `inject` is enforced as in DSH) on a fresh context that provides every
  * injected service as a plain object, over a temporary data directory. Resolves once the plugin has started; a startup error rejects. The
- * Host clock is `clock`, which stands at NOW until a test moves it.
+ * Host clock is `clock`, which stands at NOW until a test moves it; the lock's heartbeat runs on `lockTimers`, apart from the check timer.
  */
 export async function fixture(options: FixtureOptions = {}) {
   const directory = options.directory ?? await mkdtemp(join(tmpdir(), 'oc-host-'));
@@ -260,9 +260,10 @@ export async function fixture(options: FixtureOptions = {}) {
   ctx.provide('agentDefaultModel', dsh.agentDefaultModel as never);
   ctx.provide('approval', dsh.approval as never);
   const timers = fakeTimers();
+  const lockTimers = fakeTimers();
   const clock = fakeClock();
   const fiber = ctx.plugin(hostWith({
-    github: new GitHubClient({ gh: options.gh ?? codexGh() }), fetcher: options.feed ?? serve(FEED), now: clock.now, timers: timers.timers, reportPollMs: 2,
+    github: new GitHubClient({ gh: options.gh ?? codexGh() }), fetcher: options.feed ?? serve(FEED), now: clock.now, timers: timers.timers, lockTimers: lockTimers.timers, reportPollMs: 2,
     classifyRetryDelaysMs: options.classifyRetryDelaysMs ?? [1, 1], ...(options.timeouts && { timeouts: options.timeouts }),
   }) as never, { dataDirectory: directory } as never);
   const remove = () => rm(directory, { recursive: true, force: true });
@@ -274,6 +275,6 @@ export async function fixture(options: FixtureOptions = {}) {
   let unloaded = false;
   const unload = async () => { if (!unloaded) { unloaded = true; await fiber.dispose(); } };
   const close = async () => { await unload(); if (!options.directory) await remove(); };
-  return { plugin, ctx, directory, call, store, dsh, llm, timers, clock, descriptors, unload, close };
+  return { plugin, ctx, directory, call, store, dsh, llm, timers, lockTimers, clock, descriptors, unload, close };
 }
 export type Fixture = Awaited<ReturnType<typeof fixture>>;

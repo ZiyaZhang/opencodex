@@ -1,6 +1,7 @@
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import fsp, { mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ValidationError } from '../src/core/check.ts';
@@ -63,12 +64,12 @@ test('another live process whose heartbeat is under 5 minutes old keeps the lock
   assert.equal(b.timers.log.length, 0, 'nothing waits');
 }));
 
-test('a live holder whose heartbeat is over 5 minutes old is looked at again 30 seconds later, and keeps the lock if it beat meanwhile', inBench(async b => {
+test('a live holder whose heartbeat is over 5 minutes old is looked at again a minute later, and keeps the lock if it beat meanwhile', inBench(async b => {
   await b.write(foreignLock({ heartbeatAt: b.ago(6 * MINUTE) }));
   const taking = acquireLock(b.directory, 'check', b.options);
   await until(() => b.timers.armed.size === 1, 'the wait for a second look');
-  assert.deepEqual(b.timers.log.map(entry => entry.ms), [30_000]);
-  b.clock.advance(30_000);
+  assert.deepEqual(b.timers.log.map(entry => entry.ms), [60_000], 'two heartbeats, so a holder waking from sleep has beaten by then');
+  b.clock.advance(60_000);
   const awake = foreignLock({ heartbeatAt: b.clock.now().toISOString() });
   await b.write(awake);
   b.timers.fire();
@@ -81,7 +82,7 @@ test('a holder still over 5 minutes behind at the second look is taken over, its
   await b.write(frozen);
   const taking = acquireLock(b.directory, 'research', b.options);
   await until(() => b.timers.armed.size === 1, 'the wait for a second look');
-  b.clock.advance(30_000);
+  b.clock.advance(60_000);
   b.timers.fire();
   const lock = await taking;
   assert.ok(lock.held);
@@ -147,6 +148,16 @@ test('createLockFile puts the whole file in place only where there is none, and 
   assert.deepEqual(await readdir(b.directory), ['lock.json']);
 }));
 
+test('a takeover that finds another process\'s lock in the file it moved aside puts that lock back and refuses', inBench(async b => {
+  await b.write(foreignLock({ pid: GONE_PID }));
+  const rival = foreignLock({ startedAt: b.clock.now().toISOString() });
+  // Between this process's look at the gone holder and its move, the rival took the lock over.
+  const move: LockOptions['move'] = async (from, to) => { await b.write(rival); await rename(from, to); };
+  assert.deepEqual(await acquireLock(b.directory, 'check', { ...b.options, move }), { held: false, by: { pid: process.ppid, kind: 'check', startedAt: rival.startedAt } });
+  assert.deepEqual(await b.read(), rival, 'the rival\'s lock is back in place');
+  assert.deepEqual(await readdir(b.directory), ['lock.json'], 'no stale copy, nothing left aside');
+}));
+
 test('a damaged lock file counts as none', inBench(async b => {
   for (const text of ['{ not json', '[]', JSON.stringify(foreignLock({ pid: 0 })), JSON.stringify(foreignLock({ heartbeatAt: 'soon' }))]) {
     await writeFile(b.file, text);
@@ -157,7 +168,7 @@ test('a damaged lock file counts as none', inBench(async b => {
   }
 }));
 
-test('the heartbeat moves heartbeatAt every 30 seconds, and leaves alone a lock another process took over', inBench(async b => {
+test('the heartbeat moves heartbeatAt every 30 seconds, and skips a beat while the file is moved aside', inBench(async b => {
   const lock = await acquireLock(b.directory, 'check', b.options);
   assert.ok(lock.held);
   b.clock.advance(30_000);
@@ -165,14 +176,71 @@ test('the heartbeat moves heartbeatAt every 30 seconds, and leaves alone a lock 
   await until(() => b.timers.armed.size === 1, 'the next heartbeat');
   const beaten = await b.read();
   assert.deepEqual([beaten.startedAt, beaten.heartbeatAt], [NOW.toISOString(), b.clock.now().toISOString()]);
-  // This process stood still long enough for another one to take over: neither its heartbeat nor its release touches that lock.
-  const successor = foreignLock({ heartbeatAt: b.clock.now().toISOString() });
-  await b.write(successor);
+  // Another process moved the file aside to look at it, and puts it back.
+  const aside = join(b.directory, 'lock.aside');
+  await rename(b.file, aside);
   b.clock.advance(30_000);
   b.timers.fire();
+  await until(() => b.timers.armed.size === 1, 'the heartbeat after the skipped one');
+  assert.equal(await exists(b.file), false, 'no file is written while it is away');
+  await rename(aside, b.file);
+  b.clock.advance(30_000);
+  b.timers.fire();
+  await until(() => b.timers.armed.size === 1, 'the heartbeat after that');
+  assert.equal((await b.read()).heartbeatAt, b.clock.now().toISOString());
+  assert.equal(lock.signal.aborted, false);
   await lock.release();
-  assert.deepEqual(await b.read(), successor);
+  assert.equal(await exists(b.file), false);
+}));
+
+test('a hold whose lock another process took over ends: its runs are told to stop, and its release touches neither that lock nor a later hold', inBench(async b => {
+  const lost = await acquireLock(b.directory, 'check', b.options);
+  assert.ok(lost.held);
+  // This process stood still long enough for another one to take over.
+  const successor = foreignLock({ heartbeatAt: b.clock.now().toISOString() });
+  await b.write(successor);
+  b.timers.fire();
+  await until(() => lost.signal.aborted, 'the hold to end');
+  assert.match((lost.signal.reason as Error).message, /^数据目录锁被另一个 DSH 进程接管/);
   assert.equal(b.timers.armed.size, 0, 'the heartbeat stopped');
+  assert.deepEqual(await acquireLock(b.directory, 'research', b.options), { held: false, by: { pid: process.ppid, kind: 'check', startedAt: successor.startedAt } },
+    'the next acquisition claims anew instead of counting on the lost hold');
+  // The successor is gone in turn: this process takes the lock anew, and the release of the lost hold leaves the new one alone.
+  b.clock.advance(MINUTE);
+  await b.write(foreignLock({ pid: GONE_PID }));
+  const renewed = await acquireLock(b.directory, 'check', b.options);
+  assert.ok(renewed.held);
+  const text = await readFile(b.file, 'utf8');
+  await lost.release();
+  assert.equal(await readFile(b.file, 'utf8'), text);
+  b.clock.advance(MINUTE);
+  const again = await acquireLock(b.directory, 'check', b.options);
+  assert.ok(again.held);
+  assert.equal(await readFile(b.file, 'utf8'), text, 'taken again from the new hold, not claimed once more');
+  await again.release();
+  await renewed.release();
+  assert.equal(await exists(b.file), false);
+}));
+
+test('without hard links the lock file is created in place, and a lock moved aside by mistake is copied back', inBench(async b => {
+  mock.method(fsp, 'link', async () => { throw Object.assign(new Error('EPERM: operation not permitted, link'), { code: 'EPERM' }); });
+  syncBuiltinESMExports();
+  try {
+    const lock = await acquireLock(b.directory, 'check', b.options);
+    assert.ok(lock.held);
+    assert.equal((await b.read()).pid, process.pid);
+    assert.deepEqual(await readdir(b.directory), ['lock.json'], 'no temp file is left');
+    await lock.release();
+    await b.write(foreignLock({ pid: GONE_PID }));
+    const rival = foreignLock({ startedAt: b.clock.now().toISOString() });
+    const move: LockOptions['move'] = async (from, to) => { await b.write(rival); await rename(from, to); };
+    assert.deepEqual(await acquireLock(b.directory, 'check', { ...b.options, move }), { held: false, by: { pid: process.ppid, kind: 'check', startedAt: rival.startedAt } });
+    assert.deepEqual(await b.read(), rival);
+    assert.deepEqual(await readdir(b.directory), ['lock.json']);
+  } finally {
+    mock.restoreAll();
+    syncBuiltinESMExports();
+  }
 }));
 
 test('lockHolder names another live process with a fresh heartbeat, and takes nothing over', inBench(async b => {
@@ -214,5 +282,5 @@ test('LockedError names the process, what it runs and since when in local time, 
   assert.equal(checking.message, `另一个 DSH 进程正在检查（pid 4321，开始于 ${local}）`);
   assert.deepEqual(checking.by, { pid: 4321, kind: 'check', startedAt });
   assert.equal(new LockedError({ pid: 4321, kind: 'research', startedAt }).message, `另一个 DSH 进程正在调研（pid 4321，开始于 ${local}）`);
-  assert.equal(new LockedError({ pid: 0, kind: 'check', startedAt }).message, '另一个 DSH 进程正在检查（pid 未知）', 'a lost race whose winner never read whole');
+  assert.equal(new LockedError({ pid: 0, kind: 'check', startedAt }).message, '另一个 DSH 进程正在使用数据目录', 'a lost race whose winner never read whole');
 });
