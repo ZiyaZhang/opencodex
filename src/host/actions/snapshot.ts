@@ -13,8 +13,11 @@ const LIST_LIMIT = 800;
 /** Code points of a listed summary and of a listed classification rationale. */
 const SUMMARY_LIMIT = 300, RATIONALE_LIMIT = 120;
 
-/** What an action adds to the answer: the session it opened, the report it read, the record it returned. */
-export type ActionResult = Pick<OpenCodexResponse, 'startedSessionId' | 'report' | 'candidate'>;
+/**
+ * What an action adds to the answer: the session it opened, the report it read, the record, model list or start brief it returned, and
+ * what that lacks.
+ */
+export type ActionResult = Pick<OpenCodexResponse, 'startedSessionId' | 'report' | 'candidate' | 'models' | 'brief' | 'notice'>;
 
 const listedEvidence = (entry: Evidence): Evidence => (entry.url === undefined ? { kind: entry.kind, ref: entry.ref } : { kind: entry.kind, ref: entry.ref, url: entry.url });
 
@@ -57,11 +60,13 @@ function busyOf(ctx: HostContext): OpenCodexResponse['busy'] {
  * The answer to an action that has finished: the snapshot with `result` laid over it. Building the snapshot never fails the action. When
  * the list, the checkpoints, the check log or the lock file cannot be read, the answer goes without them and `notice` says so; a damaged
  * record is listed without what is damaged and named in `notice`; an answer that would pass the Remote's 4 MB bound goes without the list.
+ * The action's own `notice` comes first in `notice`, the snapshot's after it, joined by `；`.
  * The list holds the candidates `selected` picks, each as `listed` shows it; `totalCandidates` and `omittedCandidates` say how many there
  * are and how many it leaves out. The automatic research queue, and why its last run stopped short, come along when there are any.
  */
 export async function respond(ctx: HostContext, result: ActionResult = {}): Promise<OpenCodexResponse> {
-  const notices: string[] = [];
+  const { notice, ...fields } = result;
+  const notices: string[] = notice ? [notice] : [];
   let listing: Pick<OpenCodexResponse, 'candidates' | 'totalCandidates' | 'omittedCandidates'> = { candidates: [], totalCandidates: 0, omittedCandidates: 0 };
   try {
     const all = await ctx.store.list();
@@ -86,7 +91,7 @@ export async function respond(ctx: HostContext, result: ActionResult = {}): Prom
     hostPid: process.pid, ...(lock && { lock }),
     ...(index && { indexSummary: { entries: index.entries.length, commit: index.commit, builtAt: index.builtAt } }),
     ...(researchQueue.length > 0 && { researchQueue }), ...(researchNotice !== undefined && { researchNotice }),
-    ...result,
+    ...fields,
     ...(notices.length > 0 && { notice: notices.join('；') }),
   };
   if (JSON.stringify(response).length <= MAX_PAYLOAD) return response;

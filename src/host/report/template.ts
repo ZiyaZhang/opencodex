@@ -5,6 +5,26 @@
  * (when the prompt is sent; the report record's `generatedAt` is when the report was read).
  * The `## ` headings are the sections `checkReport` requires.
  */
+
+/**
+ * Evidence rules adapted from REA (`rea-agents`, https://github.com/morluto/rea, MIT; see THIRD_PARTY_NOTICES.md) and translated, numbered
+ * 1 to 7 here. The analyst session writes by 1 to 5, and the creator session's brief repeats 4 and 5, which hold for reading code too.
+ * Rule 6 (the questions first, a status for each at the end) is the table that opens 结论, so it is not a writing rule as well; rule 7
+ * (instructions found in the evidence) is in each session's prompt, worded for what that session can do about them.
+ */
+export const EVIDENCE_RULES = {
+  /** 1: an observation is something the evidence shows, with the citation; an inference is marked as one. */
+  observed: '观察只能来自证据目录里能查到的内容，并给出引用；推断要标明"推断"，写出置信度和别的可能解释。',
+  /** 2: a gap left out of the report reads as covered. */
+  unknowns: '证据不全、不支持或互相矛盾的地方都列为未知，不要省略。',
+  /** 3: in evidence that is not complete, what was not seen may still be there. */
+  unseen: '证据不完整时，"没看到"不能写成"没有"或"相同"。',
+  /** 4: desktop candidates are found by chunk names and i18n keys, which say what changed, not what it does. */
+  names: '不能只凭文件名、chunk 名、文案 key 或字符串推断行为。',
+  /** 5: the same distinction as present in the mirror source and enabled in the default profile. */
+  staticOnly: '静态分析看到的东西不能说成运行时可达或默认开启。',
+} as const;
+
 export const TEMPLATE: string = [
   '# {{title}}',
   '',
@@ -12,7 +32,7 @@ export const TEMPLATE: string = [
   '',
   '## 结论',
   '',
-  '一句话：做/可做/不做，工作量（小时或天），为什么。',
+  '先用两列表格列出这份报告要回答的问题和状态（已答 / 部分 / 未解决），再写一句话结论：做/可做/不做，工作量（小时或天），为什么。',
   '',
   '## Codex 怎么做的',
   '',
@@ -45,4 +65,9 @@ export const TEMPLATE: string = [
   '',
   '写作规则（照做，不写进报告）：平铺名词标题；先结论；不用比喻词；每段落不超过六行；数字放表格；凭公告文字写不出来的就写"未知"。',
   '区分“镜像源码里存在”与“默认 profile 里启用”，两者都写。',
+  EVIDENCE_RULES.observed,
+  EVIDENCE_RULES.unknowns,
+  EVIDENCE_RULES.unseen,
+  EVIDENCE_RULES.names,
+  EVIDENCE_RULES.staticOnly,
 ].join('\n');
