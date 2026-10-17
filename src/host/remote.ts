@@ -9,6 +9,7 @@ import { ValidationError, check } from '../core/check.js';
 import type { LockHolder } from '../core/lock.js';
 import type { CheckLogEntry } from '../core/run-log.js';
 import type { ModelRoute, Settings } from '../core/settings.js';
+import type { Brief } from './actions/brief.js';
 import type { ModelCatalog } from './actions/models.js';
 import type { CheckResult } from './collector.js';
 
@@ -17,7 +18,12 @@ export type OpenCodexRequest =
   | { action: 'check' }
   | { action: 'classify' }
   | { action: 'report'; id: string }
-  | { action: 'start'; id: string }
+  | { action: 'brief'; id: string }
+  /**
+   * Each of `instructions`, `model` and `preset` replaces, for this start only, `brief`'s task instructions (trimmed, 1 to 4,000
+   * characters), `startModel` and `startPreset` (empty for DSH's default); none of them is saved.
+   */
+  | { action: 'start'; id: string; instructions?: string; model?: ModelRoute; preset?: string }
   | { action: 'ignore'; id: string }
   | { action: 'restore'; id: string }
   | { action: 'readReport'; id: string }
@@ -56,6 +62,8 @@ export interface OpenCodexResponse {
   candidate?: Candidate;
   /** The DSH index in use, once one is loaded or built. */
   indexSummary?: { entries: number; commit: string; builtAt: string };
+  /** `brief`: the task instructions a start sends unless the page edits them, and what goes with them, which the page cannot edit. */
+  brief?: Brief;
   /** `start`: the creator-mode session just opened, for the page to switch to. */
   startedSessionId?: string;
   /** `models`: the providers DSH has registered, each with its models; one whose list could not be read has none, and `notice` names it. */
@@ -70,9 +78,15 @@ export interface OpenCodexResponse {
 /** Results above this many characters of JSON are refused, so the snapshot keeps far below it (see `OpenCodexResponse.candidates`). */
 export const MAX_PAYLOAD = 4_000_000;
 const BARE_ACTIONS: ReadonlySet<string> = new Set(['snapshot', 'check', 'classify', 'rebuildIndex', 'models']);
-const ID_ACTIONS: ReadonlySet<string> = new Set(['report', 'start', 'ignore', 'restore', 'readReport', 'candidate']);
+/** The actions that take a candidate id and nothing else; `start` may take more, and is checked on its own. */
+const ID_ACTIONS: ReadonlySet<string> = new Set(['report', 'brief', 'ignore', 'restore', 'readReport', 'candidate']);
 /** Candidate ids are `randomUUID()`s: lowercase, one path segment. */
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/**
+ * Characters (code points, so an emoji counts once) the task instructions of one start may have once trimmed: several times what the
+ * default ones take, so any edit of them fits, while the prompt stays mostly report.
+ */
+const INSTRUCTIONS_LIMIT = 4_000;
 /** The JSON type of every setting. The values themselves (absolute paths, ranges) are `mergeSettings`'s to check on the Host. */
 const SETTING_SHAPES = {
   channel: 'string', desktopPlistPath: 'string', desktopLocale: 'string', dshMirrorPath: 'string',
@@ -95,6 +109,39 @@ function onlyKeys(value: Record<string, unknown>, allowed: readonly string[], ac
   check(extra.length === 0, `${action} 不接受这些字段：${extra.map(key => JSON.stringify(key)).join('、')}`);
 }
 
+function candidateId(value: Record<string, unknown>, action: string): string {
+  check(typeof value.id === 'string' && UUID.test(value.id), `${action} 需要候选 id（小写 UUID）`);
+  return value.id;
+}
+
+/**
+ * A start: a candidate id and, each optional, task instructions (trimmed, 1 to `INSTRUCTIONS_LIMIT` characters, as a blank edit would
+ * leave the session without a task), a `{ provider, model }` route of non-empty strings and a preset name. A route with an empty part is
+ * refused here because the model switch comes after the session is created, and a switch that fails leaves that session without its task.
+ */
+function startRequest(value: Record<string, unknown>): OpenCodexRequest {
+  onlyKeys(value, ['action', 'id', 'instructions', 'model', 'preset'], 'start');
+  const request: Extract<OpenCodexRequest, { action: 'start' }> = { action: 'start', id: candidateId(value, 'start') };
+  const { instructions, model, preset } = value;
+  if (instructions !== undefined) {
+    check(typeof instructions === 'string', 'start 的 instructions 必须是字符串');
+    const trimmed = instructions.trim();
+    const length = Array.from(trimmed).length;
+    check(length > 0, '任务指令不能为空');
+    check(length <= INSTRUCTIONS_LIMIT, `任务指令最多 ${INSTRUCTIONS_LIMIT} 个字符，现在有 ${length} 个`);
+    request.instructions = trimmed;
+  }
+  if (model !== undefined) {
+    check(isRoute(model) && model.provider !== '' && model.model !== '', 'start 的 model 必须是 { provider, model }，两项都是非空字符串');
+    request.model = { provider: model.provider, model: model.model };
+  }
+  if (preset !== undefined) {
+    check(typeof preset === 'string', 'start 的 preset 必须是字符串');
+    request.preset = preset;
+  }
+  return request;
+}
+
 /** A copy of a settings patch that holds only `Settings` keys, each with a value of its JSON type: a string, a finite number, or a `{ provider, model }` route of strings. */
 function settingsPatch(value: unknown): Partial<Settings> {
   check(isRecord(value), 'settings 的 patch 必须是一个对象');
@@ -115,8 +162,8 @@ function settingsPatch(value: unknown): Partial<Settings> {
 
 /**
  * The request check `call` runs: the listed actions only, an `id` only where the action takes one and only as a candidate UUID, a settings
- * `patch` only with `Settings` keys of the right JSON type, and no other key anywhere. Returns a fresh copy; throws a ValidationError whose
- * message the page shows.
+ * `patch` only with `Settings` keys of the right JSON type, a start's own fields only as `startRequest` takes them, and no other key
+ * anywhere. Returns a fresh copy; throws a ValidationError whose message the page shows.
  */
 export function parseRequest(value: unknown): OpenCodexRequest {
   check(isRecord(value), 'OpenCodex 请求必须是一个 JSON 对象');
@@ -128,9 +175,9 @@ export function parseRequest(value: unknown): OpenCodexRequest {
   }
   if (ID_ACTIONS.has(action)) {
     onlyKeys(value, ['action', 'id'], action);
-    check(typeof value.id === 'string' && UUID.test(value.id), `${action} 需要候选 id（小写 UUID）`);
-    return { action, id: value.id } as OpenCodexRequest;
+    return { action, id: candidateId(value, action) } as OpenCodexRequest;
   }
+  if (action === 'start') return startRequest(value);
   if (action === 'settings') {
     onlyKeys(value, ['action', 'patch'], action);
     return { action, patch: settingsPatch(value.patch) };

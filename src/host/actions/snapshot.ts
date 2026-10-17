@@ -13,8 +13,11 @@ const LIST_LIMIT = 800;
 /** Code points of a listed summary and of a listed classification rationale. */
 const SUMMARY_LIMIT = 300, RATIONALE_LIMIT = 120;
 
-/** What an action adds to the answer: the session it opened, the report it read, the record or model list it returned, and what that lacks. */
-export type ActionResult = Pick<OpenCodexResponse, 'startedSessionId' | 'report' | 'candidate' | 'models' | 'notice'>;
+/**
+ * What an action adds to the answer: the session it opened, the report it read, the record, model list or start brief it returned, and
+ * what that lacks.
+ */
+export type ActionResult = Pick<OpenCodexResponse, 'startedSessionId' | 'report' | 'candidate' | 'models' | 'brief' | 'notice'>;
 
 const listedEvidence = (entry: Evidence): Evidence => (entry.url === undefined ? { kind: entry.kind, ref: entry.ref } : { kind: entry.kind, ref: entry.ref, url: entry.url });
 
