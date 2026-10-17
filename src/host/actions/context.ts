@@ -1,4 +1,5 @@
 /** The state the Host's actions share, and the helpers they all use. */
+import type { LlmRuntime } from '@deepseek-ai/dsh-llm';
 import type { LockKind, LockResult } from '../../core/lock.js';
 import type { Settings } from '../../core/settings.js';
 import type { CandidateStore } from '../../core/store.js';
@@ -7,9 +8,12 @@ import type { CheckResult } from '../collector.js';
 import type { GitHubClient } from '../github.js';
 import type { DshIndex } from '../index/dsh-index.js';
 import type { ReportHost } from '../report/report-session.js';
+import type { ModelCatalog } from './models.js';
 
 /** `ctx.llm` as classification uses it. */
 export type ClassifyLlm = Parameters<typeof classifyBatch>[0];
+/** `ctx.llm` as the `models` action uses it. */
+export type ModelsLlm = Pick<LlmRuntime, 'listProviders' | 'listConfigurableProviders' | 'listModels'>;
 /** The work on one candidate that only one request at a time may do. */
 export type Task = 'report' | 'start' | 'status';
 
@@ -46,8 +50,8 @@ export interface HostContext {
   readonly now: () => Date;
   /** Aborted when the plugin unloads. Long work runs under it rather than under one request's signal, so a page that goes away does not cut it short. */
   readonly signal: AbortSignal;
-  /** The DSH services, taken from the injected ones when the Host starts: session controller and agents for report and start (with the default model and approval for report), `llm` for classification. */
-  readonly services: ReportHost & { readonly llm: ClassifyLlm };
+  /** The DSH services, taken from the injected ones when the Host starts: session controller and agents for report and start (with the default model and approval for report), `llm` for classification and the model list. */
+  readonly services: ReportHost & { readonly llm: ClassifyLlm & ModelsLlm };
   /** How long a check, a `classify` action and the GitHub part of a report may take, in ms. */
   readonly timeouts: { readonly check: number; readonly classify: number; readonly github: number };
   /** The settings in force. */
@@ -66,6 +70,8 @@ export interface HostContext {
   readonly classifyRetryDelaysMs: readonly number[];
   /** The DSH index, once one is loaded or built. */
   index?: DshIndex;
+  /** The last model list in which every provider answered, and when it was read (Host clock, ms): `models` serves it for 5 minutes, a saved setting drops it. */
+  modelCatalog?: { readonly at: number; readonly models: ModelCatalog };
   /** The last check this process ran, and when it ended (ISO); a check that failed is recorded with an `errors` line. checks.jsonl has every process's. */
   lastCheck?: CheckResult;
   lastCheckAt?: string;

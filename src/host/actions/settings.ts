@@ -34,8 +34,9 @@ export async function loadSettings(directory: string): Promise<Readonly<Settings
 
 /**
  * The `settings` action: the patch over the settings in force, validated, written to settings.json, then put in force (which re-arms the
- * check timer). Writes run one at a time. A new mirror path is indexed right away, with `force`: the index of another mirror may well be
- * smaller, and the guard against a shrinking index would refuse it at every check. A failed build leaves the settings saved and says so.
+ * check timer). Writes run one at a time. A saved setting drops the kept model list, so the page reads DSH's providers afresh after a save.
+ * A new mirror path is indexed right away, with `force`: the index of another mirror may well be smaller, and the guard against a shrinking
+ * index would refuse it at every check. A failed build leaves the settings saved and says so.
  */
 export async function updateSettings(ctx: HostContext, patch: SettingsPatch): Promise<void> {
   const moved = await ctx.lanes.settings.run(async () => {
@@ -43,6 +44,7 @@ export async function updateSettings(ctx: HostContext, patch: SettingsPatch): Pr
     const next = mergeSettings(before, patch);
     await writeJsonAtomic(fileOf(ctx.directory), next);
     ctx.setSettings(next);
+    ctx.modelCatalog = undefined;
     return next.dshMirrorPath !== '' && next.dshMirrorPath !== before.dshMirrorPath;
   });
   if (!moved) return;

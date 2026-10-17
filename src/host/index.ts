@@ -23,6 +23,7 @@ import { classify } from './actions/classify.js';
 import { Lane, messageOf, type HostContext } from './actions/context.js';
 import { ignore, restore } from './actions/ignore-restore.js';
 import { rebuildIndex } from './actions/index.js';
+import { models } from './actions/models.js';
 import { readReport } from './actions/read-report.js';
 import { report } from './actions/report.js';
 import { loadSettings, updateSettings } from './actions/settings.js';
@@ -64,8 +65,10 @@ type TimerTrigger = Extract<CheckTrigger, 'startup' | 'timer'>;
 
 /**
  * What the actions call in DSH: the injected services, taken once. Never `ctx` itself, since a plugin context throws for a member it did not
- * inject, such as the `subagents` that `generateReport` would look for. `agentDefaultModel` and `approval` are typed on `Context` only by
- * packages this plugin does not depend on, so they are read with `ctx.get`, which skips the inject check (both are injected anyway).
+ * inject, such as the `subagents` that `generateReport` would look for. `llm` is the whole service: classification calls `prepareCall` on
+ * it, and the `models` action `listProviders`, `listConfigurableProviders` and `listModels`. `agentDefaultModel` and `approval` are typed
+ * on `Context` only by packages this plugin does not depend on, so they are read with `ctx.get`, which skips the inject check (both are
+ * injected anyway).
  */
 function servicesOf(ctx: Context): HostContext['services'] {
   return {
@@ -137,6 +140,7 @@ export default class OpenCodex extends TypertRemoteService {
       case 'readReport': return { report: await readReport(host, request.id) };
       case 'candidate': return { candidate: await candidate(host, request.id) };
       case 'rebuildIndex': await rebuildIndex(host); return {};
+      case 'models': return models(host);
       case 'settings': await updateSettings(host, request.patch); return {};
     }
   }

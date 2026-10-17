@@ -333,6 +333,82 @@ test('settings are saved and read back on the next start; a refused request is a
   } finally { await f.close(); }
 });
 
+/** DSH's providers: one whose configuration gives it a display name, one known only by the name it registered under. */
+const PROVIDERS = [{ id: 'deepseek-official', name: 'deepseek-official' }, { id: 'gateway', name: 'Gateway' }];
+/** The configurable providers: the first registered one, and one DSH has not registered. */
+const CONFIGURABLE = [
+  { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'deepseek', settingsPath: [] },
+  { provider: 'dormant', displayName: 'Dormant', settingsNs: 'dormant', settingsPath: [] },
+];
+/** `fakeLlm` that also lists DSH's providers and models, recording each provider asked; a `failing` one rejects, as DSH does for one without an adapter. */
+function modelLlm(failing: string[] = []) {
+  const listed: string[] = [];
+  return Object.assign(fakeLlm(), {
+    listed,
+    listProviders: () => PROVIDERS.map(provider => ({ ...provider })),
+    listConfigurableProviders: () => CONFIGURABLE.map(provider => ({ ...provider })),
+    async listModels(provider: string) {
+      listed.push(provider);
+      if (failing.includes(provider)) throw new Error(`no adapter for provider ${provider}`);
+      return provider === 'deepseek-official'
+        ? [{ provider, id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', description: 'pro' }, { provider, id: 'deepseek-flash', name: 'DeepSeek Flash' }]
+        : [{ provider, id: 'm1', name: 'Model One', inputModalities: ['text' as const] }];
+    },
+  });
+}
+const CATALOG = [
+  { provider: 'deepseek-official', providerName: 'DeepSeek', models: [{ id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' }, { id: 'deepseek-flash', name: 'DeepSeek Flash' }] },
+  { provider: 'gateway', providerName: 'Gateway', models: [{ id: 'm1', name: 'Model One' }] },
+];
+
+test('models lists the providers DSH has registered, by the names their configuration gives, each with its models', async () => {
+  const llm = modelLlm();
+  const f = await fixture({ llm });
+  try {
+    const response = await f.call({ action: 'models' });
+    assert.deepEqual(response.models, CATALOG);
+    assert.equal(response.notice, undefined);
+    assert.deepEqual(llm.listed, ['deepseek-official', 'gateway'], 'a configurable provider DSH has not registered is not asked');
+    assert.equal(response.hostPid, process.pid, 'the answer carries the snapshot');
+    assert.equal((await f.call({ action: 'snapshot' })).models, undefined, 'only models answers with the list');
+  } finally { await f.close(); }
+});
+
+test('a provider whose model list fails is listed without models and named in the notice, and the list is asked for again next time', async () => {
+  const llm = modelLlm(['gateway']);
+  const f = await fixture({ llm });
+  try {
+    await mkdir(join(f.directory, 'checks.jsonl'));
+    const response = await f.call({ action: 'models' });
+    assert.deepEqual(response.models, [CATALOG[0], { ...CATALOG[1], models: [] }]);
+    assert.match(response.notice ?? '', /^Gateway 的模型列表没取到：no adapter for provider gateway；checks\.jsonl 没能读出来：EISDIR/, 'the action notice, then the snapshot notice');
+    await f.call({ action: 'models' });
+    assert.deepEqual(llm.listed, ['deepseek-official', 'gateway', 'deepseek-official', 'gateway'], 'a list with a failure is not kept');
+  } finally { await f.close(); }
+});
+
+test('the model list is kept for five minutes by the Host clock and dropped when settings are saved', async () => {
+  const llm = modelLlm();
+  const f = await fixture({ llm });
+  try {
+    await f.call({ action: 'models' });
+    f.clock.advance(5 * MINUTE - 1);
+    assert.deepEqual((await f.call({ action: 'models' })).models, CATALOG);
+    assert.equal(llm.listed.length, 2, 'served from memory');
+    f.clock.advance(1);
+    assert.deepEqual((await f.call({ action: 'models' })).models, CATALOG);
+    assert.equal(llm.listed.length, 4, 'asked again five minutes on');
+    await f.call({ action: 'models' });
+    assert.equal(llm.listed.length, 4);
+    await f.call({ action: 'settings', patch: { dailyReportLimit: 3 } });
+    await f.call({ action: 'models' });
+    assert.equal(llm.listed.length, 6, 'a saved setting drops the kept list');
+    f.clock.advance(-1);
+    await f.call({ action: 'models' });
+    assert.equal(llm.listed.length, 8, 'a clock set back does not keep it either');
+  } finally { await f.close(); }
+});
+
 test('a new mirror path is indexed right away; a mirror that gives no index leaves the settings saved and says so', async () => {
   const f = await fixture();
   const empty = await mkdtemp(join(tmpdir(), 'oc-empty-mirror-'));
@@ -513,11 +589,12 @@ test('a check log that cannot be written becomes a log line of the check, and a 
 test('parseRequest accepts the listed actions only, with candidate UUIDs and settings of the right shape; the wire codec only wants an object', () => {
   const id = '9b2f3c1e-5d4a-4b6c-8e7f-0a1b2c3d4e5f';
   assert.deepEqual(parseRequest({ action: 'snapshot' }), { action: 'snapshot' });
+  assert.deepEqual(parseRequest({ action: 'models' }), { action: 'models' });
   assert.deepEqual(parseRequest({ action: 'report', id }), { action: 'report', id });
   assert.deepEqual(parseRequest({ action: 'settings', patch: { checkIntervalHours: 6, classifyModel: { provider: 'p', model: 'm' } } }),
     { action: 'settings', patch: { checkIntervalHours: 6, classifyModel: { provider: 'p', model: 'm' } } });
   const refused: unknown[] = [
-    null, [], 'snapshot', {}, { action: 'scan' }, { action: 'toString' }, { action: 'snapshot', id },
+    null, [], 'snapshot', {}, { action: 'scan' }, { action: 'toString' }, { action: 'snapshot', id }, { action: 'models', id },
     { action: 'report' }, { action: 'report', id: 'abc' }, { action: 'report', id: id.toUpperCase() }, { action: 'report', id: 7 },
     { action: 'start', id: `${id}/../x` }, { action: 'readReport', id, path: '/etc/passwd' },
     { action: 'settings' }, { action: 'settings', patch: [] }, { action: 'settings', patch: { bogus: 1 } }, { action: 'settings', patch: { __proto__: { x: 1 } } },

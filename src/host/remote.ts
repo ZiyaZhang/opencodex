@@ -9,6 +9,7 @@ import { ValidationError, check } from '../core/check.js';
 import type { LockHolder } from '../core/lock.js';
 import type { CheckLogEntry } from '../core/run-log.js';
 import type { ModelRoute, Settings } from '../core/settings.js';
+import type { ModelCatalog } from './actions/models.js';
 import type { CheckResult } from './collector.js';
 
 export type OpenCodexRequest =
@@ -22,6 +23,7 @@ export type OpenCodexRequest =
   | { action: 'readReport'; id: string }
   | { action: 'candidate'; id: string }
   | { action: 'rebuildIndex' }
+  | { action: 'models' }
   | { action: 'settings'; patch: Partial<Settings> };
 
 /** What every action answers once it has finished: the snapshot, plus the field of its own for the actions that return something. */
@@ -56,16 +58,18 @@ export interface OpenCodexResponse {
   indexSummary?: { entries: number; commit: string; builtAt: string };
   /** `start`: the creator-mode session just opened, for the page to switch to. */
   startedSessionId?: string;
+  /** `models`: the providers DSH has registered, each with its models; one whose list could not be read has none, and `notice` names it. */
+  models?: ModelCatalog;
   /**
-   * What this answer lacks though the action finished: the list, the checkpoints, the check log or the lock file could not be read, records
-   * were damaged, the list was too large.
+   * What this answer lacks though the action finished: a provider's model list could not be read (`models`); the list, the checkpoints, the
+   * check log or the lock file could not be read, records were damaged, the list was too large.
    */
   notice?: string;
 }
 
 /** Results above this many characters of JSON are refused, so the snapshot keeps far below it (see `OpenCodexResponse.candidates`). */
 export const MAX_PAYLOAD = 4_000_000;
-const BARE_ACTIONS: ReadonlySet<string> = new Set(['snapshot', 'check', 'classify', 'rebuildIndex']);
+const BARE_ACTIONS: ReadonlySet<string> = new Set(['snapshot', 'check', 'classify', 'rebuildIndex', 'models']);
 const ID_ACTIONS: ReadonlySet<string> = new Set(['report', 'start', 'ignore', 'restore', 'readReport', 'candidate']);
 /** Candidate ids are `randomUUID()`s: lowercase, one path segment. */
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
