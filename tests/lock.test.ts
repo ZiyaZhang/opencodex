@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ValidationError } from '../src/core/check.ts';
-import { LockedError, acquireLock, lockHolder, type LockOptions, type LockRecord } from '../src/core/lock.ts';
+import { LockedError, acquireLock, createLockFile, lockHolder, type LockOptions, type LockRecord } from '../src/core/lock.ts';
 import { GONE_PID, NOW, fakeClock, fakeTimers, foreignLock, until } from './helpers/host-fixture.ts';
 
 const MINUTE = 60_000;
@@ -18,7 +18,7 @@ async function bench() {
   const file = join(directory, 'lock.json');
   return {
     directory, clock, timers, file, stale: join(directory, 'lock.stale.json'),
-    options: { now: clock.now, timers: timers.timers } satisfies LockOptions,
+    options: { now: clock.now, timers: timers.timers, rereadMs: 1 } satisfies LockOptions,
     read: async (path = file) => JSON.parse(await readFile(path, 'utf8')) as LockRecord,
     write: (record: LockRecord) => writeFile(file, JSON.stringify(record)),
     /** The time `ms` before the clock. */
@@ -35,6 +35,7 @@ test('a free data directory is locked for this process, and the release deletes 
   const lock = await acquireLock(b.directory, 'check', b.options);
   assert.ok(lock.held);
   assert.deepEqual(await b.read(), { pid: process.pid, kind: 'check', startedAt: NOW.toISOString(), heartbeatAt: NOW.toISOString(), hostname: hostname() });
+  assert.deepEqual(await readdir(b.directory), ['lock.json'], 'no temp file is left');
   assert.deepEqual(b.timers.log.map(entry => entry.ms), [30_000], 'the heartbeat is armed');
   await lock.release();
   assert.equal(await exists(b.file), false);
@@ -112,6 +113,40 @@ test('a takeover that reads back another process\'s lock has lost the race to it
   assert.equal(b.timers.armed.size, 0, 'no heartbeat for a lock not held');
 }));
 
+test('a create that meets another process\'s lock already in place has lost the race, and the refusal names that process', inBench(async b => {
+  const rival = foreignLock({ startedAt: b.clock.now().toISOString() });
+  // The rival's file lands between this process's look and its create.
+  const create: LockOptions['create'] = async (path, text) => { await writeFile(path, JSON.stringify(rival)); await createLockFile(path, text); };
+  assert.deepEqual(await acquireLock(b.directory, 'check', { ...b.options, create }), { held: false, by: { pid: process.ppid, kind: 'check', startedAt: rival.startedAt } });
+  assert.deepEqual(await b.read(), rival);
+  assert.deepEqual(await readdir(b.directory), ['lock.json'], 'nothing is moved aside, and no temp file is left');
+}));
+
+test('a race lost to a file that never reads whole is a refusal by an unknown process, and nothing is taken over', inBench(async b => {
+  let creates = 0;
+  // The rival replaced this process's new file and has not written its record yet.
+  const create: LockOptions['create'] = async (path, text) => { creates++; await createLockFile(path, text); await writeFile(path, '{"pid":'); };
+  assert.deepEqual(await acquireLock(b.directory, 'check', { ...b.options, create }), { held: false, by: { pid: 0, kind: 'check', startedAt: b.clock.now().toISOString() } });
+  assert.equal(creates, 1, 'no second takeover');
+  assert.equal(await readFile(b.file, 'utf8'), '{"pid":', 'the rival keeps its file');
+  assert.equal(await exists(b.stale), false);
+  assert.equal(b.timers.armed.size, 0, 'no heartbeat for a lock not held');
+}));
+
+test('a create that keeps meeting a file is a refusal, never an error', inBench(async b => {
+  const create: LockOptions['create'] = async path => { await writeFile(path, '{'); throw Object.assign(new Error('EEXIST: file already exists'), { code: 'EEXIST' }); };
+  const result = await acquireLock(b.directory, 'research', { ...b.options, create });
+  assert.deepEqual(result, { held: false, by: { pid: 0, kind: 'check', startedAt: b.clock.now().toISOString() } });
+  assert.equal(await readFile(b.file, 'utf8'), '{');
+}));
+
+test('createLockFile puts the whole file in place only where there is none, and leaves no temp file either way', inBench(async b => {
+  await createLockFile(b.file, 'first\n');
+  await assert.rejects(createLockFile(b.file, 'second\n'), { code: 'EEXIST' });
+  assert.equal(await readFile(b.file, 'utf8'), 'first\n');
+  assert.deepEqual(await readdir(b.directory), ['lock.json']);
+}));
+
 test('a damaged lock file counts as none', inBench(async b => {
   for (const text of ['{ not json', '[]', JSON.stringify(foreignLock({ pid: 0 })), JSON.stringify(foreignLock({ heartbeatAt: 'soon' }))]) {
     await writeFile(b.file, text);
@@ -179,4 +214,5 @@ test('LockedError names the process, what it runs and since when in local time, 
   assert.equal(checking.message, `另一个 DSH 进程正在检查（pid 4321，开始于 ${local}）`);
   assert.deepEqual(checking.by, { pid: 4321, kind: 'check', startedAt });
   assert.equal(new LockedError({ pid: 4321, kind: 'research', startedAt }).message, `另一个 DSH 进程正在调研（pid 4321，开始于 ${local}）`);
+  assert.equal(new LockedError({ pid: 0, kind: 'check', startedAt }).message, '另一个 DSH 进程正在检查（pid 未知）', 'a lost race whose winner never read whole');
 });

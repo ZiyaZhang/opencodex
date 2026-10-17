@@ -163,6 +163,8 @@ DSH="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
 $DSH_HOME/opencodex/          没设 DSH_HOME 时是 ~/.dsh/opencodex/
 ├── settings.json             设置
 ├── state.json                检查点：各来源上次看到的 tag 和版本、RSS 哈希、索引的提交、每天的报告会话数
+├── checks.jsonl              每次检查一行，超过 2 MB 轮转为 checks.1.jsonl
+├── lock.json                 检查与自动调研的跨进程锁，含 pid 和心跳
 ├── candidates/<id>.json      每条候选一个文件
 ├── snapshots/                发布说明、仓库文件和桌面端的快照
 ├── index/dsh-index.json      DSH 索引
