@@ -1,6 +1,9 @@
 import { check, isRecord } from './check.js';
 
 export interface ModelRoute { provider: string; model: string }
+/** Which candidates a check or a classification queues for a report nobody asked for: none, the high-relevance ones, or the high- and medium-relevance ones. */
+export const AUTO_RESEARCH = ['off', 'high', 'medium'] as const;
+export type AutoResearch = typeof AUTO_RESEARCH[number];
 export interface Settings {
   channel: 'stable';
   desktopPlistPath: string;
@@ -15,6 +18,7 @@ export interface Settings {
   startModel: ModelRoute;
   dailyReportLimit: number;
   checkIntervalHours: number;
+  autoResearch: AutoResearch;
 }
 export type SettingsPatch = Partial<Settings>;
 
@@ -42,7 +46,7 @@ const PRO: ModelRoute = { provider: 'deepseek-official', model: 'deepseek-v4-pro
 export const DEFAULT_SETTINGS: Readonly<Settings> = frozen({
   channel: 'stable', desktopPlistPath: '/Applications/ChatGPT.app/Contents/Info.plist', desktopLocale: 'zh-CN', dshMirrorPath: '',
   classifyModel: { provider: 'deepseek-official', model: 'deepseek-flash' }, reportModel: PRO,
-  reportPreset: '', startPreset: 'cordis', startModel: PRO, dailyReportLimit: 10, checkIntervalHours: 24,
+  reportPreset: '', startPreset: 'cordis', startModel: PRO, dailyReportLimit: 10, checkIntervalHours: 24, autoResearch: 'high',
 });
 const KEYS = Object.keys(DEFAULT_SETTINGS) as Array<keyof Settings>;
 
@@ -64,6 +68,7 @@ export function validateSettings(value: Settings): void {
   check(typeof value.reportPreset === 'string', 'reportPreset must be a string');
   check(typeof value.startPreset === 'string', 'startPreset must be a string');
   check(isRoute(value.startModel), 'startModel needs a provider and a model');
+  check((AUTO_RESEARCH as readonly unknown[]).includes(value.autoResearch), 'autoResearch must be off, high or medium');
 }
 
 /**

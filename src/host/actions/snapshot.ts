@@ -58,7 +58,7 @@ function busyOf(ctx: HostContext): OpenCodexResponse['busy'] {
  * the list, the checkpoints, the check log or the lock file cannot be read, the answer goes without them and `notice` says so; a damaged
  * record is listed without what is damaged and named in `notice`; an answer that would pass the Remote's 4 MB bound goes without the list.
  * The list holds the candidates `selected` picks, each as `listed` shows it; `totalCandidates` and `omittedCandidates` say how many there
- * are and how many it leaves out.
+ * are and how many it leaves out. The automatic research queue, and why its last run stopped short, come along when there are any.
  */
 export async function respond(ctx: HostContext, result: ActionResult = {}): Promise<OpenCodexResponse> {
   const notices: string[] = [];
@@ -79,11 +79,13 @@ export async function respond(ctx: HostContext, result: ActionResult = {}): Prom
   let lock: LockHolder | undefined;
   try { lock = await lockHolder(ctx.directory, { now: ctx.now }); } catch (error) { notices.push(`lock.json 没能读出来：${messageOf(error)}`); }
   const { index, lastCheck, lastCheckAt } = ctx;
+  const researchQueue = ctx.research.queued, researchNotice = ctx.research.notice;
   const response: OpenCodexResponse = {
     settings: ctx.settings(), ...listing, checkpoints, busy: busyOf(ctx),
     ...(lastCheck && { lastCheck }), ...(lastCheckAt && { lastCheckAt }), ...(log.entry && { lastCheckLog: log.entry }),
     hostPid: process.pid, ...(lock && { lock }),
     ...(index && { indexSummary: { entries: index.entries.length, commit: index.commit, builtAt: index.builtAt } }),
+    ...(researchQueue.length > 0 && { researchQueue }), ...(researchNotice !== undefined && { researchNotice }),
     ...result,
     ...(notices.length > 0 && { notice: notices.join('；') }),
   };

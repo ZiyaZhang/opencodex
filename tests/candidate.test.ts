@@ -77,6 +77,7 @@ test('transition changes only status and updatedAt, so a restore keeps the repor
     classification: { category: 'cli-core', relevance: 'high', rationale: 'new tool surface' },
     report: { path: 'reports/c1/report.md', sessionId: 's1', generatedAt: T1, checks: { requiredSections: true, dshRefsTotal: 4, dshRefsResolved: 3 } },
     started: { sessionId: 's2', at: T1 },
+    research: { autoAttemptedAt: T0, lastError: '报告会话已中止' },
   };
   const snapshot = structuredClone(started);
 
@@ -86,7 +87,7 @@ test('transition changes only status and updatedAt, so a restore keeps the repor
   assert.deepEqual(ignored, { ...snapshot, status: 'ignored', updatedAt: T2 });
 
   const restored = transition(ignored, 'new', T3);
-  assert.deepEqual(restored, { ...snapshot, status: 'new', updatedAt: T3 }, 'report, started and classification survive a restore');
+  assert.deepEqual(restored, { ...snapshot, status: 'new', updatedAt: T3 }, 'report, started, classification and research survive a restore');
   assert.equal(restored.createdAt, T0);
 });
 

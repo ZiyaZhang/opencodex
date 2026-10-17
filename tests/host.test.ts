@@ -56,12 +56,15 @@ test('the Host registers its Remote descriptor and a first snapshot writes the d
     await f.store.setCheckpoint('lastStableTag', 'rust-v0.161.0');
     const response = await f.call({ action: 'snapshot' });
     assert.deepEqual(response.settings, DEFAULT_SETTINGS);
+    assert.equal(response.settings.autoResearch, 'high', 'automatic research is on for high relevance unless the settings say otherwise');
     assert.deepEqual(JSON.parse(await readFile(join(f.directory, 'settings.json'), 'utf8')), DEFAULT_SETTINGS);
     assert.deepEqual(response.checkpoints, { lastStableTag: 'rust-v0.161.0' }, 'checkpoints come from the store');
     assert.deepEqual([response.candidates, response.totalCandidates, response.omittedCandidates], [[], 0, 0]);
     assert.deepEqual(response.busy, { check: false, candidates: {} });
     assert.equal(response.hostPid, process.pid);
-    for (const key of ['lastCheck', 'lastCheckAt', 'lastCheckLog', 'lock', 'indexSummary', 'notice'] as const) assert.equal(response[key], undefined, key);
+    for (const key of ['lastCheck', 'lastCheckAt', 'lastCheckLog', 'lock', 'indexSummary', 'notice', 'researchQueue', 'researchNotice'] as const) {
+      assert.equal(response[key], undefined, key);
+    }
   } finally { await f.close(); }
 });
 
@@ -391,6 +394,9 @@ test('settings are saved and read back on the next start; a refused request is a
     const started = await f.call({ action: 'settings', patch: { startModel: { provider: 'p', model: 'pro' } } });
     assert.deepEqual(started.settings.startModel, { provider: 'p', model: 'pro' });
     await assert.rejects(f.call({ action: 'settings', patch: { startModel: { provider: '', model: 'm' } } }), remoteError('gateway/bad-request', /^startModel needs a provider and a model$/));
+    assert.equal((await f.call({ action: 'settings', patch: { autoResearch: 'medium' } })).settings.autoResearch, 'medium');
+    await assert.rejects(f.call({ action: 'settings', patch: { autoResearch: 'always' } } as never), remoteError('gateway/bad-request', /^autoResearch must be off, high or medium$/));
+    await assert.rejects(f.call({ action: 'settings', patch: { autoResearch: true } } as never), remoteError('gateway/bad-request', /^设置项 autoResearch 必须是字符串$/));
     assert.equal((JSON.parse(await readFile(join(f.directory, 'settings.json'), 'utf8')) as Settings).dailyReportLimit, 3);
     await assert.rejects(f.call({ action: 'settings', patch: { dailyReportLimit: '3' } } as never), remoteError('gateway/bad-request', /^设置项 dailyReportLimit 必须是数字$/));
     await assert.rejects(f.call({ action: 'settings', patch: { bogus: 1 } } as never), remoteError('gateway/bad-request', /^没有这个设置项："bogus"$/));
@@ -400,7 +406,10 @@ test('settings are saved and read back on the next start; a refused request is a
     assert.equal((JSON.parse(await readFile(join(f.directory, 'settings.json'), 'utf8')) as Settings).dailyReportLimit, 3, 'a refused patch writes nothing');
     await f.unload();
     const next = await fixture({ directory: f.directory, settings: null });
-    try { assert.equal((await next.call({ action: 'snapshot' })).settings.dailyReportLimit, 3); } finally { await next.close(); }
+    try {
+      const { settings } = await next.call({ action: 'snapshot' });
+      assert.deepEqual([settings.dailyReportLimit, settings.autoResearch], [3, 'medium']);
+    } finally { await next.close(); }
   } finally { await f.close(); }
 });
 
@@ -426,7 +435,8 @@ test('a check builds the index from the mirror path in force when its turn comes
   const gate = new Promise<void>(resolve => { release = resolve; });
   const calls: string[][] = [];
   const served = codexGh();
-  const f = await fixture({ settings: { dshMirrorPath: MIRROR }, gh: async (args, signal) => { calls.push(args); await gate; return served(args, signal); } });
+  // Automatic research off: the check's classification would otherwise start reports on what it found, which this test is not about.
+  const f = await fixture({ settings: { dshMirrorPath: MIRROR, autoResearch: 'off' }, gh: async (args, signal) => { calls.push(args); await gate; return served(args, signal); } });
   try {
     const first = await f.call({ action: 'rebuildIndex' });
     const running = f.call({ action: 'check' });
@@ -587,6 +597,7 @@ test('parseRequest accepts the listed actions only, with candidate UUIDs and set
   assert.deepEqual(parseRequest({ action: 'report', id }), { action: 'report', id });
   assert.deepEqual(parseRequest({ action: 'settings', patch: { checkIntervalHours: 6, classifyModel: { provider: 'p', model: 'm' } } }),
     { action: 'settings', patch: { checkIntervalHours: 6, classifyModel: { provider: 'p', model: 'm' } } });
+  assert.deepEqual(parseRequest({ action: 'settings', patch: { autoResearch: 'off' } }), { action: 'settings', patch: { autoResearch: 'off' } });
   const refused: unknown[] = [
     null, [], 'snapshot', {}, { action: 'scan' }, { action: 'toString' }, { action: 'snapshot', id },
     { action: 'report' }, { action: 'report', id: 'abc' }, { action: 'report', id: id.toUpperCase() }, { action: 'report', id: 7 },
@@ -595,7 +606,7 @@ test('parseRequest accepts the listed actions only, with candidate UUIDs and set
     { action: 'settings', patch: JSON.parse('{"__proto__":{"dailyReportLimit":1}}') },
     { action: 'settings', patch: { dailyReportLimit: '3' } }, { action: 'settings', patch: { dshMirrorPath: 7 } }, { action: 'settings', patch: { checkIntervalHours: Number.NaN } },
     { action: 'settings', patch: { reportModel: { provider: 'p' } } }, { action: 'settings', patch: { reportModel: { provider: 'p', model: 'm', key: 'x' } } },
-    { action: 'settings', patch: { reportModel: 'p/m' } }, { action: 'settings', patch: {}, extra: 1 },
+    { action: 'settings', patch: { reportModel: 'p/m' } }, { action: 'settings', patch: {}, extra: 1 }, { action: 'settings', patch: { autoResearch: true } },
   ];
   for (const value of refused) assert.throws(() => parseRequest(value), ValidationError, JSON.stringify(value));
   const [parameter] = OPEN_CODEX_DESCRIPTOR.parameters;
@@ -833,5 +844,119 @@ test('unloading aborts a running report and leaves the candidate as it was', asy
     const after = await f.store.get(candidate.id);
     assert.deepEqual([after.status, after.report], ['new', undefined]);
     assert.equal(await exists(join(f.directory, 'reports', candidate.id, 'report.md')), false);
+  } finally { await f.close(); }
+});
+
+/** Takes snapshots until one satisfies `done`, and returns it; fails the test after 5 seconds. */
+async function snapshotWhen(f: Fixture, done: (response: OpenCodexResponse) => boolean, what: string): Promise<OpenCodexResponse> {
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    const response = await f.call({ action: 'snapshot' });
+    if (done(response)) return response;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise(resolve => setTimeout(resolve, 2));
+  }
+}
+/** Three RSS candidates created a minute apart, oldest first; the clock stays a minute after the last. */
+async function threeItems(f: Fixture): Promise<[Candidate, Candidate, Candidate]> {
+  const seeded: Candidate[] = [];
+  for (const key of ['rss-a', 'rss-b', 'rss-c']) { seeded.push(await rssItem(f.store, key)); f.clock.advance(MINUTE); }
+  return seeded as [Candidate, Candidate, Candidate];
+}
+
+test('a check queues what is worth a report, its answer lists the queue, and the research starts after the check, outside it', async () => {
+  const f = await fixture({ settings: { dshMirrorPath: MIRROR }, gh: offlineGh, feed: serve('gone', 404) });
+  try {
+    const [oldest, middle, newest] = await threeItems(f);
+    const at = f.clock.now().toISOString();
+    f.dsh.hold();
+    const checked = await f.call({ action: 'check' });
+    assert.deepEqual(checked.researchQueue, ids([newest, middle, oldest]), 'high relevance, newest first');
+    assert.deepEqual(checked.busy, { check: false, candidates: {} }, 'the answer was made before any report started');
+    await until(() => f.dsh.prompts.length === 1, 'the first automatic report');
+    const running = await f.call({ action: 'snapshot' });
+    assert.deepEqual(running.busy, { check: false, candidates: { [newest.id]: 'report' } });
+    assert.deepEqual(running.researchQueue, ids([middle, oldest]));
+    assert.equal(JSON.parse(await readFile(lockFile(f), 'utf8')).kind, 'research', 'the check let go of the lock, the research holds it');
+    // A check asked for now runs on its own: the research is no part of the check before it, so there is nothing to join.
+    const again = await f.call({ action: 'check' });
+    assert.equal((await logLines(f)).length, 2);
+    assert.deepEqual(again.researchQueue, ids([middle, oldest]), 'queued again: nothing twice, and not the one running');
+    await f.unload();
+    assert.equal(await exists(lockFile(f)), false, 'the unload stopped the research and let go of the lock');
+    const stopped = await f.store.get(newest.id);
+    assert.deepEqual([stopped.status, stopped.research], ['new', { autoAttemptedAt: at }], 'an unload is no error of the candidate');
+    for (const left of [middle, oldest]) assert.equal((await f.store.get(left.id)).research, undefined);
+    assert.equal(f.dsh.created.length, 1);
+  } finally { await f.close(); }
+});
+
+test('the check the timer runs starts the research too, once it has ended', async () => {
+  const f = await fixture({ settings: { dshMirrorPath: MIRROR }, gh: offlineGh, feed: serve('gone', 404) });
+  try {
+    const candidate = await rssItem(f.store);
+    f.dsh.hold();
+    f.timers.fire();
+    await until(() => f.dsh.prompts.length === 1, 'the automatic report');
+    const running = await f.call({ action: 'snapshot' });
+    assert.deepEqual(running.busy, { check: false, candidates: { [candidate.id]: 'report' } });
+    assert.equal(running.lastCheckLog?.trigger, 'startup');
+  } finally { await f.close(); }
+});
+
+test('automatic research stops at the daily limit, and the snapshot says how many wait for tomorrow', async () => {
+  const f = await fixture({ settings: { dshMirrorPath: MIRROR, dailyReportLimit: 1 } });
+  try {
+    const [oldest, middle, newest] = await threeItems(f);
+    const at = f.clock.now().toISOString();
+    const classified = await f.call({ action: 'classify' });
+    assert.deepEqual(classified.researchQueue, ids([newest, middle, oldest]));
+    const stopped = await snapshotWhen(f, response => response.researchNotice !== undefined, 'the daily limit');
+    assert.equal(stopped.researchNotice, '今天的报告额度用完，还有 2 条明天继续');
+    assert.equal(stopped.researchQueue, undefined);
+    assert.deepEqual([find(stopped, newest.id)!.status, find(stopped, newest.id)!.research], ['reported', { autoAttemptedAt: at }]);
+    assert.deepEqual([find(stopped, middle.id)!.status, find(stopped, middle.id)!.research], ['new', { autoAttemptedAt: at }]);
+    assert.equal(find(stopped, oldest.id)!.research, undefined);
+    assert.equal(await f.store.checkpoint(COUNTER), '1');
+    assert.equal(f.dsh.created.length, 1);
+  } finally { await f.close(); }
+});
+
+test('research refused by another process\'s lock clears the queue, and the snapshot says so as a refused check does', async () => {
+  const f = await fixture({ settings: { dshMirrorPath: MIRROR } });
+  try {
+    const candidate = await rssItem(f.store);
+    await writeFile(lockFile(f), JSON.stringify(foreignLock()));
+    let refusal: string | undefined;
+    await assert.rejects(f.call({ action: 'check' }), (error: unknown) => { refusal = remoteErrorOf(error)?.message; return refusal !== undefined; });
+    const classified = await f.call({ action: 'classify' });
+    assert.deepEqual(classified.researchQueue, [candidate.id]);
+    const refused = await snapshotWhen(f, response => response.researchNotice !== undefined, 'the refusal');
+    assert.equal(refused.researchNotice, refusal);
+    assert.equal(refused.researchQueue, undefined);
+    assert.equal(find(refused, candidate.id)!.research, undefined);
+    assert.equal(f.dsh.created.length, 0);
+  } finally { await f.close(); }
+});
+
+test('a manual report goes ahead beside the queue, which then leaves that candidate alone', async () => {
+  const f = await fixture({ settings: { dshMirrorPath: MIRROR } });
+  try {
+    const [oldest, middle, newest] = await threeItems(f);
+    const at = f.clock.now().toISOString();
+    f.dsh.hold();
+    await f.call({ action: 'classify' });
+    await until(() => f.dsh.prompts.length === 1, 'the first automatic report');
+    await assert.rejects(f.call({ action: 'report', id: newest.id }), /正在生成报告/, 'one task per candidate, an automatic one included');
+    const manual = f.call({ action: 'report', id: middle.id });
+    await until(() => f.dsh.prompts.length === 2, 'the manual report, which does not wait for the queue');
+    f.dsh.open();
+    assert.equal(find(await manual, middle.id)!.status, 'reported');
+    const done = await snapshotWhen(f, response => find(response, oldest.id)?.status === 'reported' && Object.keys(response.busy.candidates).length === 0, 'the queue to finish');
+    assert.equal(done.researchQueue, undefined);
+    assert.deepEqual(find(done, newest.id)!.research, { autoAttemptedAt: at });
+    assert.equal(find(done, middle.id)!.research, undefined, 'the queue left the one reported by hand alone');
+    assert.deepEqual(find(done, oldest.id)!.research, { autoAttemptedAt: at });
+    assert.equal(f.dsh.created.length, 3);
   } finally { await f.close(); }
 });

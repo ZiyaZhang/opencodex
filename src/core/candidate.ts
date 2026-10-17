@@ -40,6 +40,11 @@ export interface Candidate {
   classification?: Classification;
   report?: ReportRecord;
   started?: { sessionId: string; at: string };
+  /**
+   * What automatic research did with the candidate: when it last tried (at most once a UTC day), and why that try failed. A new try
+   * replaces both, so `lastError` belongs to `autoAttemptedAt`. Absent until a first try.
+   */
+  research?: { autoAttemptedAt?: string; lastError?: string };
 }
 
 /** Allowed status moves. `reported -> reported` regenerates a report, `started -> started` opens another session, `started -> reported` regenerates the report after a start, `ignored -> new` is a manual restore. */
@@ -59,7 +64,7 @@ export function fingerprintOf(source: Source, key: string): string {
   check(!/[\u0000-\u001f\u007f\u0085\u2028\u2029]/.test(key), 'fingerprint key must be one line');
   return `${source}:${key}`;
 }
-/** Moves a candidate to `status` at time `at`. Only `status` and `updatedAt` change; every other field is history, so a restore (`ignored -> new`) keeps `report`, `started` and `classification`. */
+/** Moves a candidate to `status` at time `at`. Only `status` and `updatedAt` change; every other field is history, so a restore (`ignored -> new`) keeps `report`, `started`, `classification` and `research`. */
 export function transition(candidate: Candidate, status: Status, at: string): Candidate {
   check(Object.hasOwn(TRANSITIONS, candidate.status), `Unknown candidate status ${JSON.stringify(candidate.status)}`);
   check(canTransition(candidate.status, status), `Invalid transition ${candidate.status} -> ${status}`);

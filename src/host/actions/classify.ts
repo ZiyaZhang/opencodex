@@ -3,7 +3,8 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import type { Candidate, Classification, Status } from '../../core/candidate.js';
 import { isRecord } from '../../core/check.js';
 import { BATCH_SIZE, ClassifyError, classifyBatch } from '../classify.js';
-import { errorLine, withDeadline, type HostContext } from './context.js';
+import { errorLine, messageOf, withDeadline, type HostContext } from './context.js';
+import { enqueueResearch } from './research-queue.js';
 
 /** Failure codes of a model finish that a later try may well not see: the connection, not the request. */
 const TRANSIENT = new Set(['TRANSPORT', 'TIMEOUT']);
@@ -111,11 +112,13 @@ export function classifyPending(ctx: HostContext, signal: AbortSignal = ctx.sign
 }
 
 /**
- * The `classify` action: one pass, with 15 minutes (`timeouts.classify`) to finish. What it classified is saved either way; any problem
- * rejects the call with every problem line.
+ * The `classify` action: one pass, with 15 minutes (`timeouts.classify`) to finish, then what is worth a report goes in the automatic
+ * research queue, which the Host starts on once the action has ended. What it classified is saved either way; any problem, a failure to
+ * queue included (a `research:` line), rejects the call with every problem line.
  */
 export async function classify(ctx: HostContext): Promise<void> {
   const minutes = Math.round(ctx.timeouts.classify / 60_000);
   const problems = await withDeadline(ctx, ctx.timeouts.classify, `归类超过 ${minutes} 分钟还没结束，已停止；已归类的都已保存`, signal => classifyPending(ctx, signal));
+  try { await enqueueResearch(ctx); } catch (error) { problems.push(errorLine(`research: ${messageOf(error)}`)); }
   if (problems.length > 0) throw new Error(`归类没有全部完成：${problems.join('；')}`);
 }

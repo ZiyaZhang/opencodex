@@ -24,6 +24,17 @@ async function startedOn(ctx: HostContext, day: string): Promise<number> {
 }
 
 /**
+ * A report refused because the day's analyst sessions, with the reports admitted and not yet at their session, reach `dailyReportLimit`.
+ * A class of its own so that automatic research can tell it from a failure of the candidate: it stops the queue rather than going on.
+ */
+export class DailyLimitError extends Error {
+  constructor(taken: number, limit: number) {
+    super(`今天（UTC）的报告已有 ${taken} 份（含正在生成的），达到每日上限 ${limit} 份；明天再试，或在设置里调高每日报告上限`);
+    this.name = 'DailyLimitError';
+  }
+}
+
+/**
  * The daily limit counts analyst sessions: every one costs model tokens, the ones that time out or fail included. A report is admitted
  * when the sessions started today plus the reports admitted and not yet at their session stay under the limit; it counts once its
  * session is about to start (`countSession`), and leaves the admitted ones (`release`) if it ends before that. A run whose session never
@@ -33,7 +44,7 @@ async function startedOn(ctx: HostContext, day: string): Promise<number> {
 function admit(ctx: HostContext, day: string, limit: number): Promise<void> {
   return ctx.lanes.reports.run(async () => {
     const taken = await startedOn(ctx, day) + ctx.reportsRunning;
-    if (taken >= limit) throw new Error(`今天（UTC）的报告已有 ${taken} 份（含正在生成的），达到每日上限 ${limit} 份；明天再试，或在设置里调高每日报告上限`);
+    if (taken >= limit) throw new DailyLimitError(taken, limit);
     ctx.reportsRunning++;
   });
 }
@@ -104,7 +115,7 @@ async function setEvidenceAside(reportDir: string): Promise<{ putBack(): Promise
 /**
  * Writes the gap report of candidate `id`. Refused before anything happens when its status cannot move to `reported`, when no mirror path
  * is set, when the candidate has a task running, and when the day's analyst sessions, with the reports admitted before this one, reach
- * `dailyReportLimit`. Then:
+ * `dailyReportLimit` (a `DailyLimitError`). Then:
  * 1. the GitHub part, with 10 minutes (`timeouts.github`) to finish: the bare pull request entries are repaired, the diffs fetched;
  * 2. the evidence pack is built in `reports/<id>/evidence/` (index hits, diffs, and what could not be read), the earlier one set aside;
  * 3. one analyst session writes `reports/<id>/report.md` (it counts toward the day from here, unless it never came to exist); its failure

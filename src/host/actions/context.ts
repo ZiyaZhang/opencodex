@@ -7,6 +7,7 @@ import type { CheckResult } from '../collector.js';
 import type { GitHubClient } from '../github.js';
 import type { DshIndex } from '../index/dsh-index.js';
 import type { ReportHost } from '../report/report-session.js';
+import type { ResearchQueue } from './research-queue.js';
 
 /** `ctx.llm` as classification uses it. */
 export type ClassifyLlm = Parameters<typeof classifyBatch>[0];
@@ -75,6 +76,8 @@ export interface HostContext {
   readonly running: Map<string, Promise<unknown>>;
   /** Reports admitted against the daily limit whose analyst session has not started yet (a started one is in the day's counter). */
   reportsRunning: number;
+  /** The candidates a check or a classification queued for automatic research, and the worker that researches them. */
+  readonly research: ResearchQueue;
   /** One lane each for settings writes, the daily report counter, classification passes and index builds. */
   readonly lanes: { readonly settings: Lane; readonly reports: Lane; readonly classify: Lane; readonly index: Lane };
 }

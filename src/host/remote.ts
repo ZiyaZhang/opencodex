@@ -46,8 +46,12 @@ export interface OpenCodexResponse {
   hostPid: number;
   /** Another live DSH process holding the data-directory lock, and what for: a check asked for now is refused. */
   lock?: LockHolder;
-  /** Work in progress: a check, and the candidates with a report or a start running. */
+  /** Work in progress: a check, and the candidates with a report (asked for, or automatic research's) or a start running. */
   busy: { check: boolean; candidates: Record<string, 'report' | 'start'> };
+  /** The candidates waiting for automatic research, in the order it takes them; the one it is on shows in `busy` instead. Absent when none wait. */
+  researchQueue?: string[];
+  /** Why automatic research last stopped short: another process held the data directory, or the day's reports ran out. */
+  researchNotice?: string;
   /** `readReport`: the report, or empty text and a `notice` saying why there is none to show. */
   report?: { id: string; markdown: string; notice?: string };
   /** `candidate`: the whole record, evidence excerpts included. */
@@ -73,7 +77,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SETTING_SHAPES = {
   channel: 'string', desktopPlistPath: 'string', desktopLocale: 'string', dshMirrorPath: 'string',
   classifyModel: 'route', reportModel: 'route', reportPreset: 'string', startPreset: 'string', startModel: 'route',
-  dailyReportLimit: 'number', checkIntervalHours: 'number',
+  dailyReportLimit: 'number', checkIntervalHours: 'number', autoResearch: 'string',
 } as const satisfies Record<keyof Settings, 'string' | 'number' | 'route'>;
 const SHAPE_TEXT = { string: '字符串', number: '数字' } as const;
 

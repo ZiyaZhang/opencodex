@@ -4,6 +4,7 @@ import { appendCheckLog, type CheckTrigger } from '../../core/run-log.js';
 import { refreshIndex, runCheck, type CheckResult } from '../collector.js';
 import { classifyPending } from './classify.js';
 import { errorLine, joined, messageOf, withDeadline, type HostContext } from './context.js';
+import { enqueueResearch } from './research-queue.js';
 
 /** A check that failed as a whole: nothing collected, and one `check:` line that says why. */
 function failedCheck(error: unknown): CheckResult {
@@ -57,8 +58,10 @@ async function recordCheck(ctx: HostContext, result: CheckResult, startedAt: str
 
 /**
  * One check: the sources through `runCheck`, the index refresh, then the classification of the new candidates, whose problems join the
- * check's `errors` as `classify:` lines. The result is recorded (`recordCheck`); a check that fails as a whole is recorded too, with a `check:`
- * line, so a failed timer run shows on the page. A check asked for while one runs joins it, so the run is under the plugin's lifetime signal
+ * check's `errors` as `classify:` lines. What is worth a report then goes in the automatic research queue (`enqueueResearch`; a failure to
+ * queue is a `research:` line); the research itself starts once the check has ended, outside its joined run and its lock (the Host starts
+ * it). The result is recorded (`recordCheck`); a check that fails as a whole is recorded too, with a `check:` line, so a failed timer run
+ * shows on the page. A check asked for while one runs joins it, so the run is under the plugin's lifetime signal
  * and a deadline (`timeouts.check`), never one request's signal: a run that stalls, even waiting for its turn at the classification, gives
  * up at the deadline instead of holding every later check. The run holds the data-directory lock, taken inside the joined run so that a
  * second request of this process joins rather than meets it; while another live process holds it, the check is refused with a LockedError
@@ -81,6 +84,8 @@ export function check(ctx: HostContext, trigger: CheckTrigger): Promise<CheckRes
         const problems = await classifyPending(ctx, signal);
         return { ...result, ...(index && { index }), errors: [...result.errors, ...errors, ...problems.map(problem => errorLine(`classify: ${problem}`))] };
       }, lock.signal);
+      // The check has its result by now; failing to queue research costs it none of that.
+      try { await enqueueResearch(ctx); } catch (error) { checked.errors.push(errorLine(`research: ${messageOf(error)}`)); }
       await recordCheck(ctx, checked, startedAt, trigger);
       return checked;
     } catch (error) {
