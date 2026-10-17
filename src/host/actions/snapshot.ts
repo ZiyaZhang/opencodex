@@ -1,5 +1,6 @@
 /** The answer every action ends with, and the `candidate` action that returns one record whole. */
 import type { Candidate, Evidence } from '../../core/candidate.js';
+import { isRecord } from '../../core/check.js';
 import { lockHolder, type LockHolder } from '../../core/lock.js';
 import { readLastCheckLog } from '../../core/run-log.js';
 import type { Checkpoints } from '../../core/store.js';
@@ -15,7 +16,6 @@ const SUMMARY_LIMIT = 300, RATIONALE_LIMIT = 120;
 /** What an action adds to the answer: the session it opened, the report it read, the record it returned. */
 export type ActionResult = Pick<OpenCodexResponse, 'startedSessionId' | 'report' | 'candidate'>;
 
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const listedEvidence = (entry: Evidence): Evidence => (entry.url === undefined ? { kind: entry.kind, ref: entry.ref } : { kind: entry.kind, ref: entry.ref, url: entry.url });
 
 /**
@@ -77,7 +77,7 @@ export async function respond(ctx: HostContext, result: ActionResult = {}): Prom
   const log = await readLastCheckLog(ctx.directory);
   if (log.problem) notices.push(log.problem);
   let lock: LockHolder | undefined;
-  try { lock = await lockHolder(ctx.directory, { now: ctx.now }); } catch (error) { notices.push(`数据目录锁 lock.json 没能读出来：${messageOf(error)}`); }
+  try { lock = await lockHolder(ctx.directory, { now: ctx.now }); } catch (error) { notices.push(`lock.json 没能读出来：${messageOf(error)}`); }
   const { index, lastCheck, lastCheckAt } = ctx;
   const response: OpenCodexResponse = {
     settings: ctx.settings(), ...listing, checkpoints, busy: busyOf(ctx),

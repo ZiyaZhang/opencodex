@@ -75,7 +75,7 @@ test('a damaged last line gives way to the newest whole one, and a log with none
   await writeFile(log, '{ not json\n{"at":"2026-10-15T08:00:00.000Z"}\n');
   const { entry: none, problem } = await readLastCheckLog(directory);
   assert.equal(none, undefined);
-  assert.equal(problem, `检查日志 ${log} 的最后 64 KB 里没有一行完整的记录`);
+  assert.equal(problem, 'checks.jsonl 的最后 64 KB 里没有一行完整的记录');
 }));
 
 test('only the last 64 KB of the log are read', () => inDirectory(async (directory, log) => {
@@ -85,18 +85,17 @@ test('only the last 64 KB of the log are read', () => inDirectory(async (directo
   const { entry: none, problem } = await readLastCheckLog(directory);
   assert.equal(none, undefined, 'the whole line at the start is out of reach');
   assert.match(problem ?? '', /最后 64 KB 里没有一行完整的记录$/);
-  // The line the 64 KB edge cuts through is left out, not reported.
-  const lines = Array.from({ length: 400 }, (_, n) => JSON.stringify(entry(n % 10)));
-  await writeFile(log, `${lines.join('\n')}\n`);
-  assert.ok((await stat(log)).size > 64 * 1024);
-  assert.deepEqual(await readLastCheckLog(directory), { entry: entry(399 % 10) });
+  // The line the 64 KB edge cuts through is left out, even where its end alone would read as a whole line.
+  await writeFile(log, `{"damaged":${' '.repeat(70 * 1024)}${JSON.stringify(entry(2))}\n`);
+  const cut = await readLastCheckLog(directory);
+  assert.equal(cut.entry, undefined);
+  assert.match(cut.problem ?? '', /最后 64 KB 里没有一行完整的记录$/);
 }));
 
 test('a log that cannot be read is a problem, and one that cannot be written rejects', () => inDirectory(async (directory, log) => {
   await mkdir(log);
   const { entry: none, problem } = await readLastCheckLog(directory);
   assert.equal(none, undefined);
-  assert.ok(problem?.startsWith(`检查日志 ${log} 没能读出来：`), problem);
-  assert.match(problem ?? '', /EISDIR/);
+  assert.match(problem ?? '', /^checks\.jsonl 没能读出来：EISDIR/);
   await assert.rejects(appendCheckLog(directory, entry(1)), { code: 'EISDIR' });
 }));

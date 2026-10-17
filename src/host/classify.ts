@@ -4,6 +4,7 @@
  */
 import type { ConfigureCall, FinishReason, LlmRuntime, StreamChunk } from '@deepseek-ai/dsh-llm';
 import { CATEGORIES, RELEVANCES, type Candidate, type Classification } from '../core/candidate.js';
+import { isRecord } from '../core/check.js';
 import type { ModelRoute } from '../core/settings.js';
 import { clip } from './changelog-parser.js';
 
@@ -43,7 +44,6 @@ export class ClassifyError extends Error {
   }
 }
 
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const isCategory = (value: unknown): value is Classification['category'] => (CATEGORIES as readonly unknown[]).includes(value);
 const isRelevance = (value: unknown): value is Classification['relevance'] => (RELEVANCES as readonly unknown[]).includes(value);
 /** `text` on one line. Line breaks, with any blank lines among them, become `; ` so that the `key: text` lines of a desktop summary stay apart; other runs of whitespace and control characters become one space. */

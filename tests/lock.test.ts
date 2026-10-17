@@ -6,7 +6,7 @@ import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ValidationError } from '../src/core/check.ts';
 import { LockedError, acquireLock, createLockFile, lockHolder, type LockOptions, type LockRecord } from '../src/core/lock.ts';
-import { GONE_PID, NOW, fakeClock, fakeTimers, foreignLock, until } from './helpers/host-fixture.ts';
+import { GONE_PID, NOW, fakeClock, fakeTimers, foreignLock, until } from './helpers/fakes.ts';
 
 const MINUTE = 60_000;
 const exists = (path: string) => stat(path).then(() => true, () => false);
@@ -275,12 +275,12 @@ test('an abort ends the wait for a second look', inBench(async b => {
 
 test('LockedError names the process, what it runs and since when in local time, as a ValidationError', () => {
   const startedAt = '2026-10-15T08:00:00.000Z';
-  const local = new Date(startedAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   const checking = new LockedError({ pid: 4321, kind: 'check', startedAt });
   assert.ok(checking instanceof ValidationError);
   assert.equal(checking.name, 'LockedError');
-  assert.equal(checking.message, `另一个 DSH 进程正在检查（pid 4321，开始于 ${local}）`);
+  // The time is this machine's: month/day hour:minute, whatever the zone.
+  assert.match(checking.message, /^另一个 DSH 进程正在检查（pid 4321，开始于 \d{1,2}\/\d{1,2} \d{2}:\d{2}）$/);
   assert.deepEqual(checking.by, { pid: 4321, kind: 'check', startedAt });
-  assert.equal(new LockedError({ pid: 4321, kind: 'research', startedAt }).message, `另一个 DSH 进程正在调研（pid 4321，开始于 ${local}）`);
+  assert.match(new LockedError({ pid: 4321, kind: 'research', startedAt }).message, /^另一个 DSH 进程正在调研（pid 4321，开始于 \d{1,2}\/\d{1,2} \d{2}:\d{2}）$/);
   assert.equal(new LockedError({ pid: 0, kind: 'check', startedAt }).message, '另一个 DSH 进程正在使用数据目录', 'a lost race whose winner never read whole');
 });

@@ -3,7 +3,7 @@ import type { Dirent, Stats } from 'node:fs';
 import { lstat, readFile, readdir, stat } from 'node:fs/promises';
 import { basename, join, posix, relative, sep } from 'node:path';
 import { promisify } from 'node:util';
-import { check } from '../../core/check.js';
+import { check, isRecord } from '../../core/check.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -190,7 +190,6 @@ export async function buildDshIndex(mirror: string): Promise<DshIndex> {
 }
 
 const KINDS: readonly unknown[] = ['package', 'config', 'note', 'doc'];
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const isEntry = (value: unknown): value is IndexEntry => isRecord(value) && KINDS.includes(value.kind) && ['id', 'title', 'path', 'text'].every(key => typeof value[key] === 'string');
 /** Shape check for an index read back from disk: version 1, string fields and well-formed entries. An older or foreign file fails it and should be rebuilt. */
 export function isDshIndex(value: unknown): value is DshIndex {

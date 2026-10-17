@@ -8,8 +8,9 @@ import { constants, copyFile, link, mkdir, open, readFile, rename, unlink } from
 import { hostname } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { ValidationError } from './check.js';
+import { ValidationError, isRecord } from './check.js';
 import { writeJsonAtomic } from './store.js';
+import { NODE_TIMERS, type Timers } from './timers.js';
 
 export type LockKind = 'check' | 'research';
 /** Who holds the lock, as a refusal names it. */
@@ -18,12 +19,11 @@ export interface LockHolder { pid: number; kind: LockKind; startedAt: string }
 export interface LockRecord extends LockHolder { heartbeatAt: string; hostname: string }
 /** A hold, whose `signal` aborts if another process takes the lock over (this one stood still past the stale limit), or a refusal. */
 export type LockResult = { held: true; release(): Promise<void>; signal: AbortSignal } | { held: false; by: LockHolder };
-export interface LockTimers { set(run: () => void, ms: number): unknown; clear(handle: unknown): void }
 export interface LockOptions {
   /** The clock of `startedAt`, of the heartbeats and of their age; the system clock by default. */
   now?: () => Date;
   /** The timers of the heartbeat and of the wait before a second look at a holder that stopped beating; Node's timers, unref'd, by default. */
-  timers?: LockTimers;
+  timers?: Timers;
   /** Ends that wait. */
   signal?: AbortSignal;
   /** A test seam: puts a new lock file in place, failing with EEXIST when there is one; `createLockFile` by default. */
@@ -50,7 +50,6 @@ const WINNER_LOOKS = 5, REREAD_MS = 20;
 const UNKNOWN_PID = 0;
 /** What link() fails with where the file system has no hard links (exFAT, some network drives). */
 const NO_HARD_LINKS = new Set(['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS']);
-const NODE_TIMERS: LockTimers = { set: (run, ms) => setTimeout(run, ms).unref(), clear: handle => clearTimeout(handle as NodeJS.Timeout) };
 const KIND_TEXT: Record<LockKind, string> = { check: '检查', research: '调研' };
 
 const codeOf = (error: unknown) => (error as NodeJS.ErrnoException | null)?.code ?? '';
@@ -94,7 +93,7 @@ export async function createLockFile(path: string, text: string): Promise<void> 
 }
 
 /** This process's hold on one directory's lock file, shared by every run that took it; `lost` aborts once another process takes it over. */
-interface Hold { count: number; path: string; record: LockRecord; now: () => Date; timers: LockTimers; heartbeat?: unknown; lost: AbortController }
+interface Hold { count: number; path: string; record: LockRecord; now: () => Date; timers: Timers; heartbeat?: unknown; lost: AbortController }
 /** By resolved directory. */
 const holds = new Map<string, Hold>();
 /** Per resolved directory: acquisitions, heartbeats and releases run one at a time, so none reads the file while another is changing it. */
@@ -109,8 +108,8 @@ function serial<T>(key: string, work: () => Promise<T>): Promise<T> {
 }
 
 function recordOf(value: unknown): LockRecord | undefined {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
-  const { pid, kind, startedAt, heartbeatAt, hostname: host } = value as Record<string, unknown>;
+  if (!isRecord(value)) return undefined;
+  const { pid, kind, startedAt, heartbeatAt, hostname: host } = value;
   // pid 0 and negative pids name process groups for kill(), so they are no holder.
   const whole = Number.isInteger(pid) && (pid as number) > 0 && typeof kind === 'string' && Object.hasOwn(KIND_TEXT, kind) && typeof startedAt === 'string'
     && typeof heartbeatAt === 'string' && !Number.isNaN(Date.parse(heartbeatAt)) && typeof host === 'string';
@@ -143,7 +142,7 @@ const same = (a: LockRecord, b: LockRecord) => a.pid === b.pid && a.startedAt ==
 const otherLive = (record: LockRecord | undefined): record is LockRecord => record !== undefined && record.pid !== process.pid && alive(record.pid);
 
 /** Waits `ms` on `timers`; an abort of `signal` clears the timer and rejects with its reason. */
-function pause(ms: number, timers: LockTimers, signal?: AbortSignal): Promise<void> {
+function pause(ms: number, timers: Timers, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(signal.reason); return; }
     const abort = () => { timers.clear(handle); reject(signal!.reason); };

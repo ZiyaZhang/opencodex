@@ -1,4 +1,4 @@
-import { check } from './check.js';
+import { check, isRecord } from './check.js';
 
 export interface ModelRoute { provider: string; model: string }
 export interface Settings {
@@ -24,7 +24,6 @@ export type SettingsPatch = Partial<Settings>;
  */
 const MAX_CHECK_INTERVAL_HOURS = 168;
 
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 /** An absolute path, or empty for "off". */
 const isPathSetting = (value: unknown): boolean => typeof value === 'string' && (value === '' || value.startsWith('/'));
 const isRoute = (value: unknown): value is ModelRoute =>

@@ -1,13 +1,13 @@
 /** settings.json: read when the Host starts, written by the `settings` action. */
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { isRecord } from '../../core/check.js';
 import { DEFAULT_SETTINGS, mergeSettings, type Settings, type SettingsPatch } from '../../core/settings.js';
 import { writeJsonAtomic } from '../../core/store.js';
 import { messageOf, type HostContext } from './context.js';
 import { rebuildIndex } from './index.js';
 
 const fileOf = (directory: string) => join(directory, 'settings.json');
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 
 /**
  * The settings in `<directory>/settings.json`, with the defaults filling the keys an older file lacks; a missing file is written with the

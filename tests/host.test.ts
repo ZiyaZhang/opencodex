@@ -12,7 +12,8 @@ import type { CheckLogEntry } from '../src/core/run-log.ts';
 import { DEFAULT_SETTINGS, type Settings } from '../src/core/settings.ts';
 import { CandidateStore } from '../src/core/store.ts';
 import { MAX_PAYLOAD, OPEN_CODEX_DESCRIPTOR, parseRequest, type OpenCodexResponse } from '../src/host/remote.ts';
-import { FLAGS, GONE_PID, MIRROR, NOW, REPORT, classifyAll, codexGh, fakeLlm, fixture, foreignLock, offlineGh, serve, stalledGh, until, type Answer, type Fixture } from './helpers/host-fixture.ts';
+import { GONE_PID, NOW, foreignLock, until } from './helpers/fakes.ts';
+import { FLAGS, MIRROR, REPORT, classifyAll, codexGh, fakeLlm, fixture, offlineGh, serve, stalledGh, type Answer, type Fixture } from './helpers/host-fixture.ts';
 
 const COUNTER = 'reportsOn-2026-10-15';
 const MINUTE = 60_000;
@@ -44,6 +45,9 @@ const remoteError = (code: string, message: RegExp) => (error: unknown) => {
   assert.match(remote.message, message);
   return true;
 };
+const lockFile = (f: Fixture) => join(f.directory, 'lock.json');
+/** The lines of checks.jsonl, parsed. */
+const logLines = async (f: Fixture) => (await readFile(join(f.directory, 'checks.jsonl'), 'utf8')).split('\n').filter(Boolean).map(line => JSON.parse(line) as CheckLogEntry);
 
 test('the Host registers its Remote descriptor and a first snapshot writes the default settings', async () => {
   const f = await fixture({ settings: null });
@@ -377,11 +381,15 @@ test('a check that stalls gives up at its deadline, is recorded, and does not ho
     assert.ok(calls > first, 'the second check ran on its own instead of joining the stalled one');
     assert.match((await f.call({ action: 'snapshot' })).lastCheck!.errors[0]!, /^check: 检查超过/);
     assert.equal(f.timers.log.at(-1)!.ms, 24 * HOUR, 'a check that gave up still re-arms the timer');
+    // A check that failed as a whole is a line too: nothing collected, no window, and the one check: line.
+    const lines = await logLines(f);
+    assert.equal(lines.length, 2);
+    for (const line of lines) {
+      assert.deepEqual([line.trigger, line.window, line.added, line.errors, line.index],
+        ['manual', null, { releases: 0, files: 0, desktop: 0, rss: 0 }, ['check: 检查超过 0 分钟还没结束，已停止'], undefined]);
+    }
   } finally { await f.close(); }
 });
-
-const lockFile = (f: Fixture) => join(f.directory, 'lock.json');
-const logLines = async (f: Fixture) => (await readFile(join(f.directory, 'checks.jsonl'), 'utf8')).split('\n').filter(Boolean).map(line => JSON.parse(line) as CheckLogEntry);
 
 test('checks one after the other each take the lock, let it go and append a line, which snapshots and a restarted Host read back', async () => {
   const f = await fixture();
@@ -424,13 +432,13 @@ test('a check refused by another process\'s lock is a bad request, writes no lin
     assert.deepEqual(refused.lock, { pid: process.ppid, kind: 'check', startedAt: holder.startedAt });
     // The timer's try is refused the same way; the one after the other process lets go runs.
     f.timers.fire();
-    await until(() => f.timers.log.length === 4, 'the timer check to be refused');
+    await until(() => f.timers.armed.size === 1, 'the timer check to be refused');
     assert.equal(f.timers.log.at(-1)!.ms, 10 * MINUTE);
     assert.equal((await logLines(f)).length, 1, 'no line for a check that did not run');
     assert.deepEqual(JSON.parse(await readFile(lockFile(f), 'utf8')), holder, 'the other process keeps its lock');
     await rm(lockFile(f));
     f.timers.fire();
-    await until(() => f.timers.log.length === 5, 'the timer check to run');
+    await until(() => f.timers.armed.size === 1, 'the timer check to run');
     assert.deepEqual((await logLines(f)).map(line => line.trigger), ['manual', 'timer']);
     assert.equal(f.timers.log.at(-1)!.ms, 24 * HOUR);
   } finally { await f.close(); }
@@ -487,14 +495,18 @@ test('a check whose lock another process takes over stops, and is recorded as fa
   } finally { await f.close(); }
 });
 
-test('a check log that cannot be written becomes a log line of the check, and one that cannot be read a notice', async () => {
+test('a check log that cannot be written becomes a log line of the check, and a check log or lock file that cannot be read a notice', async () => {
   const f = await fixture();
   try {
     await mkdir(join(f.directory, 'checks.jsonl'));
     const response = await f.call({ action: 'check' });
     assert.match(response.lastCheck!.errors.at(-1)!, /^log: EISDIR/);
     assert.equal(response.lastCheckLog, undefined);
-    assert.match(response.notice ?? '', /^检查日志 .*checks\.jsonl 没能读出来：EISDIR/);
+    assert.match(response.notice ?? '', /^checks\.jsonl 没能读出来：EISDIR/);
+    await mkdir(lockFile(f));
+    const both = await f.call({ action: 'snapshot' });
+    assert.equal(both.lock, undefined);
+    assert.match(both.notice ?? '', /^checks\.jsonl 没能读出来：EISDIR[^；]*；lock\.json 没能读出来：EISDIR/);
   } finally { await f.close(); }
 });
 

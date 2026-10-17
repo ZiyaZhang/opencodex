@@ -1,10 +1,9 @@
 /**
  * The Host test bench: an OpenCodex Host loaded as a Cordis plugin over a temporary data directory, with DSH, the model, GitHub, the RSS
- * feed, the timers and the clock replaced by fakes the tests drive, and the lock file another DSH process would leave in the directory.
+ * feed, the timers and the clock replaced by fakes the tests drive (the Host-free ones are in fakes.ts).
  */
-import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { hostname, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Context } from '@deepseek-ai/cordis';
@@ -13,18 +12,16 @@ import type { FinishReason, GenerateOptions, LlmCallConfig, StreamChunk } from '
 import { SessionId } from '@deepseek-ai/dsh-session';
 import type { SessionCancelRequest, SessionCreateRequest, SessionPromptRequest, SessionRenameRequest, SessionSelectModelRequest } from '@deepseek-ai/dsh-api-session-controller/types';
 import type { InvocationDescriptor } from '@deepseek-ai/dsh-typert-protocol';
-import type { LockRecord } from '../../src/core/lock.ts';
 import { DEFAULT_SETTINGS, type Settings } from '../../src/core/settings.ts';
 import { CandidateStore } from '../../src/core/store.ts';
 import { GitHubClient, type GhRunner } from '../../src/host/github.ts';
-import OpenCodex, { type Config, type Dependencies, type Timers } from '../../src/host/index.ts';
+import OpenCodex, { type Config, type Dependencies } from '../../src/host/index.ts';
 import type { OpenCodexRequest } from '../../src/host/remote.ts';
+import { fakeClock, fakeTimers } from './fakes.ts';
 
 export const MIRROR = fileURLToPath(new URL('../fixtures/mirror/', import.meta.url));
 const RELEASE = await readFile(new URL('../fixtures/release-0.162.0.md', import.meta.url), 'utf8');
 const FEED = await readFile(new URL('../fixtures/changelog-rss-sample.xml', import.meta.url), 'utf8');
-// The RSS fixture's items are dated Aug-Oct 2026; the clock is pinned so the parser's 120-day window never drifts.
-export const NOW = new Date('2026-10-15T08:00:00.000Z');
 
 /** A report as an analyst session leaves it, citing a file of the fixture mirror. */
 export const REPORT = [
@@ -93,52 +90,6 @@ export const stalledGh: GhRunner = (_args, signal) => whenAborted(signal!);
 export function serve(body: string, status = 200, calls: { count: number } = { count: 0 }): typeof fetch {
   return async () => { calls.count++; return new Response(body, { status }); };
 }
-/** Waits until `condition` holds, and fails the test after `ms`. */
-export async function until(condition: () => boolean, what: string, ms = 5_000): Promise<void> {
-  const deadline = Date.now() + ms;
-  while (!condition()) {
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
-    await new Promise(resolve => setTimeout(resolve, 1));
-  }
-}
-
-/** A timer table the test fires by hand. */
-export function fakeTimers() {
-  const armed = new Map<number, { run: () => void; ms: number }>();
-  const log: Array<{ handle: number; ms: number }> = [];
-  const cleared: number[] = [];
-  let last = 0;
-  const timers: Timers = {
-    set(run, ms) { const handle = ++last; armed.set(handle, { run, ms }); log.push({ handle, ms }); return handle; },
-    clear(handle) { cleared.push(handle as number); armed.delete(handle as number); },
-  };
-  return {
-    timers, armed, log, cleared,
-    /** Runs the one armed timer. */
-    fire() {
-      assert.equal(armed.size, 1, 'exactly one timer is armed');
-      const [[handle, entry]] = [...armed];
-      armed.delete(handle);
-      entry.run();
-    },
-  };
-}
-
-/** A clock that stands still at `start` until the test moves it. */
-export function fakeClock(start: Date = NOW) {
-  let at = start.getTime();
-  return {
-    now: () => new Date(at),
-    /** Moves the clock by `ms`. */
-    advance(ms: number) { at += ms; },
-  };
-}
-
-/** No process has this pid: Linux and macOS both keep pids below 2^22. */
-export const GONE_PID = 2 ** 22 + 1;
-/** `lock.json` as another DSH process leaves it: by default the parent of this test process, which is alive, checking since NOW and beating at NOW. */
-export const foreignLock = (fields: Partial<LockRecord> = {}): LockRecord =>
-  ({ pid: process.ppid, kind: 'check', startedAt: NOW.toISOString(), heartbeatAt: NOW.toISOString(), hostname: hostname(), ...fields });
 
 /** The ids of the candidate blocks in a classification request. */
 function idsOf(request: GenerateOptions): string[] {

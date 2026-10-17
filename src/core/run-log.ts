@@ -4,6 +4,7 @@
  */
 import { mkdir, open, rename, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import { isRecord } from './check.js';
 
 export type CheckTrigger = 'startup' | 'timer' | 'manual' | 'run-once';
 /** One line of the log: one check from its start to its end. */
@@ -33,7 +34,6 @@ const TAIL_BYTES = 64 * 1024;
 const TRIGGERS: ReadonlySet<string> = new Set<CheckTrigger>(['startup', 'timer', 'manual', 'run-once']);
 const NEWLINE = 0x0a;
 
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const isCount = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
 const isTag = (value: unknown) => value === undefined || typeof value === 'string';
 
@@ -97,7 +97,7 @@ export async function readLastCheckLog(directory: string): Promise<{ entry?: Che
     } finally { await handle.close(); }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
-    return { problem: `检查日志 ${path} 没能读出来：${(error as Error).message}` };
+    return { problem: `${LOG} 没能读出来：${(error as Error).message}` };
   }
   const lines = tail.split('\n');
   // Where the tail starts inside the file, its first piece is the end of a line whose start was not read.
@@ -109,5 +109,5 @@ export async function readLastCheckLog(directory: string): Promise<{ entry?: Che
     const entry = entryOf(value);
     if (entry) return { entry };
   }
-  return { problem: `检查日志 ${path} 的最后 64 KB 里没有一行完整的记录` };
+  return { problem: `${LOG} 的最后 64 KB 里没有一行完整的记录` };
 }

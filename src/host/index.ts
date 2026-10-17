@@ -14,6 +14,7 @@ import { ValidationError } from '../core/check.js';
 import { LockedError, acquireLock, type LockKind, type LockOptions, type LockResult } from '../core/lock.js';
 import type { CheckTrigger } from '../core/run-log.js';
 import { CandidateStore } from '../core/store.js';
+import { NODE_TIMERS, type Timers } from '../core/timers.js';
 import { loadIndex, type CheckResult } from './collector.js';
 import { GitHubClient } from './github.js';
 import type { ReportHost } from './report/report-session.js';
@@ -30,8 +31,7 @@ import { start } from './actions/start.js';
 import { OPEN_CODEX_DESCRIPTOR, parseRequest, type OpenCodexRequest, type OpenCodexResponse } from './remote.js';
 
 export interface Config { dataDirectory?: string }
-/** Arms and clears the check timer. */
-export interface Timers { set(run: () => void, ms: number): unknown; clear(handle: unknown): void }
+export type { Timers } from '../core/timers.js';
 /** Replacements for tests; the plugin loader passes none. */
 export interface Dependencies {
   /** Serves every GitHub request; a new `GitHubClient` per run by default. */
@@ -39,7 +39,7 @@ export interface Dependencies {
   /** Serves the RSS feed instead of the proxy-aware public network. */
   fetcher?: typeof fetch;
   now?: () => Date;
-  /** Node's timers, unref'd, by default. */
+  /** The check timer; Node's timers, unref'd, by default. */
   timers?: Timers;
   /** The timers of the data-directory lock's heartbeat and second look; Node's timers, unref'd, by default. */
   lockTimers?: Timers;
@@ -59,7 +59,6 @@ const FIRST_CHECK_DELAY_MS = 60_000;
 const LOCKED_RETRY_MS = 10 * 60_000;
 const TIMEOUTS: HostContext['timeouts'] = { check: 30 * 60_000, classify: 15 * 60_000, github: 10 * 60_000 };
 const CLASSIFY_RETRY_DELAYS_MS = [5_000, 20_000];
-const NODE_TIMERS: Timers = { set: (run, ms) => setTimeout(run, ms).unref(), clear: handle => clearTimeout(handle as NodeJS.Timeout) };
 /** What the timer starts: the first check after the Host starts, or a later one. */
 type TimerTrigger = Extract<CheckTrigger, 'startup' | 'timer'>;
 
