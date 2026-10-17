@@ -21,7 +21,7 @@ const route = { provider: 'p', model: 'm' };
 const never = () => new AbortController().signal;
 const candidate = (id: string, fields: Partial<BatchCandidate> = {}): BatchCandidate => ({ id, source: 'codex-release', title: `title ${id}`, summary: `summary ${id}`, ...fields });
 /** One answer element; `fields` override or, set to `undefined`, leave out a member. */
-const item = (id: string, fields: Record<string, unknown> = {}) => ({ id, category: 'cli-core', relevance: 'high', rationale: 'r', ...fields });
+const item = (id: string, fields: Record<string, unknown> = {}) => ({ id, category: 'cli-core', relevance: 'high', headline: 'h', gist: 'g', rationale: 'r', ...fields });
 const answer = (...items: unknown[]) => JSON.stringify(items);
 /** The request fields `LlmRuntime` compares with the prepared config before dispatch. */
 const CALL_FIELDS = ['provider', 'model', 'reasoningEffort', 'temperature', 'maxTokens', 'stop'] as const;
@@ -104,12 +104,12 @@ test('parseClassification drops elements with an unknown id, category or relevan
     item('a', { category: 'nope' }), item('b', { relevance: 'urgent' }), item('c', { relevance: undefined }), item('d', { category: 'Desktop' }),
     item('outside'), null, 'e', ['e'], 7, item('e', { category: 'model', relevance: 'low' }),
   ), new Set(['a', 'b', 'c', 'd', 'e']));
-  assert.deepEqual([...parsed.entries()], [['e', { category: 'model', relevance: 'low', rationale: 'r' }]]);
+  assert.deepEqual([...parsed.entries()], [['e', { category: 'model', relevance: 'low', headline: 'h', gist: 'g', rationale: 'r' }]]);
 });
 
 test('parseClassification keeps the first valid element of an id', () => {
   const parsed = parseClassification(answer(item('a', { category: 'nope', rationale: 'invalid' }), item('a', { category: 'desktop', rationale: 'first' }), item('a', { category: 'fix', rationale: 'second' })), new Set(['a']));
-  assert.deepEqual(parsed.get('a'), { category: 'desktop', relevance: 'high', rationale: 'first' });
+  assert.deepEqual(parsed.get('a'), { category: 'desktop', relevance: 'high', headline: 'h', gist: 'g', rationale: 'first' });
 });
 
 test('parseClassification keeps mergedInto only when it names a candidate earlier in the batch', () => {
@@ -117,7 +117,7 @@ test('parseClassification keeps mergedInto only when it names a candidate earlie
   const parsed = parseClassification(answer(
     item('b', { mergedInto: 'a' }), item('a', { mergedInto: 'b' }), item('c', { mergedInto: 'c' }), item('d', { mergedInto: 'outside' }), item('e', { mergedInto: 7 }),
   ), new Set(['a', 'b', 'c', 'd', 'e']));
-  const plain = { category: 'cli-core', relevance: 'high', rationale: 'r' };
+  const plain = { category: 'cli-core', relevance: 'high', headline: 'h', gist: 'g', rationale: 'r' };
   assert.deepEqual(Object.fromEntries(parsed), { a: plain, b: { ...plain, mergedInto: 'a' }, c: plain, d: plain, e: plain });
 });
 
@@ -129,6 +129,30 @@ test('parseClassification puts the rationale on one line and clips it to 300 cod
   assert.equal(parsed.get('b')?.rationale, '第一行; 第二行');
   assert.equal(parsed.get('c')?.rationale, '');
   assert.equal(parsed.get('d')?.rationale, '');
+});
+
+test('parseClassification puts the headline and the gist on one line and cuts them at 20 and 60 code points, never back to a space', () => {
+  const spaced = 'fork 子会话保留父级历史并同步状态和权限';
+  assert.equal([...spaced].length, 22);
+  const parsed = parseClassification(answer(
+    item('a', { headline: spaced, gist: '😀'.repeat(100) }),
+    item('b', { headline: ' Composer \t 输入预测 ', gist: ' 第一句\n\n第二句 ' }),
+    item('c', { headline: '名'.repeat(20), gist: '句'.repeat(60) }),
+  ), new Set(['a', 'b', 'c']));
+  // Cut at the limit: going back to the space would leave only `fork…`.
+  assert.equal(parsed.get('a')?.headline, 'fork 子会话保留父级历史并同步状态…');
+  const gist = parsed.get('a')?.gist ?? '';
+  assert.equal([...gist].length, 60);
+  assert.match(gist, /^(?:😀)+…$/u); // cut between code points, never inside a surrogate pair
+  assert.deepEqual([parsed.get('b')?.headline, parsed.get('b')?.gist], ['Composer 输入预测', '第一句; 第二句']);
+  assert.deepEqual([parsed.get('c')?.headline, parsed.get('c')?.gist], ['名'.repeat(20), '句'.repeat(60)], 'a text at the limit stays whole');
+});
+
+test('parseClassification leaves a headline or gist that is missing, blank or not a string empty', () => {
+  const parsed = parseClassification(answer(
+    item('a', { headline: undefined, gist: undefined }), item('b', { headline: 7, gist: null }), item('c', { headline: ['h'], gist: { text: 'g' } }), item('d', { headline: ' \n ', gist: '' }),
+  ), new Set(['a', 'b', 'c', 'd']));
+  for (const id of ['a', 'b', 'c', 'd']) assert.deepEqual(parsed.get(id), { category: 'cli-core', relevance: 'high', headline: '', gist: '', rationale: 'r' }, id);
 });
 
 test('classifyBatch prepares the call with the least reasoning effort, temperature 0 and a 12,000-token ceiling, and streams it with the caller signal', async () => {
@@ -146,6 +170,16 @@ test('classifyBatch prepares the call with the least reasoning effort, temperatu
   assert.match(request?.system ?? '', /只输出一个 JSON 数组/);
 });
 
+test('classifyBatch asks for a feature name of at most 20 characters and a one-sentence gist of at most 60 in every element', async () => {
+  const llm = fakeLlm('[]');
+  await classifyBatch(llm, route, [candidate('a')], never());
+  const system = llm.requests[0]?.system ?? '';
+  const rule = (key: string) => system.split('\n').find(line => line.startsWith(`- ${key}：`)) ?? '';
+  for (const part of [/功能名/, /名词短语/, /不超过 20 个字/, /英文标识符/, /不以「有变化」「更新」「新增」这类词开头/, /「fork 子会话保留父级历史」/]) assert.match(rule('headline'), part);
+  for (const part of [/一句话/, /不超过 60 个字/, /Codex 做了什么/, /用户/, /不提 DSH/, /headline/]) assert.match(rule('gist'), part);
+  assert.ok(system.includes('{"id":"<块上的 id>","category":"cli-core","relevance":"high","headline":"……","gist":"……","rationale":"……"}'), system);
+});
+
 test('classifyBatch leaves the reasoning effort to the route when its model offers none', async () => {
   const llm = fakeLlm('[]', { efforts: [] });
   await classifyBatch(llm, route, [candidate('a')], never());
@@ -155,7 +189,7 @@ test('classifyBatch leaves the reasoning effort to the route when its model offe
 test('classifyBatch reads only the text deltas and stops reading at the stop finish', async () => {
   const llm = fakeLlm(answer(item('a', { category: 'desktop' })));
   const result = await classifyBatch(llm, route, [candidate('a')], never());
-  assert.deepEqual(Object.fromEntries(result), { a: { category: 'desktop', relevance: 'high', rationale: 'r' } });
+  assert.deepEqual(Object.fromEntries(result), { a: { category: 'desktop', relevance: 'high', headline: 'h', gist: 'g', rationale: 'r' } });
   assert.equal(llm.state.pulledAfterFinish, false);
 });
 

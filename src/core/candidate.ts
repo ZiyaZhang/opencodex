@@ -14,6 +14,12 @@ export interface Classification {
   category: typeof CATEGORIES[number]; relevance: typeof RELEVANCES[number];
   /** The `id` of another candidate this one was merged into. */
   mergedInto?: string;
+  /**
+   * The Codex feature as a name (at most 20 code points) and what Codex does, in one sentence (at most 60). Both are absent on a
+   * classification made before they existed, which marks it to be classified again; they are empty when the model gave none, which the
+   * page treats as absent.
+   */
+  headline?: string; gist?: string;
   rationale: string;
 }
 export interface ReportChecks { requiredSections: boolean; dshRefsTotal: number; dshRefsResolved: number }

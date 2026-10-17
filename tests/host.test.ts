@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { FinishReason } from '@deepseek-ai/dsh-llm';
 import { remoteErrorOf } from '@deepseek-ai/dsh-typert-protocol';
-import { transition, type Candidate, type Evidence } from '../src/core/candidate.ts';
+import { transition, type Candidate, type Classification, type Evidence } from '../src/core/candidate.ts';
 import { ValidationError } from '../src/core/check.ts';
 import type { CheckLogEntry } from '../src/core/run-log.ts';
 import { DEFAULT_SETTINGS, type Settings } from '../src/core/settings.ts';
@@ -184,6 +184,77 @@ test('a check waiting for a running classification gives up at its own deadline,
     assert.equal(after.busy.check, false);
     await f.unload();
     await assert.rejects(classifying, { name: 'AbortError' });
+  } finally { await f.close(); }
+});
+
+/**
+ * A candidate file classified the way 0.3.x left it, without a headline or a gist: the higher `n`, the later it was created. `updatedAt`
+ * runs in another order (29 and 64 have no common factor), so a pass that took the store's order or the latest change would show it.
+ */
+function classifiedBefore(n: number, status: Candidate['status'], fields: Partial<Classification> = {}): Candidate {
+  return {
+    id: randomUUID(), fingerprint: `codex-release:old-${n}`, source: 'codex-release', title: `Old feature ${n}`, summary: `Summary of old feature ${n}`, status,
+    createdAt: new Date(NOW.getTime() - (1_000 - n) * MINUTE).toISOString(), updatedAt: new Date(NOW.getTime() - ((n * 29) % 64) * MINUTE).toISOString(), evidence: [],
+    classification: { category: 'other', relevance: 'low', rationale: '旧的归类', ...fields },
+  };
+}
+const ids = (candidates: readonly Candidate[]) => candidates.map(candidate => candidate.id);
+
+test('a pass also classifies again up to 60 older new, reported and started candidates without a headline, oldest first, after the unclassified ones', async () => {
+  const asked: string[][] = [];
+  const record: Answer = batch => { asked.push(batch); return classifyAll(batch); };
+  const f = await fixture({ llm: fakeLlm(Array.from({ length: 10 }, () => record)) });
+  try {
+    const statuses = ['new', 'reported', 'started'] as const;
+    const older = Array.from({ length: 64 }, (_, n) => classifiedBefore(10 + n, statuses[n % 3]!));
+    // Created before all of them: ignored ones, and ones classified with a headline, even an empty one.
+    const ignored = [classifiedBefore(0, 'ignored'), classifiedBefore(1, 'ignored')];
+    const named = [classifiedBefore(2, 'new', { headline: '', gist: '' }), classifiedBefore(3, 'started', { headline: 'Composer 输入预测', gist: '输入框会预测接下来要写的话。' })];
+    await writeCandidates(f.directory, [...older, ...ignored, ...named]);
+    const first = await seed(f.store, 'pr:50148');
+    f.clock.advance(MINUTE);
+    const second = await seed(f.store, 'pr:51500');
+
+    await f.call({ action: 'classify' });
+    // The unclassified ones first, latest change first as before, then the oldest 60; batches of 30 as for any candidate.
+    assert.deepEqual(asked.flat(), [second.id, first.id, ...ids(older.slice(0, 60))]);
+    assert.deepEqual(asked.map(batch => batch.length), [30, 30, 2]);
+    for (const candidate of older.slice(0, 60)) {
+      const saved = await f.store.get(candidate.id);
+      assert.deepEqual([saved.status, saved.classification], [candidate.status, { category: 'cli-core', relevance: 'high', headline: '', gist: '', rationale: '测试' }]);
+    }
+    for (const candidate of [...older.slice(60), ...ignored, ...named]) assert.deepEqual((await f.store.get(candidate.id)).classification, candidate.classification);
+
+    // The model gave no headline, and the empty one it was saved with is not asked about again: only the 4 left wait.
+    await f.call({ action: 'classify' });
+    assert.deepEqual(asked.slice(3), [ids(older.slice(60))]);
+    await f.call({ action: 'classify' });
+    assert.equal(asked.length, 4, 'nothing is left to classify');
+  } finally { await f.close(); }
+});
+
+test('classified again, an older candidate keeps the merge it had unless the new answer names one', async () => {
+  const [p, q, r, s] = [classifiedBefore(0, 'new'), classifiedBefore(1, 'reported'), classifiedBefore(2, 'started'), classifiedBefore(3, 'new')];
+  q.classification!.mergedInto = p.id;
+  r.classification!.mergedInto = q.id;
+  const element = (id: string, mergedInto?: string) => ({ id, category: 'cli-core', relevance: 'high', headline: `新名字 ${id.slice(0, 4)}`, gist: '新的一句话', rationale: '测试', ...(mergedInto && { mergedInto }) });
+  const f = await fixture({ llm: fakeLlm([() => JSON.stringify([element(p.id), element(q.id), element(r.id, p.id), element(s.id)])]) });
+  try {
+    await writeCandidates(f.directory, [p, q, r, s]);
+    await f.call({ action: 'classify' });
+    const merges = await Promise.all([p, q, r, s].map(async candidate => (await f.store.get(candidate.id)).classification?.mergedInto));
+    assert.deepEqual(merges, [undefined, p.id, p.id, undefined], 'q keeps its own, r takes the new one, p and s had none');
+    assert.equal((await f.store.get(q.id)).classification?.headline, `新名字 ${q.id.slice(0, 4)}`, 'the rest is the new answer');
+  } finally { await f.close(); }
+});
+
+test('the headline and the gist of an answer are saved and carried by the list', async () => {
+  const headline = 'fork 子会话保留父级历史', gist = 'fork 出来的子会话会带上父会话的完整历史，接着原来的上下文继续做。';
+  const f = await fixture({ llm: fakeLlm([batch => JSON.stringify(batch.map(id => ({ id, category: 'cli-core', relevance: 'high', headline, gist, rationale: '测试' })))]) });
+  try {
+    const seeded = await seed(f.store, 'pr:50148');
+    const response = await f.call({ action: 'classify' });
+    assert.deepEqual(find(response, seeded.id)?.classification, { category: 'cli-core', relevance: 'high', headline, gist, rationale: '测试' });
   } finally { await f.close(); }
 });
 
