@@ -856,6 +856,24 @@ test('brief shows the task instructions a start sends and what goes with them, a
   } finally { await f.close(); }
 });
 
+test('brief is refused in the words start is while the report is being rewritten, without reading the file moved aside', async () => {
+  const f = await fixture({ settings: { dshMirrorPath: MIRROR } });
+  try {
+    const candidate = await asReported(f, await seed(f.store, 'pr:50148'));
+    f.dsh.hold();
+    const rerun = f.call({ action: 'report', id: candidate.id });
+    await until(() => f.dsh.prompts.length === 1, 'the analyst prompt');
+    // The rerun has moved report.md aside, which a brief that read the file would call gone.
+    assert.equal(await exists(join(f.directory, 'reports', candidate.id, 'report.md')), false);
+    const busy = '这条候选正在生成报告，等它结束再操作';
+    await assert.rejects(f.call({ action: 'start', id: candidate.id }), { message: busy });
+    await assert.rejects(f.call({ action: 'brief', id: candidate.id }), remoteError('gateway/bad-request', new RegExp(`^${busy}$`)));
+    f.dsh.open();
+    await rerun;
+    assert.equal((await f.call({ action: 'brief', id: candidate.id })).brief?.instructions, defaultInstructions(), 'there again once the rerun ends');
+  } finally { await f.close(); }
+});
+
 test('start takes task instructions, a model and a preset for this session only, keeping the fixed lines and the report', async () => {
   const f = await fixture({ settings: { dshMirrorPath: MIRROR } });
   try {
