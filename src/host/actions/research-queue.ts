@@ -163,7 +163,7 @@ export class ResearchQueue {
       try {
         await ctx.store.patch(id, current => ({ ...current, research: { autoAttemptedAt: at, lastError: line } }));
       } catch (recording) {
-        this.tried[this.tried.length - 1] = { id, ok: false, error: errorLine(`${line}；没能记到候选上：${messageOf(recording)}`) };
+        this.tried[this.tried.length - 1] = { id, ok: false, error: errorLine(`${line}；没能记到这条动态上：${messageOf(recording)}`) };
       }
       return true;
     }

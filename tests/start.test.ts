@@ -151,7 +151,7 @@ test('startWork opens a creator-mode session in work/<id> and queues the report 
     assert.equal(request.content.length, 1);
     const text = textOf(request);
     assert.ok(text.includes('cordis-plugin-development'));
-    assert.ok(text.includes(`工作目录是 ${dirs.workdir}（当前目录），里面可能有之前开工会话留下的 bundle`), 'an earlier session may have left a bundle');
+    assert.ok(text.includes(`工作目录是 ${dirs.workdir}（当前目录），里面可能有之前执行会话留下的 bundle`), 'an earlier session may have left a bundle');
     assert.ok(text.includes(`DSH 官方镜像在 ${dirs.mirror}（只读参考），不要改动镜像里的任何文件`), 'names the mirror, which stays as it is');
     assert.ok(text.includes('报告里 packages/…:行号 这类引用都相对镜像根目录'));
     const evidence = join(dirs.directory, 'reports', ID, 'evidence');
@@ -439,11 +439,11 @@ test('startWork refuses a candidate without a report or in a status that cannot 
   await withData(async dirs => {
     const { host, calls } = fakeHost();
     for (const status of ['reported', 'new'] as const) {
-      await assert.rejects(startWork(host, inputFor(dirs, { candidate: { ...withoutReport(candidate), status } })), { message: '先生成报告再开工' });
+      await assert.rejects(startWork(host, inputFor(dirs, { candidate: { ...withoutReport(candidate), status } })), { message: '先调研，有报告后才能执行' });
     }
     // A restored candidate is `new` again and an ignored one stays ignored; both keep their old report.
     for (const status of ['new', 'ignored'] as const) {
-      await assert.rejects(startWork(host, inputFor(dirs, { candidate: { ...candidate, status } })), { message: `当前状态不能开工：${status}` });
+      await assert.rejects(startWork(host, inputFor(dirs, { candidate: { ...candidate, status } })), { message: `当前状态不能执行：${status}` });
     }
     assert.deepEqual(calls, []);
     await noWorkDirectory(dirs);
@@ -526,7 +526,7 @@ test('startWork names the session when renaming, switching the model, finding it
     await assert.rejects(startWork(renameFails.host, inputFor(dirs)), (error: unknown) => {
       assert.ok(error instanceof StartWorkError);
       assert.equal(error.name, 'StartWorkError');
-      assert.equal(error.message, '开工会话 s-1 已创建，但交接没完成：session/agent-busy');
+      assert.equal(error.message, '执行会话 s-1 已创建，但交接没完成：session/agent-busy');
       assert.equal(error.sessionId, 's-1');
       assert.equal(error.cause, failure);
       return true;
@@ -540,14 +540,14 @@ test('startWork names the session when renaming, switching the model, finding it
     const saveFails = fakeHost({ save: () => { throw failure; } });
     await assert.rejects(startWork(saveFails.host, inputFor(dirs)), {
       name: 'StartWorkError', sessionId: 's-1',
-      message: '开工会话 s-1 已创建，但交接没完成：没能把默认模型恢复为 deepseek-official/deepseek-flash：session/agent-busy',
+      message: '执行会话 s-1 已创建，但交接没完成：没能把默认模型恢复为 deepseek-official/deepseek-flash：session/agent-busy',
     });
     assert.deepEqual(saveFails.calls, ['create', 'rename', 'selectModel', 'saveSelection'], 'no prompt after a failed restore');
 
     // No live agent, so no session to set the mode on: the session is named, and gets no task in the default mode.
     const noAgent = fakeHost({ activation: { error: failure } });
     await assert.rejects(startWork(noAgent.host, inputFor(dirs)), {
-      name: 'StartWorkError', sessionId: 's-1', cause: failure, message: '开工会话 s-1 已创建，但交接没完成：session/agent-busy',
+      name: 'StartWorkError', sessionId: 's-1', cause: failure, message: '执行会话 s-1 已创建，但交接没完成：session/agent-busy',
     });
     assert.deepEqual(noAgent.calls, ['create', 'rename', 'selectModel', 'saveSelection', 'resolveAgent'], 'no sandbox mode and no prompt');
 

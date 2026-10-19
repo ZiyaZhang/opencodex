@@ -88,11 +88,11 @@ export interface HostContext {
   readonly lanes: { readonly settings: Lane; readonly reports: Lane; readonly classify: Lane; readonly index: Lane };
 }
 
-const TASK_LABEL: Record<Task, string> = { report: '生成报告', start: '开工', status: '改状态' };
+const TASK_LABEL: Record<Task, string> = { report: '调研', start: '执行', status: '改状态' };
 
 /** Why a candidate with `task` running takes no other task now: `exclusive`'s refusal, which `brief` gives in the same words. */
 export function busyRefusal(task: Task): string {
-  return `这条候选正在${TASK_LABEL[task]}，等它结束再操作`;
+  return `这条动态正在${TASK_LABEL[task]}，等它结束再操作`;
 }
 
 /**

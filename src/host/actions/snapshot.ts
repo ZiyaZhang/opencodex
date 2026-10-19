@@ -73,9 +73,9 @@ export async function respond(ctx: HostContext, result: ActionResult = {}): Prom
     const damaged = new Set<string>();
     const candidates = selected(all).map(candidate => listed(candidate, damaged));
     listing = { candidates, totalCandidates: all.length, omittedCandidates: all.length - candidates.length };
-    if (damaged.size > 0) notices.push(`这些候选的记录有损坏，列表里只显示能读的部分：${[...damaged].join('、')}`);
+    if (damaged.size > 0) notices.push(`这些动态的记录有损坏，列表里只显示能读的部分：${[...damaged].join('、')}`);
   } catch (error) {
-    notices.push(`候选列表没能读出来：${messageOf(error)}`);
+    notices.push(`动态列表没能读出来：${messageOf(error)}`);
   }
   let checkpoints: Checkpoints = {};
   try { checkpoints = await ctx.store.checkpoints(); } catch (error) { notices.push(`state.json 没能读出来：${messageOf(error)}`); }
@@ -95,7 +95,7 @@ export async function respond(ctx: HostContext, result: ActionResult = {}): Prom
     ...(notices.length > 0 && { notice: notices.join('；') }),
   };
   if (JSON.stringify(response).length <= MAX_PAYLOAD) return response;
-  notices.push(`候选列表超过 4 MB，这次没有带上`);
+  notices.push(`动态列表超过 4 MB，这次没有带上`);
   return { ...response, candidates: [], omittedCandidates: response.totalCandidates, notice: notices.join('；') };
 }
 

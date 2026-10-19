@@ -8,9 +8,9 @@ import { exclusive, messageOf, mirrorOf, type HostContext } from './context.js';
 
 /** Why a candidate in `status` cannot start; a `new` one has no report to start from, or (restored) must be reported again. */
 export function refusal(status: Status): string {
-  if (status === 'new') return '先生成报告再开工';
-  if (status === 'ignored') return '已忽略的候选不能开工，先恢复它';
-  return `状态为 ${status} 的候选不能开工`;
+  if (status === 'new') return '先调研，有报告后才能执行';
+  if (status === 'ignored') return '已忽略的动态不能执行，先恢复它';
+  return `状态为 ${status} 的动态不能执行`;
 }
 
 /**
@@ -48,7 +48,7 @@ export async function start(ctx: HostContext, id: string, overrides: StartOverri
     const settings = ctx.settings();
     const { mirror } = checkStart(candidate, settings);
     const previous = candidate.started?.sessionId;
-    if (previous !== undefined && ctx.services.agents.get(SessionId(previous))?.status === 'running') throw new Error(`上一个开工会话还在运行（会话 ${previous}）`);
+    if (previous !== undefined && ctx.services.agents.get(SessionId(previous))?.status === 'running') throw new Error(`上一个执行会话还在运行（会话 ${previous}）`);
     // A failure once the session exists is a StartWorkError whose message names the session.
     const { sessionId } = await startWork(ctx.services, {
       candidate, directory: ctx.directory, mirror, signal: ctx.signal, instructions: overrides.instructions,
@@ -58,7 +58,7 @@ export async function start(ctx: HostContext, id: string, overrides: StartOverri
     try {
       await ctx.store.patch(id, current => ({ ...transition(current, 'started', at), started: { sessionId, at } }));
     } catch (error) {
-      throw new Error(`开工会话 ${sessionId} 已经开始工作，但没能记到候选上：${messageOf(error)}`, { cause: error });
+      throw new Error(`执行会话 ${sessionId} 已经开始工作，但没能记到这条动态上：${messageOf(error)}`, { cause: error });
     }
     return sessionId;
   });

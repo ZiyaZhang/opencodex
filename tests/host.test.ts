@@ -355,7 +355,7 @@ test('a finished action is answered as finished when the list cannot be read or 
     await writeFile(join(f.directory, 'candidates', `${randomUUID()}.json`), '{ damaged');
     const ignored = await f.call({ action: 'ignore', id: target.id });
     assert.deepEqual([ignored.candidates, ignored.totalCandidates], [[], 0]);
-    assert.match(ignored.notice ?? '', /^候选列表没能读出来：Corrupt JSON/);
+    assert.match(ignored.notice ?? '', /^动态列表没能读出来：Corrupt JSON/);
     assert.equal((await f.store.get(target.id)).status, 'ignored', 'the action itself went through');
     const started = await f.call({ action: 'start', id: reported.id });
     assert.equal(started.startedSessionId, 'cordis-1', 'the opened session is not lost');
@@ -363,9 +363,9 @@ test('a finished action is answered as finished when the list cannot be read or 
     await rm(join(f.directory, 'candidates'), { recursive: true });
     const huge = await seed(f.store, 'huge', { evidence: [{ kind: 'file', ref: 'x'.repeat(MAX_PAYLOAD) }] });
     const read = await f.call({ action: 'readReport', id: huge.id });
-    assert.deepEqual(read.report, { id: huge.id, markdown: '', notice: '这条候选还没有报告' });
+    assert.deepEqual(read.report, { id: huge.id, markdown: '', notice: '这条动态还没有报告' });
     assert.deepEqual([read.candidates, read.totalCandidates, read.omittedCandidates], [[], 1, 1]);
-    assert.match(read.notice ?? '', /候选列表超过 4 MB，这次没有带上/);
+    assert.match(read.notice ?? '', /动态列表超过 4 MB，这次没有带上/);
   } finally { await f.close(); }
 });
 
@@ -381,7 +381,7 @@ test('ignore and restore move the status, and a restored candidate keeps its old
     const restored = find(await f.call({ action: 'restore', id: candidate.id }), candidate.id)!;
     assert.equal(restored.status, 'new');
     assert.deepEqual(restored.report, candidate.report);
-    await assert.rejects(f.call({ action: 'restore', id: candidate.id }), /只有已忽略的候选可以恢复/);
+    await assert.rejects(f.call({ action: 'restore', id: candidate.id }), /只有已忽略的动态可以恢复/);
   } finally { await f.close(); }
 });
 
@@ -402,7 +402,7 @@ test('settings are saved and read back on the next start; a refused request is a
     await assert.rejects(f.call({ action: 'settings', patch: { dailyReportLimit: '3' } } as never), remoteError('gateway/bad-request', /^设置项 dailyReportLimit 必须是数字$/));
     await assert.rejects(f.call({ action: 'settings', patch: { bogus: 1 } } as never), remoteError('gateway/bad-request', /^没有这个设置项："bogus"$/));
     await assert.rejects(f.call({ action: 'settings', patch: { dailyReportLimit: 0 } }), remoteError('gateway/bad-request', /^dailyReportLimit must be an integer >= 1$/));
-    await assert.rejects(f.call({ action: 'report', id: 'abc' }), remoteError('gateway/bad-request', /^report 需要候选 id（小写 UUID）$/));
+    await assert.rejects(f.call({ action: 'report', id: 'abc' }), remoteError('gateway/bad-request', /^report 需要动态的 id（小写 UUID）$/));
     await assert.rejects(f.call({ action: 'scan' } as never), remoteError('gateway/bad-request', /^未知的 OpenCodex 操作："scan"$/));
     assert.equal((JSON.parse(await readFile(join(f.directory, 'settings.json'), 'utf8')) as Settings).dailyReportLimit, 3, 'a refused patch writes nothing');
     await f.unload();
@@ -720,9 +720,9 @@ test('report: refused while one runs and past the daily limit; otherwise it writ
     f.dsh.hold();
     const running = f.call({ action: 'report', id: bare.id });
     await until(() => f.dsh.prompts.length === 1, 'the analyst prompt');
-    await assert.rejects(f.call({ action: 'report', id: bare.id }), /正在生成报告/);
-    await assert.rejects(f.call({ action: 'start', id: bare.id }), /正在生成报告/);
-    await assert.rejects(f.call({ action: 'ignore', id: bare.id }), /正在生成报告/);
+    await assert.rejects(f.call({ action: 'report', id: bare.id }), /正在调研/);
+    await assert.rejects(f.call({ action: 'start', id: bare.id }), /正在调研/);
+    await assert.rejects(f.call({ action: 'ignore', id: bare.id }), /正在调研/);
     f.dsh.open();
     const done = find(await running, bare.id)!;
 
@@ -842,7 +842,7 @@ test('report and start need the mirror path, and readReport says why a report is
   try {
     const candidate = await seed(f.store, 'pr:50148');
     await assert.rejects(f.call({ action: 'report', id: candidate.id }), /dshMirrorPath/);
-    assert.deepEqual((await f.call({ action: 'readReport', id: candidate.id })).report, { id: candidate.id, markdown: '', notice: '这条候选还没有报告' });
+    assert.deepEqual((await f.call({ action: 'readReport', id: candidate.id })).report, { id: candidate.id, markdown: '', notice: '这条动态还没有报告' });
     await asReported(f, candidate);
     for (const action of ['brief', 'start'] as const) {
       await assert.rejects(f.call({ action, id: candidate.id }), remoteError('gateway/bad-request', /^先在设置里填写 DSH 镜像路径（dshMirrorPath）$/), action);
@@ -858,7 +858,7 @@ test('start opens a creator session for a reported candidate, records it, and re
   const f = await fixture({ settings: { dshMirrorPath: MIRROR } });
   try {
     const fresh = await seed(f.store, 'pr:51500');
-    await assert.rejects(f.call({ action: 'start', id: fresh.id }), remoteError('gateway/bad-request', /^先生成报告再开工$/));
+    await assert.rejects(f.call({ action: 'start', id: fresh.id }), remoteError('gateway/bad-request', /^先调研，有报告后才能执行$/));
     const candidate = await asReported(f, await seed(f.store, 'pr:50148'));
     const response = await f.call({ action: 'start', id: candidate.id });
     assert.equal(response.startedSessionId, 'cordis-1');
@@ -874,7 +874,7 @@ test('start opens a creator session for a reported candidate, records it, and re
     assert.ok(prompt.type === 'text' && prompt.text.includes(REPORT), 'the report is the task');
 
     f.dsh.statuses.set('cordis-1', 'running');
-    await assert.rejects(f.call({ action: 'start', id: candidate.id }), /上一个开工会话还在运行（会话 cordis-1）/);
+    await assert.rejects(f.call({ action: 'start', id: candidate.id }), /上一个执行会话还在运行（会话 cordis-1）/);
     f.dsh.statuses.set('cordis-1', 'idle');
     const again = await f.call({ action: 'start', id: candidate.id });
     assert.equal(again.startedSessionId, 'cordis-2', 'started -> started opens another session');
@@ -882,7 +882,7 @@ test('start opens a creator session for a reported candidate, records it, and re
     // A report rerun moves the candidate back to reported; its creator session may still be working.
     await f.store.patch(candidate.id, current => transition(current, 'reported', NOW.toISOString()));
     f.dsh.statuses.set('cordis-2', 'running');
-    await assert.rejects(f.call({ action: 'start', id: candidate.id }), /上一个开工会话还在运行（会话 cordis-2）/);
+    await assert.rejects(f.call({ action: 'start', id: candidate.id }), /上一个执行会话还在运行（会话 cordis-2）/);
   } finally { await f.close(); }
 });
 
@@ -892,7 +892,7 @@ test('a start whose record cannot be saved names the session it opened', async (
     const candidate = await asReported(f, await seed(f.store, 'pr:50148'));
     // The candidate file breaks while the creator session takes its task, so the patch that records the session fails.
     f.dsh.hooks.creatorPrompted = () => writeFile(join(f.directory, 'candidates', `${candidate.id}.json`), '{ damaged');
-    await assert.rejects(f.call({ action: 'start', id: candidate.id }), /开工会话 cordis-1 已经开始工作，但没能记到候选上：Corrupt JSON/);
+    await assert.rejects(f.call({ action: 'start', id: candidate.id }), /执行会话 cordis-1 已经开始工作，但没能记到这条动态上：Corrupt JSON/);
   } finally { await f.close(); }
 });
 
@@ -909,13 +909,13 @@ test('brief shows the task instructions a start sends and what goes with them, a
     assert.deepEqual([f.dsh.created, await exists(join(f.directory, 'work'))], [[], false], 'and opens nothing');
     // No report yet; a status that cannot start; a reported record that lost its report.
     const fresh = await seed(f.store, 'pr:51500');
-    await assert.rejects(f.call({ action: 'brief', id: fresh.id }), remoteError('gateway/bad-request', /^先生成报告再开工$/));
+    await assert.rejects(f.call({ action: 'brief', id: fresh.id }), remoteError('gateway/bad-request', /^先调研，有报告后才能执行$/));
     const ignored = await asReported(f, await seed(f.store, 'pr:51600'));
     await f.store.transition(ignored.id, 'ignored');
-    await assert.rejects(f.call({ action: 'brief', id: ignored.id }), remoteError('gateway/bad-request', /^已忽略的候选不能开工，先恢复它$/));
+    await assert.rejects(f.call({ action: 'brief', id: ignored.id }), remoteError('gateway/bad-request', /^已忽略的动态不能执行，先恢复它$/));
     const bare = await f.store.patch(fresh.id, current => transition(current, 'reported', NOW.toISOString()));
     for (const action of ['brief', 'start'] as const) {
-      await assert.rejects(f.call({ action, id: bare.id }), remoteError('gateway/bad-request', /^先生成报告再开工$/), action);
+      await assert.rejects(f.call({ action, id: bare.id }), remoteError('gateway/bad-request', /^先调研，有报告后才能执行$/), action);
     }
     // A report file that is gone, empty, empty once the comments the page hides are gone, or recorded elsewhere: both read it alike.
     const file = join(f.directory, 'reports', candidate.id, 'report.md');
@@ -947,7 +947,7 @@ test('brief is refused in the words start is while the report is being rewritten
     await until(() => f.dsh.prompts.length === 1, 'the analyst prompt');
     // The rerun has moved report.md aside, which a brief that read the file would call gone.
     assert.equal(await exists(join(f.directory, 'reports', candidate.id, 'report.md')), false);
-    const busy = '这条候选正在生成报告，等它结束再操作';
+    const busy = '这条动态正在调研，等它结束再操作';
     await assert.rejects(f.call({ action: 'start', id: candidate.id }), { message: busy });
     await assert.rejects(f.call({ action: 'brief', id: candidate.id }), remoteError('gateway/bad-request', new RegExp(`^${busy}$`)));
     f.dsh.open();
@@ -1149,7 +1149,7 @@ test('a manual report goes ahead beside the queue, which then leaves that candid
     f.dsh.hold();
     await f.call({ action: 'classify' });
     await until(() => f.dsh.prompts.length === 1, 'the first automatic report');
-    await assert.rejects(f.call({ action: 'report', id: newest.id }), /正在生成报告/, 'one task per candidate, an automatic one included');
+    await assert.rejects(f.call({ action: 'report', id: newest.id }), /正在调研/, 'one task per candidate, an automatic one included');
     const manual = f.call({ action: 'report', id: middle.id });
     await until(() => f.dsh.prompts.length === 2, 'the manual report, which does not wait for the queue');
     f.dsh.open();

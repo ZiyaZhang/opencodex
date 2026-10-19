@@ -18,7 +18,7 @@ export async function readReport(ctx: HostContext, id: string): Promise<{ id: st
     if (!isMissing(error)) throw error;
     const notice = ctx.busy.get(id) === 'report' ? '报告正在生成，生成完再看'
       : candidate.report ? '报告文件不存在，请重新生成'
-      : '这条候选还没有报告';
+      : '这条动态还没有报告';
     return { id, markdown: '', notice };
   }
 }

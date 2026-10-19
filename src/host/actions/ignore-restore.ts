@@ -13,10 +13,10 @@ async function move(ctx: HostContext, id: string, to: Status, refusal: (status: 
 
 /** `new`, `reported` or `started` to `ignored`. */
 export function ignore(ctx: HostContext, id: string): Promise<void> {
-  return move(ctx, id, 'ignored', status => (status === 'ignored' ? '这条候选已经忽略了' : `状态为 ${status} 的候选不能忽略`));
+  return move(ctx, id, 'ignored', status => (status === 'ignored' ? '这条动态已经忽略了' : `状态为 ${status} 的动态不能忽略`));
 }
 
 /** `ignored` back to `new`; the report, the session record and the classification stay. */
 export function restore(ctx: HostContext, id: string): Promise<void> {
-  return move(ctx, id, 'new', () => '只有已忽略的候选可以恢复');
+  return move(ctx, id, 'new', () => '只有已忽略的动态可以恢复');
 }

@@ -114,7 +114,7 @@ function onlyKeys(value: Record<string, unknown>, allowed: readonly string[], ac
 }
 
 function candidateId(value: Record<string, unknown>, action: string): string {
-  check(typeof value.id === 'string' && UUID.test(value.id), `${action} 需要候选 id（小写 UUID）`);
+  check(typeof value.id === 'string' && UUID.test(value.id), `${action} 需要动态的 id（小写 UUID）`);
   return value.id;
 }
 

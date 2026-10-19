@@ -13,7 +13,7 @@ const counterOf = (day: string) => `reportsOn-${day}`;
 const isMissing = (error: unknown) => ['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException | undefined)?.code ?? '');
 
 function refusal(status: Status): string {
-  return status === 'ignored' ? '已忽略的候选不能生成报告，先恢复它' : `状态为 ${status} 的候选不能生成报告`;
+  return status === 'ignored' ? '已忽略的动态不能调研，先恢复它' : `状态为 ${status} 的动态不能调研`;
 }
 
 async function startedOn(ctx: HostContext, day: string): Promise<number> {
@@ -167,7 +167,7 @@ export async function report(ctx: HostContext, id: string): Promise<void> {
       try {
         await ctx.store.patch(id, current => ({ ...transition(current, 'reported', at), report: done }));
       } catch (error) {
-        throw new Error(`报告已写好（分析会话 ${done.sessionId ?? '未知'}），但没能记到候选上：${messageOf(error)}`, { cause: error });
+        throw new Error(`报告已写好（分析会话 ${done.sessionId ?? '未知'}），但没能记到这条动态上：${messageOf(error)}`, { cause: error });
       }
     } finally {
       if (!counted) await release(ctx);
