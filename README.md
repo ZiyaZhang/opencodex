@@ -398,7 +398,7 @@ plutil -replace EnvironmentVariables.OPENCODEX_TIMEOUT_MIN -string 60 ~/Library/
 | `DSH_BIN` | `/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh` | 起 DSH 用的 CLI，默认是桌面端自带的；没装桌面端时填 `which dsh` 的结果 |
 | `DSH_PROFILE` | `opencodex` | 起哪个 profile |
 | `DSH_HOME` | `~/.dsh` | 改了的话，上面命令里的 `~/.dsh` 都要换成它 |
-| `OPENCODEX_TIMEOUT_MIN` | `120` | 时限，分钟，可以带小数；到了还没有 `last-run.json` 就结束 DSH |
+| `OPENCODEX_TIMEOUT_MIN` | `120` | 时限，分钟，可以带小数；到了还没有 `last-run.json` 就结束 DSH。脚本把「时限减 10 分钟」作为截止时间传给 OpenCodex（`OPENCODEX_DEADLINE`），剩余时间不够调研一条（按 31 分钟算）时不再开新的，照常写 `last-run.json`，`notice` 写「时间不够，还有 N 条等下次」 |
 | `OPENCODEX_POLL_SEC` | `20` | 多久看一次 `last-run.json`，秒 |
 | `OPENCODEX_KILL_WAIT_SEC` | `60` | 发 SIGTERM 后等 DSH 退出多久，到了就发 SIGKILL，秒 |
 
