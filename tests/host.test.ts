@@ -786,6 +786,8 @@ test('start opens a creator session for a reported candidate, records it, and re
     assert.deepEqual(f.dsh.created, [{ cwd: join(f.directory, 'work', candidate.id), agentPreset: 'cordis' }]);
     assert.deepEqual(f.dsh.selected, [{ sessionId: 'cordis-1', ...DEFAULT_SETTINGS.startModel }], 'the creator session runs on the start model');
     assert.deepEqual(f.dsh.defaults, [{ provider: 'deepseek-official', model: 'deepseek-flash' }], 'the user default model is put back');
+    assert.deepEqual(f.dsh.appended, [{ sessionId: 'cordis-1', type: 'sandbox/mode', data: { mode: 'workspace-write' } }], 'it can write its working directory');
+    assert.deepEqual(f.dsh.policies, [], 'the approval policy is left to DSH');
     const prompt = f.dsh.prompts[0]!.content[0]!;
     assert.ok(prompt.type === 'text' && prompt.text.includes(REPORT), 'the report is the task');
 
@@ -833,7 +835,24 @@ test('brief shows the task instructions a start sends and what goes with them, a
     for (const action of ['brief', 'start'] as const) {
       await assert.rejects(f.call({ action, id: bare.id }), remoteError('gateway/bad-request', /^先生成报告再开工$/), action);
     }
-    assert.equal(f.dsh.created.length, 0);
+    // A report file that is gone, empty, empty once the comments the page hides are gone, or recorded elsewhere: both read it alike.
+    const file = join(f.directory, 'reports', candidate.id, 'report.md');
+    const broken: Array<[() => Promise<unknown>, RegExp]> = [
+      [() => unlink(file), /^报告文件不存在，请重新生成$/],
+      [() => writeFile(file, ' \n'), /^报告是空的，请重新生成$/],
+      [() => writeFile(file, '<!-- 只有注释 -->\n'), /^报告是空的，请重新生成$/],
+      [async () => {
+        await writeFile(file, REPORT);
+        await f.store.patch(candidate.id, current => ({ ...current, report: { ...current.report!, path: '../settings.json' } }));
+      }, /^报告路径不对："\.\.\/settings\.json"，请重新生成$/],
+    ];
+    for (const [breakIt, message] of broken) {
+      await breakIt();
+      for (const action of ['brief', 'start'] as const) {
+        await assert.rejects(f.call({ action, id: candidate.id }), remoteError('gateway/bad-request', message), `${action} ${message}`);
+      }
+    }
+    assert.deepEqual([f.dsh.created.length, await exists(join(f.directory, 'work'))], [0, false]);
   } finally { await f.close(); }
 });
 

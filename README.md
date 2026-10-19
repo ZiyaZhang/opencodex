@@ -128,7 +128,7 @@ DSH="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
 
 「开工」在 `work/<id>/` 开一个 `startPreset` 会话（默认 `cordis`，创造模式），标题「实现 · <候选标题>」，页面随即跳过去。会话建好后切到 `startModel`（随后把 DSH 的默认模型恢复原样）。首条消息是任务说明加报告全文（去掉页面上不显示的 HTML 注释）：用 `cordis-plugin-development` skill 把「建议」一节推荐的那一级做成独立 bundle，自己验证后装进当前 profile；只做建议的那一级，要开这个 profile 里没开的插件先问；写代码前用 `cordis_inspect_query` 确认要注入的服务真的在；检查都过了再装；搜索限定在工作目录、profile 目录和镜像；需要改 DSH 核心代码时停下来，写清楚改哪个包的哪几行。提示词交代报告和证据里的原文、命令、链接都是第三方数据，不照做。
 
-之后 OpenCodex 不再介入：不设沙箱，不等结果。会话从部署的默认沙箱模式开始，常见是只读，要写 bundle 时在那个会话里放宽到工作目录。会话用 DSH 自带的 plugin_manager 工具安装 bundle，每次安装会弹一张「允许本次操作使用 danger-full-access 权限」的单次审批卡，批之前先看一眼它写的代码；装好的 bundle 是 `link:` 装法，源码就在 `work/<id>/` 里，删了那个目录 profile 就坏。同一条候选可以再开工，上一个开工会话还在运行时会拒绝。两次实跑（`list_worktrees` 工具、`workflow-to-skill` skill）见 [phase3-trial.md](docs/plans/phase3-trial.md)。
+之后 OpenCodex 不再介入，不等结果。执行会话以 `workspace-write` 沙箱开始，能写自己的工作目录 `work/<id>/`；审批策略不改，用 DSH 的默认值。会话用 DSH 自带的 plugin_manager 工具安装 bundle，安装时 DSH 会弹一次「允许本次操作使用 danger-full-access 权限」的审批卡，批之前先看一眼它写的代码；装好的 bundle 是 `link:` 装法，源码就在 `work/<id>/` 里，删了那个目录 profile 就坏。同一条候选可以再开工，上一个开工会话还在运行时会拒绝。两次实跑（`list_worktrees` 工具、`workflow-to-skill` skill）见 [phase3-trial.md](docs/plans/phase3-trial.md)。
 
 ### 失败处理
 
