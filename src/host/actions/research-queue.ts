@@ -62,7 +62,7 @@ export class ResearchQueue {
   get queued(): string[] { return [...this.waiting]; }
   /**
    * Why the last run stopped short: the data directory's lock was held by another process, taken over by one, or could not be taken, or
-   * the day's reports ran out. A run clears it as it starts.
+   * the day's reports ran out. A run clears it as it starts, and so does a queueing while no run is going (`put`).
    */
   get notice(): string | undefined { return this.stoppedBecause; }
   /** The candidates the current run, or the last one, took on, in order; one it left alone is not among them. A run clears them as it starts. */
@@ -73,9 +73,12 @@ export class ResearchQueue {
     while (this.running) await this.worker;
   }
 
-  /** Makes `ids` the queue, in their order, leaving out the one the worker is on. */
+  /** Makes `ids` the queue, in their order, leaving out the one the worker is on. With no run going, the last run's notice goes too. */
   put(ids: readonly string[]): void {
     this.waiting = ids.filter(id => id !== this.current);
+    // `start` clears it only when it starts a run, which it does not on an empty queue: a later check with nothing worth a report would
+    // leave the page saying the reports ran out, or another process holds the directory, for good. A running worker's run is its own.
+    if (!this.running) this.stoppedBecause = undefined;
   }
 
   /**
@@ -129,14 +132,17 @@ export class ResearchQueue {
   /**
    * Researches candidate `id`, unless by now it is no longer one to take or has a task running: such a candidate is left exactly as it is.
    * The try is marked on the candidate first, the error of an earlier one dropped; a failure is recorded on it and the run goes on. Returns
-   * false when the run has to stop: the day's reports ran out (the queue is cleared and `notice` counts what waits), or the plugin unloads.
+   * false when the run has to stop: the day's reports ran out (the candidate gets back what it had, the queue is cleared and `notice`
+   * counts what waits), or the plugin unloads.
    */
   private async one(ctx: HostContext, id: string): Promise<boolean> {
     const at = ctx.now().toISOString();
+    let before: Candidate['research'];
     try {
       // The second look and the mark are one patch, so nothing that changes the candidate comes between them.
       await ctx.store.patch(id, current => {
         if (ctx.busy.has(id) || !eligible(current, ctx.settings(), dayOf(at))) throw SKIP;
+        before = current.research;
         return { ...current, research: { autoAttemptedAt: at } };
       });
     } catch (error) {
@@ -154,7 +160,18 @@ export class ResearchQueue {
       const line = errorLine(messageOf(error));
       this.tried.push({ id, ok: false, error: line });
       if (error instanceof DailyLimitError) {
-        // The candidate that met the limit waits too: its try of today never ran.
+        // The report was refused before it began, so there was no try today. Left marked, the candidate would count as tried: each further
+        // check that day would mark one more that never ran, the notice would count fewer, and a limit raised that day would not take them.
+        try {
+          await ctx.store.patch(id, current => {
+            const restored = { ...current, research: before };
+            if (before === undefined) delete restored.research;
+            return restored;
+          });
+        } catch (restoring) {
+          this.tried[this.tried.length - 1] = { id, ok: false, error: errorLine(`${line}；没能撤回这条动态今天的尝试记录：${messageOf(restoring)}`) };
+        }
+        // The candidate that met the limit waits too.
         this.halt(`今天的报告额度用完，还有 ${this.waiting.length + 1} 条明天继续`);
         return false;
       }

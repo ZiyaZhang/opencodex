@@ -1106,8 +1106,8 @@ test('the check the timer runs starts the research too, once it has ended', asyn
   } finally { await f.close(); }
 });
 
-test('automatic research stops at the daily limit, and the snapshot says how many wait for tomorrow', async () => {
-  const f = await fixture({ settings: { dshMirrorPath: MIRROR, dailyReportLimit: 1 } });
+test('automatic research stops at the daily limit, the snapshot says how many wait for tomorrow, and a later check that day says the same', async () => {
+  const f = await fixture({ settings: { dshMirrorPath: MIRROR, dailyReportLimit: 1 }, gh: offlineGh, feed: serve('gone', 404) });
   try {
     const [oldest, middle, newest] = await threeItems(f);
     const at = f.clock.now().toISOString();
@@ -1117,9 +1117,16 @@ test('automatic research stops at the daily limit, and the snapshot says how man
     assert.equal(stopped.researchNotice, '今天的报告额度用完，还有 2 条明天继续');
     assert.equal(stopped.researchQueue, undefined);
     assert.deepEqual([find(stopped, newest.id)!.status, find(stopped, newest.id)!.research], ['reported', { autoAttemptedAt: at }]);
-    assert.deepEqual([find(stopped, middle.id)!.status, find(stopped, middle.id)!.research], ['new', { autoAttemptedAt: at }]);
+    assert.deepEqual([find(stopped, middle.id)!.status, find(stopped, middle.id)!.research], ['new', undefined], 'its report never began, so no try today');
     assert.equal(find(stopped, oldest.id)!.research, undefined);
     assert.equal(await f.store.checkpoint(COUNTER), '1');
+    assert.equal(f.dsh.created.length, 1);
+    // A check later that day queues both again, and the limit stops it the same way: still two waiting, still neither marked.
+    const checked = await f.call({ action: 'check' });
+    assert.deepEqual([checked.researchQueue, checked.researchNotice], [ids([middle, oldest]), undefined], 'the queueing cleared the notice');
+    const again = await snapshotWhen(f, response => response.researchNotice !== undefined, 'the daily limit again');
+    assert.equal(again.researchNotice, '今天的报告额度用完，还有 2 条明天继续');
+    for (const item of [middle, oldest]) assert.equal(find(again, item.id)!.research, undefined);
     assert.equal(f.dsh.created.length, 1);
   } finally { await f.close(); }
 });
