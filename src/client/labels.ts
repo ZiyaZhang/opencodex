@@ -11,7 +11,7 @@ type Relevance = Classification['relevance'];
 export const SOURCE_LABELS: Record<Source, string> = { 'codex-release': 'Codex 发布说明', 'codex-files': 'Codex 仓库文件', desktop: 'Codex 桌面端', rss: '官方 RSS' };
 export const CATEGORY_LABELS: Record<Category, string> = { 'cli-core': 'CLI 核心', desktop: '桌面端', cloud: '云端', model: '模型', fix: '修复', other: '其他' };
 export const RELEVANCE_LABELS: Record<Relevance, string> = { high: '高', medium: '中', low: '低' };
-export const EVIDENCE_LABELS: Record<EvidenceKind, string> = { pr: 'PR', file: '文件', chunk: 'chunk', i18n: 'i18n key', rss: 'RSS', 'feature-flag': '功能开关', schema: '协议类型', doc: '文档' };
+export const EVIDENCE_LABELS: Record<EvidenceKind, string> = { pr: 'PR', file: '文件', chunk: 'chunk', i18n: '文案 key', rss: 'RSS', 'feature-flag': '功能开关', schema: '协议类型', doc: '文档' };
 
 /** The label of a value read from disk, or the value itself when this page does not know it. */
 export const labelOf = <K extends string>(labels: Record<K, string>, value: string): string => (Object.hasOwn(labels, value) ? labels[value as K] : value);
