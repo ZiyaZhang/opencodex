@@ -20,6 +20,11 @@ export type Researcher = (ctx: HostContext, id: string) => Promise<void>;
 const QUEUED: Record<AutoResearch, ReadonlySet<unknown>> = { off: new Set(), high: new Set(['high']), medium: new Set(['high', 'medium']) };
 /** Thrown inside the patch that marks a try, so that a candidate no longer to take is left as it is. */
 const SKIP = Symbol('left alone');
+/**
+ * The longest one report takes: 10 minutes for its GitHub part (`timeouts.github`), 20 for the analyst session, and one for the rest (the
+ * evidence pack, the session's start and end). Under a deadline (`HostContext.deadline`), a candidate is taken only with this much left.
+ */
+const REPORT_MS = 31 * 60_000;
 
 /** The UTC day of an ISO time, as the daily report counter has it. */
 const dayOf = (iso: string) => iso.slice(0, 10);
@@ -54,6 +59,7 @@ export class ResearchQueue {
   private running = false;
   private worker: Promise<void> = Promise.resolve();
   private stoppedBecause: string | undefined;
+  private lockRefused = false;
   private tried: ResearchResult[] = [];
 
   constructor(private readonly researcher: Researcher = report) {}
@@ -61,10 +67,13 @@ export class ResearchQueue {
   /** The ids waiting, in the order the worker takes them. */
   get queued(): string[] { return [...this.waiting]; }
   /**
-   * Why the last run stopped short: the data directory's lock was held by another process, taken over by one, or could not be taken, or
-   * the day's reports ran out. A run clears it as it starts, and so does a queueing while no run is going (`put`).
+   * Why the last run stopped short: the data directory's lock was held by another process, taken over by one, or could not be taken, the
+   * day's reports ran out, or, under a deadline, too little time was left for one more report. A run clears it as it starts, and so does a
+   * queueing while no run is going (`put`).
    */
   get notice(): string | undefined { return this.stoppedBecause; }
+  /** Whether another live process holding the data directory's lock refused the last run, which the Host then tries again. A run clears it as it starts. */
+  get refused(): boolean { return this.lockRefused; }
   /** The candidates the current run, or the last one, took on, in order; one it left alone is not among them. A run clears them as it starts. */
   get results(): readonly ResearchResult[] { return this.tried; }
 
@@ -89,6 +98,7 @@ export class ResearchQueue {
     if (this.running || this.waiting.length === 0 || ctx.signal.aborted) return undefined;
     this.running = true;
     this.stoppedBecause = undefined;
+    this.lockRefused = false;
     this.tried = [];
     this.worker = this.drain(ctx);
     return this.worker;
@@ -114,12 +124,19 @@ export class ResearchQueue {
       this.halt(ctx.signal.aborted ? undefined : `自动调研没能拿到数据目录锁：${messageOf(error)}`);
       return;
     }
-    // Another live process is checking or researching in this data directory; the next check here queues these candidates again.
-    if (!lock.held) { this.halt(new LockedError(lock.by).message); return; }
+    // Another live process is checking or researching in this data directory: the Host tries again later, and the next check here queues
+    // these candidates again in any case.
+    if (!lock.held) { this.lockRefused = true; this.halt(new LockedError(lock.by).message); return; }
     try {
       while (this.waiting.length > 0 && !ctx.signal.aborted) {
         // The lock went over to another process while this one stood still: what is left is that process's to do now.
         if (lock.signal.aborted) { this.halt(messageOf(lock.signal.reason)); return; }
+        // Under the launchd job, a report still going when the job ends DSH is lost, and its analyst session counts toward the day for
+        // nothing: what is left waits, unmarked, for the next check.
+        if (ctx.deadline !== undefined && ctx.deadline - ctx.now().getTime() < REPORT_MS) {
+          this.halt(`时间不够，还有 ${this.waiting.length} 条等下次`);
+          return;
+        }
         const id = this.waiting.shift()!;
         this.current = id;
         try { if (!await this.one(ctx, id)) return; } finally { this.current = undefined; }

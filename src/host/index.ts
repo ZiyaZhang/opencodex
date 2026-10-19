@@ -28,12 +28,12 @@ import { rebuildIndex } from './actions/index.js';
 import { models } from './actions/models.js';
 import { readReport } from './actions/read-report.js';
 import { report } from './actions/report.js';
-import { ResearchQueue } from './actions/research-queue.js';
+import { ResearchQueue, enqueueResearch } from './actions/research-queue.js';
 import { loadSettings, updateSettings } from './actions/settings.js';
 import { candidate, respond, type ActionResult } from './actions/snapshot.js';
 import { start } from './actions/start.js';
 import { OPEN_CODEX_DESCRIPTOR, parseRequest, type OpenCodexRequest, type OpenCodexResponse } from './remote.js';
-import { LAST_RUN, runOnce } from './run-once.js';
+import { LAST_RUN, deadlineOf, runOnce } from './run-once.js';
 
 export interface Config { dataDirectory?: string }
 export type { Timers } from '../core/timers.js';
@@ -44,7 +44,7 @@ export interface Dependencies {
   /** Serves the RSS feed instead of the proxy-aware public network. */
   fetcher?: typeof fetch;
   now?: () => Date;
-  /** The check timer; Node's timers, unref'd, by default. */
+  /** The check timer and the retry of research another process's lock refused; Node's timers, unref'd, by default. */
   timers?: Timers;
   /** The timers of the data-directory lock's heartbeat and second look; Node's timers, unref'd, by default. */
   lockTimers?: Timers;
@@ -56,13 +56,21 @@ export interface Dependencies {
   classifyRetryDelaysMs?: number[];
   /** Run-once mode (see run-once.ts), for the launchd job; on when the environment has OPENCODEX_RUN_ONCE=1, which tests never rely on. */
   runOnce?: boolean;
+  /**
+   * In run-once mode, when the run should be over (`HostContext.deadline`), in ms on the Host clock; OPENCODEX_DEADLINE, which the launchd
+   * job sets, by default, and tests never rely on. Outside run-once mode there is none.
+   */
+  deadline?: number;
 }
 declare module '@deepseek-ai/cordis' { interface Context { opencodex: OpenCodex } }
 
 const HOUR = 3_600_000;
 /** The first check waits this long, so it does not compete with DSH starting up. */
 const FIRST_CHECK_DELAY_MS = 60_000;
-/** A check refused by another process's lock is tried again this soon, not a whole interval later: what that process runs takes minutes. */
+/**
+ * A check, or a research run, refused by another process's lock is tried again this soon, not a whole interval later: what that process
+ * runs takes minutes.
+ */
 const LOCKED_RETRY_MS = 10 * 60_000;
 const TIMEOUTS: HostContext['timeouts'] = { check: 30 * 60_000, classify: 15 * 60_000, github: 10 * 60_000 };
 const CLASSIFY_RETRY_DELAYS_MS = [5_000, 20_000];
@@ -95,11 +103,15 @@ export default class OpenCodex extends TypertRemoteService {
   private readonly timers: Timers;
   /** Run-once mode: one check as soon as the Host has started, then its research and last-run.json; no timer, ever. */
   private readonly once: boolean;
+  /** Run-once mode under the launchd job: when the run should be over (`Dependencies.deadline`). */
+  private readonly deadline: number | undefined;
   /** Calls, timer runs, the research worker and the run-once start in progress, waited for on unload. */
   private readonly work = new Set<Promise<unknown>>();
   /** Holds of the data-directory lock taken through the HostContext and not released yet. */
   private readonly locks = new Set<Extract<LockResult, { held: true }>>();
   private timer: unknown;
+  /** The retry armed after another process's lock refused the research (`retryResearch`). */
+  private researchRetry: unknown;
   private closed = false;
 
   constructor(ctx: Context, public config: Config = {}, deps: Dependencies = {}) {
@@ -107,6 +119,7 @@ export default class OpenCodex extends TypertRemoteService {
     this.directory = resolve(config.dataDirectory ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'opencodex'));
     this.timers = deps.timers ?? NODE_TIMERS;
     this.once = deps.runOnce ?? process.env.OPENCODEX_RUN_ONCE === '1';
+    this.deadline = this.once ? deps.deadline ?? this.deadlineFromEnvironment() : undefined;
     ctx.typert.register({ package: 'dsh-opencodex', face: 'host', schemas: [], model: { services: [], events: [], objects: [] }, invocations: [OPEN_CODEX_DESCRIPTOR] });
     this.ready = this.open(deps);
     void this.ready.catch(() => undefined); // reported by [Service.init] and by every call
@@ -117,6 +130,17 @@ export default class OpenCodex extends TypertRemoteService {
 
   /** Cordis runs this after construction: a settings.json that cannot be used fails the plugin start with the reason. */
   async [Service.init](): Promise<void> { await this.ready; }
+
+  /**
+   * OPENCODEX_DEADLINE (`deadlineOf`). One that is no time leaves the run without a deadline, and the DSH log says so: the job's daily log
+   * has DSH's output, so a script that passes something else shows there.
+   */
+  private deadlineFromEnvironment(): number | undefined {
+    const value = process.env.OPENCODEX_DEADLINE;
+    const deadline = deadlineOf(value);
+    if (value !== undefined && deadline === undefined) this.ctx.logger.warn(`opencodex: OPENCODEX_DEADLINE 不是毫秒时间戳，这次自动调研不按它限时：${value}`);
+    return deadline;
+  }
 
   /**
    * The one Remote method: checks the request, runs its action, and answers with the snapshot plus what the action returns. The wire codec
@@ -172,7 +196,7 @@ export default class OpenCodex extends TypertRemoteService {
       setSettings: next => { settings = next; this.rearm(host); },
       github: () => deps.github ?? new GitHubClient(),
       lock: kind => this.lock(kind, { now, timers: deps.lockTimers }),
-      fetcher: deps.fetcher, reportPollMs: deps.reportPollMs, timeouts: { ...TIMEOUTS, ...deps.timeouts },
+      fetcher: deps.fetcher, reportPollMs: deps.reportPollMs, timeouts: { ...TIMEOUTS, ...deps.timeouts }, ...(this.deadline !== undefined && { deadline: this.deadline }),
       classifyRetryDelaysMs: deps.classifyRetryDelaysMs ?? CLASSIFY_RETRY_DELAYS_MS,
       index: await loadIndex(this.directory),
       busy: new Map(), running: new Map(), reportsRunning: 0, research: new ResearchQueue(),
@@ -217,11 +241,35 @@ export default class OpenCodex extends TypertRemoteService {
   /**
    * Starts the research worker on what checks and classifications queued, unless it runs already (it takes what is queued meanwhile). It
    * starts only after the check has ended, so that the reports, minutes each, are no part of a check a later request would join, nor
-   * under its deadline or its lock; unload waits for it.
+   * under its deadline or its lock; unload waits for it. A run that starts takes the place of a retry armed before it, and a run that
+   * another process's lock refuses arms one (`retryResearch`).
    */
   private startResearch(host: HostContext): void {
     const worker = host.research.start(host);
-    if (worker) void this.track(worker);
+    if (!worker) return;
+    this.dropResearchRetry();
+    void this.track(worker.then(() => { if (host.research.refused) this.retryResearch(host); }));
+  }
+
+  /**
+   * Research refused by another process's lock is queued again, and started on, 10 minutes later, as a refused check is tried again:
+   * otherwise it waits for the next check, a whole interval away. The queue is made anew, since the other process may have taken some of
+   * it on. Not in run-once mode, whose job ends DSH after its one run: last-run.json has the refusal, and the next day's run queues again.
+   */
+  private retryResearch(host: HostContext): void {
+    this.dropResearchRetry();
+    if (this.closed || this.once) return;
+    this.researchRetry = this.timers.set(() => {
+      this.researchRetry = undefined;
+      void this.track(enqueueResearch(host).then(() => this.startResearch(host), error => {
+        if (!this.closed) this.ctx.logger.warn(`OpenCodex: 自动调研重试没能排队：${messageOf(error)}`);
+      }));
+    }, LOCKED_RETRY_MS);
+  }
+
+  private dropResearchRetry(): void {
+    if (this.researchRetry !== undefined) this.timers.clear(this.researchRetry);
+    this.researchRetry = undefined;
   }
 
   private disarm(): void {
@@ -263,10 +311,14 @@ export default class OpenCodex extends TypertRemoteService {
     return work;
   }
 
-  /** Unload: no more timer, every running report, start, check, classification and research aborted, their ends waited for, and the lock let go. */
+  /**
+   * Unload: no more timers, every running report, start, check, classification and research aborted, their ends waited for, and the lock
+   * let go.
+   */
   private async close(): Promise<void> {
     this.closed = true;
     this.disarm();
+    this.dropResearchRetry();
     this.lifetime.abort(new DOMException('OpenCodex 已卸载', 'AbortError'));
     await Promise.allSettled([...this.work]);
     // Each run lets go of its lock as it ends. A hold still here would go on beating, and refusing every other process, while DSH runs.

@@ -55,6 +55,11 @@ export interface HostContext {
   readonly services: ReportHost & { readonly llm: ClassifyLlm & ModelsLlm };
   /** How long a check, a `classify` action and the GitHub part of a report may take, in ms. */
   readonly timeouts: { readonly check: number; readonly classify: number; readonly github: number };
+  /**
+   * Run-once mode under the launchd job: when the run should be over, in ms on the Host clock (OPENCODEX_DEADLINE, 10 minutes before the
+   * job ends DSH). Automatic research takes no candidate whose report could not finish by then. Absent otherwise.
+   */
+  readonly deadline?: number;
   /** The settings in force. */
   settings(): Readonly<Settings>;
   /** Puts settings in force once they are on disk, and re-arms the check timer. */

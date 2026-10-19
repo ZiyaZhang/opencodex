@@ -3,6 +3,8 @@
  * as the Host has started, lets the automatic research that check queued run out, writes `last-run.json` and arms no timer. The job ends
  * DSH once that file is replaced, so it is written however the run went: refused by another process's lock, failed as a whole, even when
  * the Host could not start. Only an unload writes nothing: it cuts the run short, and the job takes an end without the file as a failure.
+ * The job also passes OPENCODEX_DEADLINE (`deadlineOf`), 10 minutes before it ends DSH: the research takes no candidate whose report could
+ * not finish by then, and the notice says how many wait for the next run.
  */
 import { join } from 'node:path';
 import { LockedError } from '../core/lock.js';
@@ -16,6 +18,16 @@ import type { ResearchResult } from './actions/research-queue.js';
 export const LAST_RUN = 'last-run.json';
 /** The prefix of the `errors` line a check gets when its checks.jsonl line could not be written. */
 const UNLOGGED = 'log: ';
+
+/**
+ * OPENCODEX_DEADLINE as the launchd job sets it: when the run should be over, in whole milliseconds since the epoch. Undefined when it is
+ * not set or is anything else, which leaves the run without a deadline, as before the job passed one.
+ */
+export function deadlineOf(value: string | undefined): number | undefined {
+  if (value === undefined || !/^\d+$/.test(value)) return undefined;
+  const ms = Number(value);
+  return Number.isSafeInteger(ms) ? ms : undefined;
+}
 
 /** What `last-run.json` holds: one run-once start, from its start to its end. */
 export interface LastRun {
@@ -31,7 +43,10 @@ export interface LastRun {
   check: CheckLogEntry | null;
   /** The candidates the automatic research took on, in order, as the queue's `results` has them. */
   reports: ResearchResult[];
-  /** Why the run fell short, when it did: the refusal of the check, a check line not found, why the research stopped, why the Host did not start. */
+  /**
+   * Why the run fell short, when it did: the refusal of the check, a check line not found, why the research stopped (too little time left
+   * included), why the Host did not start.
+   */
   notice?: string;
 }
 
