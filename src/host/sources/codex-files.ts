@@ -238,15 +238,29 @@ function titleOf(group: Pick<FileGroup, 'kind' | 'files' | 'flag'>, version?: st
 /*
  * Flags. A flag is defined by a field of a feature's config, `pub <name>: Option<…>`, or by an entry of the registry, `key: "<name>"`; a field and an entry of the
  * same name are one flag. A field named `enabled` is no flag: it switches on the feature whose config it sits in. What describes a definition is the run of `///` lines
- * right above it, attribute lines (`#[…]`) in the run passed over. An entry has no `///` of its own: the `id: Feature::<Variant>,` line above it names its variant
- * of `pub enum Feature`, and the run above that variant describes it.
+ * right above it, attribute lines (`#[…]`, also one that rustfmt broke over several lines) in the run passed over. An entry is a whole `FeatureSpec { … }` literal,
+ * and it has no `///` of its own: its `id: Feature::<Variant>,` names its variant of `pub enum Feature`, and the run above that variant describes it.
  */
 const FLAG_FIELD = /^\s*pub\s+([a-z][a-z0-9_]*):\s*Option</;
 const FLAG_KEY = /^\s*key:\s*"([a-z][a-z0-9_]*)"/;
 const DOC_COMMENT = /^\s*\/\/\/(?!\/)/; // `////` is a plain comment
 const ATTRIBUTE = /^\s*#\[/;
+/** The last line of an attribute that rustfmt broke over several lines, such as `#[serde(` … `)]`. */
+const ATTRIBUTE_END = /\)\]\s*$/;
 const VARIANT_ID = /^\s*id:\s*Feature::([A-Za-z_][A-Za-z0-9_]*)\s*,/;
 const FEATURE_ENUM = /^\s*pub(?:\([^)]*\))?\s+enum\s+Feature\b/;
+/** The line that opens a struct literal, `FeatureSpec {` in the registry; rustfmt puts it on a line of its own. */
+const LITERAL_HEAD = /^\s*[A-Z][A-Za-z0-9_]*\s*\{\s*$/;
+/** A field of a struct literal, `stage: Stage::Stable,`, by its name; a `::` after the name is a path, not a field. */
+const LITERAL_FIELD = /^\s*([a-z_][a-z0-9_]*)\s*:(?!:)/;
+/**
+ * The fields of a registry entry its flag shows besides the key: whether the flag is still being built, experimental or stable, and whether it is on unless the user
+ * turns it off. The rest of the literal tells nothing more: its head and closing line are the same on every entry, and `id` only names the variant whose description
+ * the flag shows.
+ */
+const SHOWN_FIELDS: ReadonlySet<string> = new Set(['stage', 'default_enabled']);
+/** A line of Rust without its string and character literals and its comment, so that the brackets in them are not counted. */
+const codeOf = (line: string): string => line.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)'/g, '""').replace(/\/\/.*$/, '');
 function definitionOf(line: string): { name: string; entry: boolean } | undefined {
   const field = FLAG_FIELD.exec(line)?.[1];
   if (field !== undefined) return field === 'enabled' ? undefined : { name: field, entry: false };
@@ -255,7 +269,7 @@ function definitionOf(line: string): { name: string; entry: boolean } | undefine
 }
 /**
  * The line of `lines` (a new text) that each added line is, or undefined when the added lines cannot have come from that text. `addedLines` counts copies in order,
- * so the added copies of a line are its last ones in the new text: which copy of a repeated attribute a definition owns is told by place, not by content alone.
+ * so the added copies of a line are its last ones in the new text, which need not be where the definition that brought them stands (see `restOf`).
  */
 function placesIn(lines: string[], added: string[]): number[] | undefined {
   const where = new Map<string, number[]>();
@@ -275,13 +289,71 @@ function placesIn(lines: string[], added: string[]): number[] | undefined {
   return places;
 }
 /**
- * The first line of the run of `///` and attribute lines right above line `end`; `end` itself when there is none. Only one-line attributes are read: one that rustfmt
- * broke over several lines ends the run, and what stands above it is not taken.
+ * The first line of the run of `///` and attribute lines right above line `end`; `end` itself when there is none. An attribute that rustfmt broke over several lines
+ * shows as a `)]` line: the run goes on above the `#[` that opens it, since the description of the definition stands over that.
  */
 function runAbove(lines: string[], end: number): number {
   let top = end;
-  while (top > 0 && (DOC_COMMENT.test(lines[top - 1]!) || ATTRIBUTE.test(lines[top - 1]!))) top--;
+  while (top > 0) {
+    const above = lines[top - 1]!;
+    const start = DOC_COMMENT.test(above) || ATTRIBUTE.test(above) ? top - 1 : ATTRIBUTE_END.test(above) ? attributeStart(lines, top - 1) : -1;
+    if (start < 0) break;
+    top = start;
+  }
   return top;
+}
+/**
+ * The `#[` line of the attribute that line `end` closes with `)]`: going up, the line where its brackets balance, which has to start with `#[`; -1 for anything else,
+ * such as an expression that ends in `)]`.
+ */
+function attributeStart(lines: string[], end: number): number {
+  let open = 0; // brackets closed on the lines read so far and not opened yet
+  for (let line = end; line >= 0; line--) {
+    for (const char of codeOf(lines[line]!)) open += ')]'.includes(char) ? 1 : '(['.includes(char) ? -1 : 0;
+    if (open <= 0) return open === 0 && ATTRIBUTE.test(lines[line]!) ? line : -1;
+  }
+  return -1;
+}
+/**
+ * The struct literal that line `at` stands in, such as the `FeatureSpec { … },` of a registry entry: from its `Name {` line to the line that closes it. Undefined when
+ * the innermost brace around `at` opens something else (a function body, a `match`), or never closes.
+ */
+function literalAround(lines: string[], at: number): { from: number; to: number } | undefined {
+  let closed = 0, from = -1; // braces closed between a line and `at`, going up
+  for (let line = at - 1; line >= 0 && from < 0; line--) {
+    const code = codeOf(lines[line]!);
+    for (let char = code.length - 1; char >= 0; char--) {
+      if (code[char] === '}') closed++;
+      else if (code[char] === '{') {
+        if (closed === 0) { from = line; break; }
+        closed--;
+      }
+    }
+  }
+  if (from < 0 || !LITERAL_HEAD.test(codeOf(lines[from]!))) return undefined;
+  let depth = 0;
+  for (let line = from; line < lines.length; line++) {
+    for (const char of codeOf(lines[line]!)) {
+      if (char === '{') depth++;
+      else if (char === '}' && --depth === 0) return { from, to: line };
+    }
+  }
+  return undefined;
+}
+/**
+ * The fields of a struct literal (see `literalAround`), each by name with the lines it spans: a value that rustfmt broke inside its own brackets, such as a
+ * `Stage::Experimental { … }`, runs to the line that closes them.
+ */
+function fieldsOf(lines: string[], literal: { from: number; to: number }): Array<{ name: string; from: number; to: number }> {
+  const fields: Array<{ name: string; from: number; to: number }> = [];
+  let depth = 1; // inside the braces of the literal
+  for (let line = literal.from + 1; line < literal.to; line++) {
+    const name = depth === 1 ? LITERAL_FIELD.exec(lines[line]!)?.[1] : undefined;
+    if (name !== undefined) fields.push({ name, from: line, to: line });
+    else if (depth > 1 && fields.length > 0) fields.at(-1)!.to = line;
+    for (const char of codeOf(lines[line]!)) depth += '{[('.includes(char) ? 1 : '}])'.includes(char) ? -1 : 0;
+  }
+  return fields;
 }
 /** The line of variant `name` in `pub enum Feature`, or -1. A variant may have a value (`Name = 3,`); its attributes stand above it, in its run. */
 function variantLine(lines: string[], name: string): number {
@@ -290,7 +362,7 @@ function variantLine(lines: string[], name: string): number {
   const variant = new RegExp(`^\\s*${name}\\s*(?:=[^,]*)?,?\\s*$`); // `name` is an identifier: nothing in it needs escaping
   let depth = 0, opened = false;
   for (let at = start; at < lines.length; at++) {
-    const code = lines[at]!.replace(/\/\/.*$/, ''); // a doc comment may hold braces
+    const code = codeOf(lines[at]!); // a doc comment or a string may hold braces
     if (depth === 1 && variant.test(code)) return at;
     for (const char of code) {
       if (char === '{') { depth++; opened = true; } else if (char === '}') depth--;
@@ -301,11 +373,12 @@ function variantLine(lines: string[], name: string): number {
 }
 /**
  * The flags a feature file defines among its added lines, in the order they are defined, each with the lines it shows, and the added lines no flag took.
- * A definition takes the run above it, and an entry also its variant with the run above that; a flag shows the `///` lines of what it took and its definitions, in the
- * order of the file, and hides the attributes and the variant line. The rest is the added lines less the copies the flags took.
+ * A definition takes the run above it. An entry also takes its whole `FeatureSpec { … }` literal, and its variant with the run above that. A flag shows the `///`
+ * lines of what it took, its definitions and, of an entry's literal, the fields in `SHOWN_FIELDS`, all in the order of the file; it hides the attributes, the variant
+ * line and the rest of the literal. The rest is the added lines less what the flags took (see `restOf`).
  * The runs are read in `text`, the new version of the file, when the added lines come from it: a description the window left as it was is shown as well, and lines
- * that are next to each other among the added lines but not in the file stay apart. Without it they are read among the added lines, and an entry gets no description,
- * since its variant cannot be looked up.
+ * that are next to each other among the added lines but not in the file stay apart. Without it they are read among the added lines, and an entry keeps its key line
+ * alone: lines torn from their context tell neither where its literal starts and ends nor what its variant is.
  */
 function flagsOf(file: ChangedFile, text?: string): { flags: Array<{ name: string; lines: string[] }>; rest: string[] } {
   const definitions = file.added.flatMap((line, index) => { const found = definitionOf(line); return found ? [{ ...found, index }] : []; });
@@ -314,29 +387,63 @@ function flagsOf(file: ChangedFile, text?: string): { flags: Array<{ name: strin
   const placed = textLines && placesIn(textLines, file.added);
   const lines = textLines && placed ? textLines : file.added;
   const places = placed ?? file.added.map((_, index) => index);
-  const addedAt = new Map(places.map((place, index) => [place, index]));
-  const taken = new Set<number>(); // indices into `file.added`
+  const owned = new Set<number>(); // lines of `lines` some flag took, shown or not
   const shown = new Map<string, Set<number>>(); // lines of `lines`, per flag
   for (const { name, entry, index } of definitions) {
     const end = places[index]!;
-    const runs: Array<{ from: number; to: number; showsEnd: boolean }> = [{ from: runAbove(lines, end), to: end, showsEnd: true }];
-    const variant = entry && placed ? VARIANT_ID.exec(lines[end - 1] ?? '')?.[1] : undefined;
-    const variantAt = variant === undefined ? -1 : variantLine(lines, variant);
-    if (variantAt >= 0) runs.push({ from: runAbove(lines, variantAt), to: variantAt, showsEnd: false });
     const own = shown.get(name) ?? new Set<number>();
-    for (const { from, to, showsEnd } of runs) {
+    const take = (from: number, to: number, shows: (line: number) => boolean) => {
       for (let line = from; line <= to; line++) {
-        const added = addedAt.get(line);
-        if (added !== undefined) taken.add(added);
-        if (line === to ? showsEnd : DOC_COMMENT.test(lines[line]!)) own.add(line);
+        owned.add(line);
+        if (shows(line)) own.add(line);
       }
+    };
+    take(runAbove(lines, end), end, line => line === end || DOC_COMMENT.test(lines[line]!));
+    if (entry && placed) {
+      const literal = literalAround(lines, end);
+      const fields = literal ? fieldsOf(lines, literal) : [];
+      if (literal) take(literal.from, literal.to, line => fields.some(field => SHOWN_FIELDS.has(field.name) && field.from <= line && line <= field.to));
+      const idAt = literal ? fields.find(field => field.name === 'id')?.from : end - 1;
+      const variant = idAt === undefined ? undefined : VARIANT_ID.exec(lines[idAt] ?? '')?.[1];
+      const variantAt = variant === undefined ? -1 : variantLine(lines, variant);
+      if (variantAt >= 0) take(runAbove(lines, variantAt), variantAt, line => DOC_COMMENT.test(lines[line]!));
     }
     shown.set(name, own);
   }
   return {
     flags: [...shown].map(([name, own]) => ({ name, lines: [...own].sort((a, b) => a - b).map(line => lines[line]!) })),
-    rest: file.added.filter((_, index) => !taken.has(index)),
+    rest: restOf(file.added, places, lines, owned),
   };
+}
+/**
+ * The added lines less the ones the flags took: `owned` holds lines of `lines`, and `places` says which line of `lines` each added line is.
+ * A line taken where an added line stands is that added line. A line taken elsewhere can still be one the window added: `addedLines` counts copies, so of a line that
+ * repeats (the `#[serde(…)]` over every field, the `FeatureSpec {`, `stage`, `default_enabled` and `},` of every entry) the added copies are its last ones in the
+ * file, wherever the definition that brought one stands. Left in the rest, that copy would make a registry candidate of one stray line. So those lines take, by content
+ * and count, from what is left once every flag has taken its lines by place: taken earlier, by content, a copy could be one that another flag takes where it stands.
+ * Among copies of one line the first left goes: the added copies come after every copy the old text had. Counting cannot tell which copy the window brought, so a
+ * line the window left as it was takes a copy as well when one is left.
+ */
+function restOf(added: string[], places: number[], lines: string[], owned: ReadonlySet<number>): string[] {
+  const addedAt = new Map(places.map((place, index) => [place, index]));
+  const taken = new Set<number>(); // indices into `added`
+  const elsewhere: string[] = [];
+  for (const line of [...owned].sort((a, b) => a - b)) {
+    const index = addedAt.get(line);
+    if (index !== undefined) taken.add(index);
+    else elsewhere.push(lines[line]!);
+  }
+  const left = new Map<string, number[]>(); // the indices of the added lines not taken yet, by content
+  for (const [index, line] of added.entries()) {
+    if (taken.has(index)) continue;
+    const copies = left.get(line);
+    if (copies) copies.push(index); else left.set(line, [index]);
+  }
+  for (const line of elsewhere) {
+    const copy = left.get(line)?.shift();
+    if (copy !== undefined) taken.add(copy);
+  }
+  return added.filter((_, index) => !taken.has(index));
 }
 
 /**

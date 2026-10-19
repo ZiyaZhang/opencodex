@@ -269,16 +269,17 @@ test('groupWatchedFiles: with the new text, a description is read where the defi
     '    /// Prepare compaction in the background.', '    #[doc(hidden)]', '    AsyncCompaction = 7,', '    #[serde(default)]', '    pub async_compaction: Option<bool>,', '    pub enabled: Option<bool>,',
     '    FeatureSpec {', '        id: Feature::AsyncCompaction,', '        key: "async_compaction",', '    },',
   ]);
-  // The `id:` above the key names the variant; its `///` line, across the attribute and whatever the value, describes the flag. The attributes and the variant line go
-  // with the flag and are not shown.
+  // The entry's `id:` names the variant; its `///` line, across the attribute and whatever the value, describes the flag. The attributes, the variant line and the
+  // whole `FeatureSpec { … }` go with the flag; of the literal only the key is shown, as this entry has no `stage` or `default_enabled`.
   const [rest, flag] = groupWatchedFiles([file], '0.163', new Map([[path, after]]));
   assert.deepEqual(flag, {
     key: 'feature-flag:async_compaction', kind: 'feature-flag', flag: 'async_compaction', title: 'async_compaction',
     files: [{ ...file, added: ['    /// Prepare compaction in the background.', '    pub async_compaction: Option<bool>,', '        key: "async_compaction",'] }],
     excerpt: 'lib.rs:     /// Prepare compaction in the background.\nlib.rs:     pub async_compaction: Option<bool>,\nlib.rs:         key: "async_compaction",',
   });
-  assert.deepEqual(rest!.files, [{ ...file, added: ['    pub enabled: Option<bool>,', '    FeatureSpec {', '        id: Feature::AsyncCompaction,', '    },'] }]);
-  // Without the text there is no variant to look up: the key has no description, and the variant's lines are a change of the registry.
+  assert.deepEqual(rest!.files, [{ ...file, added: ['    pub enabled: Option<bool>,'] }]);
+  // Without the text there is neither a variant nor a literal to look up: the key has no description, and the variant's lines and the rest of the entry are a change
+  // of the registry.
   const [restWithout, flagWithout] = groupWatchedFiles([file], '0.163');
   assert.deepEqual(flagWithout!.files, [{ ...file, added: ['    pub async_compaction: Option<bool>,', '        key: "async_compaction",'] }]);
   assert.deepEqual(restWithout!.files[0]!.added, [
@@ -311,7 +312,85 @@ test('groupWatchedFiles: only a variant of `pub enum Feature` describes a regist
   const file: ChangedFile = { path, status: 'modified', added: ['    /// Not the flag.', '    Masking,', '        id: Feature::Masking,', '        key: "masking",'] };
   const [rest, flag] = groupWatchedFiles([file], undefined, new Map([[path, text]]));
   assert.deepEqual(flag!.files, [{ ...file, added: ['        key: "masking",'] }]);
-  assert.deepEqual(rest!.files, [{ ...file, added: ['    /// Not the flag.', '    Masking,', '        id: Feature::Masking,'] }]);
+  // The `id:` goes with its entry all the same; the variant of the other enum is a change of the registry.
+  assert.deepEqual(rest!.files, [{ ...file, added: ['    /// Not the flag.', '    Masking,'] }]);
+});
+
+test('groupWatchedFiles: the attribute over every field goes with a field added between two others, though its added copy is counted to the last field', () => {
+  const path = 'codex-rs/features/src/lib.rs';
+  const serde = '    #[serde(default, skip_serializing_if = "Option::is_none")]';
+  const toml = (...fields: string[]) => ['pub struct FeaturesToml {', ...fields.flatMap(field => [serde, `    pub ${field}: Option<bool>,`]), '}', ''].join('\n');
+  const grouped = (before: string, after: string) => {
+    const file: ChangedFile = { path, status: 'modified', added: addedLines(before, after) };
+    return { added: file.added, groups: groupWatchedFiles([file], '0.163', new Map([[path, after]])).map(g => [g.key, g.files.map(f => f.added)]) };
+  };
+  // `addedLines` counts copies in order: the added copy of the attribute is its last one, over `undo`, which did not change. The copy over the new field takes it by
+  // content, so no registry group of that one line is left.
+  assert.deepEqual(grouped(toml('apps', 'undo'), toml('apps', 'remote_compaction', 'undo')), {
+    added: ['    pub remote_compaction: Option<bool>,', serde],
+    groups: [['feature-flag:remote_compaction', [['    pub remote_compaction: Option<bool>,']]]],
+  });
+  // Every flag takes its lines where they stand before any line is taken by content: `worktrees` keeps the copy over it, and `remote_compaction` gets the one left,
+  // over `zsh`. Taken first, by content, it would have got the copy of `worktrees` and left the one over `zsh` behind.
+  assert.deepEqual(grouped(toml('apps', 'undo', 'zsh'), toml('apps', 'remote_compaction', 'undo', 'worktrees', 'zsh')), {
+    added: ['    pub remote_compaction: Option<bool>,', serde, '    pub worktrees: Option<bool>,', serde],
+    groups: [['feature-flag:remote_compaction', [['    pub remote_compaction: Option<bool>,']]], ['feature-flag:worktrees', [['    pub worktrees: Option<bool>,']]]],
+  });
+  // The new field has the copy over it where it stands, so the one a field the window left as it was gained is a change of the registry.
+  assert.deepEqual(grouped(['pub struct FeaturesToml {', serde, '    pub apps: Option<bool>,', '    pub undo: Option<bool>,', '}', ''].join('\n'), toml('apps', 'remote_compaction', 'undo')), {
+    added: [serde, '    pub remote_compaction: Option<bool>,', serde],
+    groups: [['feature-flags', [[serde]]], ['feature-flag:remote_compaction', [['    pub remote_compaction: Option<bool>,']]]],
+  });
+});
+
+test('groupWatchedFiles: a registry entry takes its whole FeatureSpec literal and shows its stage and default, also where the added copies are another entry\'s', () => {
+  const path = 'codex-rs/features/src/lib.rs';
+  const spec = (variant: string, key: string, stage: string[], enabled: boolean) => [
+    '    FeatureSpec {', `        id: Feature::${variant},`, `        key: "${key}",`, ...stage, `        default_enabled: ${enabled},`, '    },',
+  ];
+  const lib = (variants: string[], entries: string[][]) => ['pub enum Feature {', ...variants, '}', '', 'pub const FEATURES: &[FeatureSpec] = &[', ...entries.flat(), '];', ''].join('\n');
+  const undo = spec('Undo', 'undo', ['        stage: Stage::Stable,'], true), apps = spec('Apps', 'apps', ['        stage: Stage::UnderDevelopment,'], false);
+  const masking = spec('CredentialMasking', 'credential_masking', ['        stage: Stage::UnderDevelopment,'], false);
+  const experimental = ['        stage: Stage::Experimental {', '            name: "Worktrees",', '            menu_description: "Run each thread in its own worktree.",', '        },'];
+  const worktrees = spec('Worktrees', 'worktrees', experimental, false);
+  const before = lib(['    /// Undo the last turn.', '    Undo,', '    /// Connect apps.', '    Apps,'], [undo, apps]);
+  const after = lib([
+    '    /// Undo the last turn.', '    Undo,', '    /// Mask credentials before they reach the model.', '    CredentialMasking,', '    /// Connect apps.', '    Apps,',
+    '    /// Give each thread a git worktree of its own.', '    Worktrees,',
+  ], [undo, masking, apps, worktrees]);
+  const file: ChangedFile = { path, status: 'modified', added: addedLines(before, after) };
+  // Of the entry added in the middle only `id` and `key` are added lines where they stand: the added copies of its other lines are the last ones, in `apps`.
+  assert.deepEqual(file.added, [
+    '    /// Mask credentials before they reach the model.', '    CredentialMasking,', '    /// Give each thread a git worktree of its own.', '    Worktrees,',
+    '        id: Feature::CredentialMasking,', '        key: "credential_masking",',
+    '    FeatureSpec {', '        stage: Stage::UnderDevelopment,', '        default_enabled: false,', '    },',
+    ...worktrees,
+  ]);
+  // An entry shows its key, its stage (whole when rustfmt broke it over lines) and its default; its head, `id` and closing line go with it unseen. What the entry in
+  // the middle stands on elsewhere it takes by content from the copies counted to `apps`, so no registry group of boilerplate is left.
+  assert.deepEqual(groupWatchedFiles([file], '0.163', new Map([[path, after]])).map(g => [g.key, g.files.map(f => f.added)]), [
+    ['feature-flag:credential_masking', [['    /// Mask credentials before they reach the model.', '        key: "credential_masking",', '        stage: Stage::UnderDevelopment,', '        default_enabled: false,']]],
+    ['feature-flag:worktrees', [['    /// Give each thread a git worktree of its own.', '        key: "worktrees",', ...experimental, '        default_enabled: false,']]],
+  ]);
+});
+
+test('groupWatchedFiles: an attribute rustfmt broke over several lines does not cut the description off', () => {
+  const path = 'codex-rs/features/src/feature_configs.rs';
+  const description = "    /// Percentage of the model's full context window that starts background compaction.";
+  const after = [
+    'pub struct AsyncCompactionConfigToml {', '    pub enabled: Option<bool>,', description, '    #[schemars(range(min = 1, max = 100))]',
+    '    #[serde(', '        default,', '        skip_serializing_if = "Option::is_none",', '        deserialize_with = "crate::percent::deserialize_optional"', '    )]',
+    '    pub model_async_compact_threshold_percent: Option<u8>,', '}', '',
+  ].join('\n');
+  const file: ChangedFile = { path, status: 'added', added: addedLines('', after) };
+  // Above `)]` the run goes on at the `#[serde(` that opens it, then over the one-line attribute to the description; the attribute lines go with the flag unseen.
+  // Every line of the file is new, so the run reads the same in the text and among the added lines.
+  for (const texts of [new Map([[path, after]]), undefined]) {
+    assert.deepEqual(groupWatchedFiles([file], undefined, texts).map(g => [g.key, g.files.map(f => f.added)]), [
+      ['feature-flags', [['pub struct AsyncCompactionConfigToml {', '    pub enabled: Option<bool>,', '}']]],
+      ['feature-flag:model_async_compact_threshold_percent', [[description, '    pub model_async_compact_threshold_percent: Option<u8>,']]],
+    ]);
+  }
 });
 
 test('groupWatchedFiles: a flag defined in two files is one group; the registry group holds only what no flag took, and a file without a flag goes to it as it is', () => {
@@ -1504,8 +1583,9 @@ test('collectFileChanges: every flag a window adds is a candidate of its own, de
     assert.equal(masking!.summary, 'lib.rs:     /// Mask credentials before they reach the model.\nlib.rs:         key: "credential_masking",');
     assert.deepEqual(preserve!.evidence, [{ kind: 'feature-flag', ref: configs, url: urlOf(WINDOW, configs), excerpt: "    /// Preserve the parent's history on full forks.\n    pub preserve_fork_prefix: Option<bool>," }]);
     assert.equal(wait!.evidence[0]!.excerpt, '    /// Wait for agents.\n    pub wait_agent_enabled: Option<u8>,');
-    // The added attribute went with a field, so nothing of feature_configs.rs is left; the other lines of the new registry entry are.
-    assert.deepEqual(rest!.evidence, [{ kind: 'feature-flag', ref: lib, url: urlOf(WINDOW, lib), excerpt: 'pub use feature_configs::MultiAgentConfigToml;\n    FeatureSpec {\n        id: Feature::CredentialMasking,\n    },' }]);
+    // The added attribute went with a field, so nothing of feature_configs.rs is left; the new registry entry went whole with its key, so of lib.rs only the
+    // re-export is.
+    assert.deepEqual(rest!.evidence, [{ kind: 'feature-flag', ref: lib, url: urlOf(WINDOW, lib), excerpt: 'pub use feature_configs::MultiAgentConfigToml;' }]);
   });
 });
 

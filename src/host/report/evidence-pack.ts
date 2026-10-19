@@ -165,8 +165,8 @@ export function rankDiffFiles(files: DiffFile[], budget: number, options: { cutL
 
 /**
  * The per-file diffs of a candidate. A release candidate gets the diff of each of its pull requests, split into files and tagged `#<number>`; a codex-files candidate
- * gets the added lines of its own files (its evidence refs) from the snapshots of its windows, as `+` lines tagged with the windows they span; desktop and RSS
- * candidates have none. What cannot be read is left out and reported through `onError`; an abort is rethrown.
+ * gets the added lines of its own files (its evidence refs) from the snapshots of its windows, as `+` lines tagged with the windows they span, a feature-flag candidate
+ * only the lines of its flag; desktop and RSS candidates have none. What cannot be read is left out and reported through `onError`; an abort is rethrown.
  */
 export async function diffsFor(candidate: Candidate, deps: DiffSources, signal?: AbortSignal): Promise<DiffFile[]> {
   signal?.throwIfAborted();
@@ -273,6 +273,21 @@ function windowsOf(candidate: Candidate): { covers: (snapshot: Snapshot) => bool
   if (version.split('.').length === 2) return { covers: snapshot => minor(snapshot.toTag) === version, label: `windows ending in ${version}` };
   return { covers: snapshot => snapshot.toTag === `rust-v${version}`, label: `window ending at rust-v${version}` };
 }
+/**
+ * A candidate of one feature flag, `codex-files:feature-flag:<name>:<version>`. The evidence entry of a file is then that flag's lines of the file, not every line
+ * the file gained, which the registry candidate (`codex-files:feature-flags:<version>`) and the snapshots keep.
+ */
+const isFlagCandidate = (candidate: Candidate) => /^codex-files:feature-flag:/.test(candidate.fingerprint);
+/** The lines of the evidence excerpts, by ref; a damaged entry without a text excerpt gives none. */
+function excerptLines(evidence: Evidence[]): Map<string, Set<string>> {
+  const lines = new Map<string, Set<string>>();
+  for (const entry of evidence) {
+    const own = lines.get(entry.ref) ?? new Set<string>();
+    for (const line of typeof entry.excerpt === 'string' ? entry.excerpt.split('\n') : []) own.add(line);
+    lines.set(entry.ref, own);
+  }
+  return lines;
+}
 const isSnapshotEntry = (value: unknown): value is SnapshotEntry => {
   if (typeof value !== 'object' || value === null) return false;
   const entry = value as Record<string, unknown>;
@@ -292,6 +307,8 @@ async function readSnapshot(dir: string, name: string, onError?: (message: strin
  * The added lines of the candidate's own files across the snapshots of its windows, oldest window first, each line once per file, tagged `<from>__<to>` with the
  * windows that gave lines. An entry with an `error` was never read: it adds nothing and is reported as `unknown content: <path> in <window>: <reason>`, because
  * unread is not empty. A candidate no snapshot covers is reported too.
+ * A feature-flag candidate gets of each file only the lines that its evidence excerpt of that file holds (see `isFlagCandidate`): the snapshot keeps every line
+ * the file gained, the other flags' too.
  */
 async function snapshotDiffs(candidate: Candidate, { snapshotDir, onError }: DiffSources): Promise<DiffFile[]> {
   const none = (reason: string): DiffFile[] => { onError?.(`no added lines for ${candidate.id}: ${reason}`); return []; };
@@ -304,14 +321,17 @@ async function snapshotDiffs(candidate: Candidate, { snapshotDir, onError }: Dif
     .sort((a, b) => byVersion(a.to, b.to) || byVersion(a.from, b.from));
   if (snapshots.length === 0) return none(`no snapshot of the ${windows.label}`);
   const own = new Set(candidate.evidence.map(entry => entry.ref));
+  const flagLines = isFlagCandidate(candidate) ? excerptLines(candidate.evidence) : undefined;
   const found = new Map<string, { lines: Set<string>; from: string; to: string }>();
   for (const snapshot of snapshots) {
     for (const file of await readSnapshot(dir, snapshot.name, onError) ?? []) {
       if (!own.has(file.path)) continue; // another group's file of the same window
       if (file.error !== undefined) { onError?.(`unknown content: ${file.path} in ${snapshot.fromTag}__${snapshot.toTag}: ${file.error}`); continue; }
-      if (file.added.length === 0) continue;
+      // A window that gave the flag no line of this file does not go into the tag either.
+      const added = flagLines ? file.added.filter(line => flagLines.get(file.path)?.has(line)) : file.added;
+      if (added.length === 0) continue;
       const entry = found.get(file.path) ?? { lines: new Set<string>(), from: snapshot.fromTag, to: snapshot.toTag };
-      for (const line of file.added) entry.lines.add(line);
+      for (const line of added) entry.lines.add(line);
       entry.to = snapshot.toTag;
       found.set(file.path, entry);
     }
@@ -354,16 +374,20 @@ const EXCERPT_LABEL: Record<EvidenceKind, string> = {
   file: '摘录：', 'feature-flag': '新增行：', schema: '新增行：', doc: '新增行：',
   chunk: '本版本的归档路径：', i18n: '文案：', rss: '公告原文：',
 };
-/** The link and excerpt of one evidence entry; when its file's added lines are in a `.txt` of their own, a pointer there instead of the same lines again. */
-function evidenceBody(entry: Evidence, linesFile: string | undefined): string[] {
+/**
+ * The link and excerpt of one evidence entry; when its file's added lines are in a `.txt` of their own, a pointer there instead of the same lines again. `flag` is set
+ * for a feature-flag candidate, whose lines of a file are that flag's alone (see `isFlagCandidate`): the page says so, since the file gained more than it shows.
+ */
+function evidenceBody(entry: Evidence, linesFile: string | undefined, flag: boolean): string[] {
   const lines = entry.url ? [`链接：${textOf(entry.url)}`, ''] : [];
-  if (linesFile) return [...lines, `新增行在 ${linesFile}，这里不重复。`];
-  if (entry.excerpt) return [...lines, isKnownKind(entry.kind) ? EXCERPT_LABEL[entry.kind] : '摘录：', '', String(entry.excerpt)];
+  if (linesFile) return [...lines, `新增行在 ${linesFile}，${flag ? '只含这个开关的行，' : ''}这里不重复。`];
+  if (entry.excerpt) return [...lines, flag ? '这个开关的行：' : isKnownKind(entry.kind) ? EXCERPT_LABEL[entry.kind] : '摘录：', '', String(entry.excerpt)];
   return [...lines, entry.kind === 'pr' ? '（没有取到这个 PR 的标题和文件，只有编号。）' : '（没有摘录。）'];
 }
-const evidenceText = (entry: Evidence, linesFile: string | undefined) => [`# ${kindText(entry)} ${textOf(entry.ref)}`, '', ...evidenceBody(entry, linesFile), ''].join('\n');
-function moreEvidenceText(entries: Evidence[], linesFiles: Map<string, string>): string {
-  const sections = entries.flatMap(entry => ['', `## ${kindText(entry)} ${textOf(entry.ref)}`, '', ...evidenceBody(entry, linesFiles.get(entry.ref))]);
+const evidenceText = (entry: Evidence, linesFile: string | undefined, flag: boolean) =>
+  [`# ${kindText(entry)} ${textOf(entry.ref)}`, '', ...evidenceBody(entry, linesFile, flag), ''].join('\n');
+function moreEvidenceText(entries: Evidence[], linesFiles: Map<string, string>, flag: boolean): string {
+  const sections = entries.flatMap(entry => ['', `## ${kindText(entry)} ${textOf(entry.ref)}`, '', ...evidenceBody(entry, linesFiles.get(entry.ref), flag)]);
   return ['# 其余证据', '', `前 ${EVIDENCE_FILES} 条证据各有一个文件，这里是其余 ${entries.length} 条。`, ...sections, ''].join('\n');
 }
 /** The key group of a desktop i18n candidate, from its fingerprint `desktop:i18n:<group>:<version>`. */
@@ -376,11 +400,12 @@ function chunksText(chunks: Evidence[]): string {
   const sections = chunks.flatMap(entry => ['', `## ${textOf(entry.ref)}`, '', entry.excerpt ? String(entry.excerpt) : '（没有摘录。）']);
   return ['# 桌面端新模块', '', '每个模块一节：标题是去掉哈希的模块名，下面是本版本归档里的实际路径。', ...sections, ''].join('\n');
 }
-function addedText(file: DiffFile, whole: DiffFile | undefined): string {
+/** A line list as a file of the pack. `flag` is set for a feature-flag candidate, whose list holds that flag's lines alone (see `evidenceBody`). */
+function addedText(file: DiffFile, whole: DiffFile | undefined, flag: boolean): string {
   const window = windowText(file.source);
   return [
     `# ${oneLine(file.path)}${SEPARATOR}${window ? `${window} ` : ''}新增的行`,
-    `不是 diff：没有上下文，也没有删掉的行。${whole ? `${cutNote(file, whole)}。` : ''}`,
+    `不是 diff：没有上下文，也没有删掉的行。${flag ? '只含这个开关的行，文件别的新增行不在这里。' : ''}${whole ? `${cutNote(file, whole)}。` : ''}`,
     '', file.diff, '',
   ].join('\n');
 }
@@ -460,6 +485,7 @@ async function writePack(dir: string, input: EvidencePackInput, budget: number):
 
   // The changes are named first: the evidence of a file whose added lines have a .txt of their own points there instead of repeating them.
   const lists = candidate.source === 'codex-files';
+  const flag = isFlagCandidate(candidate); // its lines of a file are one flag's, and its pages say so
   const { kept, dropped, cut } = rankDiffFiles(input.diffs, budget, { cutLines: lists });
   const whole = new Map(cut.map(file => [file.path, file]));
   const name = namer();
@@ -470,13 +496,13 @@ async function writePack(dir: string, input: EvidencePackInput, budget: number):
   const own = candidate.evidence.filter(entry => entry.kind !== 'i18n' && entry.kind !== 'chunk');
   for (const entry of own.slice(0, EVIDENCE_FILES)) {
     const path = `sources/${name(evidenceName(entry), '.md')}`;
-    await write(path, evidenceText(entry, linesFiles.get(entry.ref)));
+    await write(path, evidenceText(entry, linesFiles.get(entry.ref), flag));
     evidenceItems.push(`- ${path} ← ${kindText(entry)} ${textOf(entry.ref)}`);
   }
   const more = own.slice(EVIDENCE_FILES);
   if (more.length) {
     const path = `sources/${name('more-evidence', '.md')}`;
-    await write(path, moreEvidenceText(more, linesFiles));
+    await write(path, moreEvidenceText(more, linesFiles, flag));
     evidenceItems.push(`- ${path} ← 其余 ${more.length} 条证据`);
   }
   const keys = candidate.evidence.filter(entry => entry.kind === 'i18n');
@@ -496,7 +522,7 @@ async function writePack(dir: string, input: EvidencePackInput, budget: number):
   const changeItems: string[] = [];
   for (const { file, path } of changes) {
     const full = whole.get(file.path);
-    await write(path, lists ? addedText(file, full) : file.diff);
+    await write(path, lists ? addedText(file, full, flag) : file.diff);
     const notes = [lists ? windowText(file.source) : textOf(file.source), full ? cutNote(file, full) : ''].filter(Boolean);
     changeItems.push(`- ${path} ← ${oneLine(file.path)}${notes.length ? `（${notes.join('，')}）` : ''}`);
   }
@@ -571,7 +597,8 @@ async function writePack(dir: string, input: EvidencePackInput, budget: number):
  * - `candidate.json`: the candidate as stored.
  * - `sources/`: one `.md` per evidence entry, the first 40 of them (the rest in `more-evidence.md`), all i18n keys in one `i18n-<group>.md` and all chunks in
  *   `chunks.md`; one `.diff` per diff or one `added-*.txt` per codex-files line list that `rankDiffFiles` keeps within `budget`. Names that come out the same
- *   are told apart by `-2`, `-3`. An evidence kind is slugged like the ref, so that a damaged candidate file cannot name a path outside `sources/`.
+ *   are told apart by `-2`, `-3`. An evidence kind is slugged like the ref, so that a damaged candidate file cannot name a path outside `sources/`. The pages
+ *   of a feature-flag candidate say that its lines are that flag's alone.
  * - `dsh/`: one file per index hit, numbered in the order given, with its path relative to the mirror root and, for a note, its status.
  * - `INDEX.md`: what each directory holds, the files above, the files left out under 未读文件 and the `gaps` under 没取到的内容, each list at most 40 lines, the
  *   whole file within 8,000 characters. A 未读文件 or 没取到的内容 list that does not fit goes whole to `unread.txt` or `gaps.txt`, and INDEX.md points there.
