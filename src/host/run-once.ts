@@ -39,7 +39,7 @@ export interface LastRun {
 export interface RunOnceOptions {
   /** The data directory, where last-run.json goes even when the Host could not start. */
   directory: string;
-  /** The Host clock. */
+  /** The Host clock, which the HostContext has too; this one is there before the Host has started. */
   now: () => Date;
   /** Starts the research worker on what the check queued, as the Host does after any check, so that its unload waits for the worker. */
   startResearch(ctx: HostContext): void;
@@ -92,7 +92,7 @@ export async function runOnce(ready: Promise<HostContext>, options: RunOnceOptio
   if (ctx.signal.aborted) return undefined;
   if (ctx.research.notice !== undefined) notices.push(ctx.research.notice);
   return save(ctx.directory, {
-    startedAt, finishedAt: ctx.now().toISOString(), pid: process.pid, check: line, reports: [...ctx.research.results],
+    startedAt, finishedAt: options.now().toISOString(), pid: process.pid, check: line, reports: [...ctx.research.results],
     ...(notices.length > 0 && { notice: notices.join('；') }),
   });
 }

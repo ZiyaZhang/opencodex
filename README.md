@@ -49,13 +49,13 @@ DSH="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
 "$DSH" plugin --profile desktop add ~/.dsh/opencodex-release/dsh-opencodex-0.3.1.tgz
 ```
 
-桌面端和同一 `DSH_HOME` 下其他装了 OpenCodex 的 profile 共用数据目录，不要同时运行。
+桌面端和同一 `DSH_HOME` 下其他装了 OpenCodex 的 profile 共用数据目录；同时运行时检查和自动调研一次只跑一个，见[和桌面应用同时运行](#和桌面应用同时运行)。
 
 ### 第一次启动
 
 1. `dsh --profile <profile>` 打印网页地址，打开后侧栏出现 OpenCodex。
 2. 在「设置」里填 DSH 镜像路径（`dshMirrorPath`），保存后马上建索引。
-3. DSH 每次启动后自动检查一次，之后每次检查结束再过 `checkIntervalHours` 小时检查一次；DSH 不运行时不检查。点「检查更新」随时手动检查，计时从这次结束重新算。第一次检查时，发布说明和仓库文件只看最新一个次版本的全部正式版（例如 `rust-v0.161.0 → rust-v0.162.1`），桌面端只记下当前版本作基线，不出候选。
+3. DSH 每次启动后自动检查一次，之后每次检查结束再过 `checkIntervalHours` 小时检查一次；DSH 不运行时不检查，除非装了[无人值守](#无人值守)的每日任务。点「检查更新」随时手动检查，计时从这次结束重新算。第一次检查时，发布说明和仓库文件只看最新一个次版本的全部正式版（例如 `rust-v0.161.0 → rust-v0.162.1`），桌面端只记下当前版本作基线，不出候选。
 
 ## 设置
 
@@ -157,6 +157,130 @@ DSH="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh"
 | 桌面端快照 | 保留最近 3 个版本 |
 | 匿名 GitHub REST | 每小时 60 次请求 |
 
+## 无人值守
+
+DSH 不开着也能每天检查一次：launchd 每天 08:00 运行 `opencodex-daily.sh`，它以 run-once 模式起一个不开网页的 DSH（profile 默认 `opencodex`）。OpenCodex 启动后立刻检查一次，不等 60 秒；检查排进自动调研队列的报告写完后，把这次的结果写进数据目录的 `last-run.json`，之后不再定时。脚本看到 `last-run.json` 换了新的，就结束 DSH。脚本和 plist 在安装包的 `launchd/` 目录里，0.4.0 起随包发布。
+
+任务起的 profile 要装好 OpenCodex（见[安装命令](#安装命令)），归类和报告用的模型在这个 profile 里能用。桌面端的 `desktop` profile 只能由桌面应用启动，所以任务用另一个 profile，两者在同一个 `DSH_HOME` 下共用数据目录。桌面端里的 OpenCodex 也要是 0.4.0 或更新：两边靠 0.4.0 加的数据目录锁错开，旧版本不认这个锁。任务属于登录用户：没登录时不跑。
+
+### 安装任务
+
+脚本复制到数据目录的 `bin/` 下，不用插件安装目录里的那份，这样卸载或升级插件不影响任务。
+
+建目录：
+
+```bash
+mkdir -p ~/.dsh/opencodex/bin ~/.dsh/opencodex/logs
+```
+
+从安装包取出 `launchd/` 里的两个文件（npm 包里的文件都在 `package/` 下）：
+
+```bash
+tar -xzf ~/.dsh/opencodex-release/dsh-opencodex-0.4.0.tgz -C ~/.dsh/opencodex/bin --strip-components 2 package/launchd
+```
+
+launchd 不展开 `~` 和环境变量。用 sed 把 plist 里的两个占位符换成绝对路径，写进 `~/Library/LaunchAgents/`：
+
+```bash
+sed -e "s|__SCRIPT_PATH__|$HOME/.dsh/opencodex/bin/opencodex-daily.sh|" -e "s|__LOG_PATH__|$HOME/.dsh/opencodex/logs/launchd.log|g" ~/.dsh/opencodex/bin/com.opencodex.daily.plist > ~/Library/LaunchAgents/com.opencodex.daily.plist
+```
+
+加载：
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.opencodex.daily.plist
+```
+
+不等到 08:00，马上跑一次（`-k`：正在跑的那次先结束）：
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.opencodex.daily
+```
+
+### 看结果
+
+脚本的日志，每步一行，DSH 的输出也追加在里面；30 天前的日志在下次运行时删除：
+
+```bash
+tail -n 50 ~/.dsh/opencodex/logs/daily-$(date +%Y-%m-%d).log
+```
+
+这次的结果：
+
+```bash
+cat ~/.dsh/opencodex/last-run.json
+```
+
+| 字段 | 内容 |
+| --- | --- |
+| `startedAt`、`finishedAt` | 这次开始和结束的时间 |
+| `pid` | 跑这次的 DSH 进程 |
+| `check` | 这次检查写进 `checks.jsonl` 的那一行，整次失败的检查也有；没检查（被锁挡住、插件没起来）或没找到那一行时是 `null` |
+| `reports` | 自动调研这次处理过的候选：`id`、`ok`，失败的带 `error` |
+| `notice` | 没跑全时的原因：检查或调研被锁挡住、当天报告额度用完、没找到这次检查的那一行、插件没起来（例如 settings.json 损坏） |
+
+launchd 记下的上次退出码在输出的 `last exit code` 一行：
+
+```bash
+launchctl print gui/$(id -u)/com.opencodex.daily
+```
+
+| 退出码 | 含义 |
+| --- | --- |
+| 0 | 写出了 `last-run.json`。检查被锁挡住、检查失败也是 0，原因在 `last-run.json` 里 |
+| 2 | 超过时限还没写出 `last-run.json`，DSH 被结束 |
+| 3 | 没能开始（找不到 DSH、环境变量不合法），或者 DSH 没写 `last-run.json` 就退出了 |
+
+`logs/launchd.log` 只收脚本日志以外的输出，平时是空的。
+
+### 任务的设置
+
+脚本从环境变量读设置，都可以不设。要改就写进 plist 的 `EnvironmentVariables`，例如时限改成 60 分钟：
+
+```bash
+plutil -replace EnvironmentVariables.OPENCODEX_TIMEOUT_MIN -string 60 ~/Library/LaunchAgents/com.opencodex.daily.plist
+```
+
+改完要先卸载（[卸载任务](#卸载任务)的第一条命令）再重新 `bootstrap` 才生效。
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `DSH_BIN` | `/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh` | 起 DSH 用的 CLI，默认是桌面端自带的；没装桌面端时填 `which dsh` 的结果 |
+| `DSH_PROFILE` | `opencodex` | 起哪个 profile |
+| `DSH_HOME` | `~/.dsh` | 改了的话，上面命令里的 `~/.dsh` 都要换成它 |
+| `OPENCODEX_TIMEOUT_MIN` | `120` | 时限，分钟，可以带小数；到了还没有 `last-run.json` 就结束 DSH |
+| `OPENCODEX_POLL_SEC` | `20` | 多久看一次 `last-run.json`，秒 |
+| `OPENCODEX_KILL_WAIT_SEC` | `60` | 发 SIGTERM 后等 DSH 退出多久，到了就发 SIGKILL，秒 |
+
+launchd 不读 `~/.zshrc` 这类文件，脚本也不依赖它们：PATH 是 plist 里写的 `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`，`gh` 装在这些目录里就找得到。只写在 `.zshrc` 里的变量（例如 `HTTPS_PROXY`），任务起的 DSH 和 OpenCodex 都拿不到，需要的话同样写进 `EnvironmentVariables`；没有 `HTTPS_PROXY` 时 OpenCodex 用 macOS 的系统 HTTPS 代理。
+
+### 和桌面应用同时运行
+
+检查和自动调研靠数据目录的 `lock.json` 一次只跑一个，后到的跳过：
+
+| 情况 | 结果 |
+| --- | --- |
+| 任务启动时，桌面应用正在检查或调研 | 任务这次不检查：`last-run.json` 的 `check` 是 `null`，`notice` 写「另一个 DSH 进程正在检查（pid N，开始于 …）」或「…正在调研…」；脚本结束 DSH，退出码 0。不重试，等第二天 |
+| 任务检查完要调研时，桌面应用正拿着锁 | 任务这次不调研，`notice` 里写明 |
+| 任务在跑时，桌面应用的定时检查到了 | 桌面应用这次跳过，10 分钟后再试；它的页面提示另一个 DSH 进程正在检查，「检查更新」不能点 |
+
+### 电脑睡着时
+
+- 08:00 时 Mac 在睡眠，launchd 在唤醒后补跑一次，错过几次也只补一次；关机期间错过的不补。
+- 运行期间 `caffeinate -i` 让 Mac 不进入闲置睡眠，但挡不住合盖和菜单里的「睡眠」。睡眠时 DSH 停住，醒来接着跑；时限按实际经过的时间算，睡得久了，醒来时可能已经到了时限，脚本就结束 DSH，退出码 2。
+
+### 卸载任务
+
+```bash
+launchctl bootout gui/$(id -u)/com.opencodex.daily
+```
+
+```bash
+rm ~/Library/LaunchAgents/com.opencodex.daily.plist
+```
+
+`~/.dsh/opencodex/bin/` 里的两个文件之后用不到，可以一起删。
+
 ## 数据目录
 
 ```text
@@ -165,6 +289,9 @@ $DSH_HOME/opencodex/          没设 DSH_HOME 时是 ~/.dsh/opencodex/
 ├── state.json                检查点：各来源上次看到的 tag 和版本、RSS 哈希、索引的提交、每天的报告会话数
 ├── checks.jsonl              每次检查一行，超过 2 MB 轮转为 checks.1.jsonl
 ├── lock.json                 检查与自动调研的跨进程锁，含 pid 和心跳
+├── last-run.json             run-once 模式最近一次的结果，无人值守的任务等它换新
+├── logs/daily-YYYY-MM-DD.log 无人值守任务的日志，含 DSH 的输出，保留 30 天
+├── bin/                      无人值守任务的脚本和 plist 原件，装了才有
 ├── candidates/<id>.json      每条候选一个文件
 ├── snapshots/                发布说明、仓库文件和桌面端的快照
 ├── index/dsh-index.json      DSH 索引
@@ -174,7 +301,7 @@ $DSH_HOME/opencodex/          没设 DSH_HOME 时是 ~/.dsh/opencodex/
 └── work/<id>/                开工会话的工作目录
 ```
 
-全是明文 JSON 和 Markdown。目录按 `DSH_HOME` 分，不按 profile 分：同一个 `DSH_HOME` 下装了 OpenCodex 的 profile 共用这份数据，不要同时运行其中两个。
+全是明文文件。目录按 `DSH_HOME` 分，不按 profile 分：同一个 `DSH_HOME` 下装了 OpenCodex 的 profile 共用这份数据。几个 profile 同时运行时，检查和自动调研靠 `lock.json` 一次只跑一个；忽略、恢复、手动生成报告不经过锁，两边同时改同一条候选时，后写的覆盖先写的。
 
 ## 不做的事
 
