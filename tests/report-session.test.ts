@@ -31,7 +31,7 @@ const reportWith = (dsh: string) => `# T\n\n## 结论\n做\n\n## Codex 怎么做
  * 结论 table; rule 7 is in the prompt, worded for a session that answers nothing but REPORT_DONE.
  */
 const EVIDENCE_RULES: Array<[string, string[]]> = [
-  ['1: observations come from the evidence, cited; an inference says so', ['证据目录里能查到', '引用', '推断', '置信度', '别的可能解释']],
+  ['1: observations come from the evidence or the mirror, cited; an inference says so', ['证据目录和 DSH 镜像里能查到', '引用', '推断', '置信度', '别的可能解释']],
   ['2: incomplete, unsupported and conflicting evidence is listed as unknown', ['不全', '不支持', '互相矛盾', '列为未知']],
   ['3: not seen in incomplete evidence is neither absent nor the same', ['证据不完整', '没看到', '没有', '相同']],
   ['4: no behaviour from file names, chunk names, i18n keys or strings alone', ['文件名', 'chunk 名', '文案 key', '字符串', '推断行为']],

@@ -1,6 +1,6 @@
 /** The `start` action: a creator-mode session for a reported candidate, recorded on it; and the checks `brief` shares with it. */
 import { SessionId } from '@deepseek-ai/dsh-session';
-import { canTransition, transition, type Candidate, type Status } from '../../core/candidate.js';
+import { canTransition, transition, type Candidate, type ReportRecord, type Status } from '../../core/candidate.js';
 import { ValidationError } from '../../core/check.js';
 import type { ModelRoute, Settings } from '../../core/settings.js';
 import { startWork } from '../start.js';
@@ -16,12 +16,12 @@ export function refusal(status: Status): string {
 /**
  * The checks a start and its brief share, in this order: a status that can move to `started`, a report (a record that lost it is refused
  * as a new one is), a mirror path in the settings. Each refusal is a ValidationError, so the page gets it as a bad request with the reason.
- * Returns the mirror path.
+ * Returns the mirror path and the report record. The report file is `readReportForStart`'s to check, as both read it.
  */
-export function checkStart(candidate: Candidate, settings: Readonly<Settings>): string {
+export function checkStart(candidate: Candidate, settings: Readonly<Settings>): { mirror: string; report: ReportRecord } {
   if (!canTransition(candidate.status, 'started')) throw new ValidationError(refusal(candidate.status));
   if (!candidate.report) throw new ValidationError(refusal('new'));
-  try { return mirrorOf(settings); } catch (error) { throw new ValidationError(messageOf(error)); }
+  try { return { mirror: mirrorOf(settings), report: candidate.report }; } catch (error) { throw new ValidationError(messageOf(error)); }
 }
 
 /** What one start may take instead of the default task instructions, `startModel` and `startPreset`; none of it is saved. */
@@ -35,17 +35,18 @@ export interface StartOverrides {
 
 /**
  * Opens a creator-mode session (`startPreset`, on `startModel`, unless `overrides` says otherwise) for candidate `id` with its report as the
- * task, and returns the session id. Refused before anything is created when `checkStart` refuses, when the candidate has a task running, and
+ * task, and returns the session id. Refused before anything is created when `checkStart` refuses, when the candidate has a task running,
  * when the session of the last start is still running, whatever the status is now (`started -> started` opens another session, so two
- * clicks would open two; a report rerun moves a started candidate back to `reported` while its session may still work). Then
- * one patch moves the candidate to `started` and records the session. A session that exists but did not get its task, or that works
- * without being recorded, is named in the error.
+ * clicks would open two; a report rerun moves a started candidate back to `reported` while its session may still work), and when the
+ * report file is misplaced, missing or empty (`readReportForStart`, which `startWork` runs). Then one patch moves the candidate to
+ * `started` and records the session. A session that exists but did not get its task, or that works without being recorded, is named in
+ * the error.
  */
 export async function start(ctx: HostContext, id: string, overrides: StartOverrides = {}): Promise<string> {
   return exclusive(ctx, id, 'start', async () => {
     const candidate = await ctx.store.get(id);
     const settings = ctx.settings();
-    const mirror = checkStart(candidate, settings);
+    const { mirror } = checkStart(candidate, settings);
     const previous = candidate.started?.sessionId;
     if (previous !== undefined && ctx.services.agents.get(SessionId(previous))?.status === 'running') throw new Error(`上一个开工会话还在运行（会话 ${previous}）`);
     // A failure once the session exists is a StartWorkError whose message names the session.

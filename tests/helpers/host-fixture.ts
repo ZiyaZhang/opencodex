@@ -123,7 +123,8 @@ export function fakeLlm(answers: Answer[] = []) {
 
 /**
  * DSH's session controller, agents, default model and approval, as plain objects. A session in a `reports/` directory writes `report.md`
- * when it is prompted (after `hold()`, only once `open()` is called); a creator session writes nothing.
+ * when it is prompted (after `hold()`, only once `open()` is called); a creator session writes nothing. What is appended to the session of
+ * an agent `resolveAgent` hands out (the `sandbox/mode` event of DSH's `setSandboxMode`) is recorded in `appended`.
  */
 export function fakeDsh() {
   const created: SessionCreateRequest[] = [];
@@ -135,11 +136,12 @@ export function fakeDsh() {
   const cwd = new Map<string, string>();
   const policies: string[] = [];
   const defaults: ModelSelection[] = [];
+  const appended: Array<{ sessionId: string; type: string; data: unknown }> = [];
   let gate: Promise<void> | undefined;
   let release = () => {};
   const hooks: { creatorPrompted?: (request: SessionPromptRequest) => Promise<void>; activationError?: Error; createError?: Error } = {};
   return {
-    created, renamed, selected, prompts, cancelled, statuses, policies, defaults, hooks,
+    created, renamed, selected, prompts, cancelled, statuses, policies, defaults, appended, hooks,
     hold() { gate = new Promise(resolve => { release = resolve; }); },
     open() { release(); gate = undefined; },
     sessionController: {
@@ -152,7 +154,10 @@ export function fakeDsh() {
       },
       async rename(request: SessionRenameRequest) { renamed.push(request); return { title: request.title, seq: 1 }; },
       async selectModel(request: SessionSelectModelRequest) { selected.push(request); return { selected: request }; },
-      async resolveAgent(sessionId: string) { return hooks.activationError ? { error: hooks.activationError } : { agent: { session: { id: sessionId, append() {} } } }; },
+      async resolveAgent(sessionId: string) {
+        if (hooks.activationError) return { error: hooks.activationError };
+        return { agent: { session: { id: sessionId, append(type: string, data: unknown) { appended.push({ sessionId, type, data }); } } } };
+      },
       async prompt(request: SessionPromptRequest, signal: AbortSignal) {
         prompts.push(request);
         const dir = cwd.get(request.sessionId)!;

@@ -90,13 +90,18 @@ export interface HostContext {
 
 const TASK_LABEL: Record<Task, string> = { report: '生成报告', start: '开工', status: '改状态' };
 
+/** Why a candidate with `task` running takes no other task now: `exclusive`'s refusal, which `brief` gives in the same words. */
+export function busyRefusal(task: Task): string {
+  return `这条候选正在${TASK_LABEL[task]}，等它结束再操作`;
+}
+
 /**
  * Runs `work` as the one task of candidate `id`. While it runs, a report, a start, an ignore or a restore of the same candidate is refused,
  * so no status can move under a task that is about to record its own.
  */
 export async function exclusive<T>(ctx: HostContext, id: string, task: Task, work: () => Promise<T>): Promise<T> {
   const current = ctx.busy.get(id);
-  if (current) throw new Error(`这条候选正在${TASK_LABEL[current]}，等它结束再操作`);
+  if (current) throw new Error(busyRefusal(current));
   ctx.busy.set(id, task);
   try { return await work(); } finally { ctx.busy.delete(id); }
 }

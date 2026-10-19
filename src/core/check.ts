@@ -1,5 +1,6 @@
+/** A request the Host refuses, with a reason the page shows; `options.cause` keeps what led to it (a missing file, say) for the logs. */
 export class ValidationError extends Error {
-  constructor(message: string) { super(message); this.name = 'ValidationError'; }
+  constructor(message: string, options?: ErrorOptions) { super(message, options); this.name = 'ValidationError'; }
 }
 export function check(condition: unknown, message: string): asserts condition {
   if (!condition) throw new ValidationError(message);

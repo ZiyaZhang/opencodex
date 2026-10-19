@@ -13,8 +13,11 @@
  * (instructions found in the evidence) is in each session's prompt, worded for what that session can do about them.
  */
 export const EVIDENCE_RULES = {
-  /** 1: an observation is something the evidence shows, with the citation; an inference is marked as one. */
-  observed: '观察只能来自证据目录里能查到的内容，并给出引用；推断要标明"推断"，写出置信度和别的可能解释。',
+  /**
+   * 1: an observation is something the evidence or the mirror shows, with the citation; an inference is marked as one. The mirror counts
+   * because the DSH section is found by searching it, not the evidence.
+   */
+  observed: '观察只能来自证据目录和 DSH 镜像里能查到的内容，并给出引用；推断要标明"推断"，写出置信度和别的可能解释。',
   /** 2: a gap left out of the report reads as covered. */
   unknowns: '证据不全、不支持或互相矛盾的地方都列为未知，不要省略。',
   /** 3: in evidence that is not complete, what was not seen may still be there. */
