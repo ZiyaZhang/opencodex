@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  OpenCodex's daily run (see "无人值守" in the README). launchd expands neither ~ nor variables, so the README's install replaces
-  __SCRIPT_PATH__ and __LOG_PATH__ with absolute paths. The script's own log is in the data directory's logs/; __LOG_PATH__ only gets
-  what bash prints outside it. Settings of the script (DSH_BIN, DSH_PROFILE, DSH_HOME, OPENCODEX_TIMEOUT_MIN) go in EnvironmentVariables.
+  OpenCodex's daily run (see "无人值守" in the README). launchd expands neither ~ nor variables, so the README's install replaces the two
+  placeholders below, the script's path and the log file's, with absolute paths. The script's own log is in the data directory's logs/;
+  the log file below only gets what bash prints outside it. Settings of the script (DSH_BIN, DSH_PROFILE, DSH_HOME, OPENCODEX_TIMEOUT_MIN)
+  go in EnvironmentVariables.
 -->
 <plist version="1.0">
 <dict>

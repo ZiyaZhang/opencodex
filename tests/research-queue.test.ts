@@ -173,6 +173,59 @@ test('each candidate is looked at again just before it runs, and one no longer t
   } finally { await b.close(); }
 });
 
+test('a task asked for once the mark is written goes ahead, and the run leaves that candidate to it', async () => {
+  const ran: string[] = [];
+  const b = await bench(async (_ctx, id) => { ran.push(id); });
+  try {
+    const [taken, next] = [candidate(1, 'high'), candidate(2, 'high')];
+    await write(b.directory, taken, next);
+    await enqueueResearch(b.ctx);
+    // A report of `taken` asked for by hand just as its mark lands: after the patch, before the worker's next step.
+    const patch = b.ctx.store.patch.bind(b.ctx.store);
+    b.ctx.store.patch = async (id, update) => {
+      const patched = await patch(id, update);
+      if (id === taken.id) b.ctx.busy.set(id, 'report');
+      return patched;
+    };
+    b.ctx.research.start(b.ctx);
+    await b.ctx.research.idle();
+    assert.deepEqual(ran, [next.id], 'the report asked for has the candidate');
+    assert.deepEqual(b.ctx.research.results, [{ id: next.id, ok: true }]);
+  } finally { await b.close(); }
+});
+
+test('candidates queued while the worker lets go of the lock get another hold of it, so none waits with no worker', async () => {
+  const ran: string[] = [];
+  const b = await bench(async (_ctx, id) => { ran.push(id); });
+  try {
+    const first = candidate(1, 'high'), later = candidate(2, undefined);
+    await write(b.directory, first, later);
+    await enqueueResearch(b.ctx);
+    assert.deepEqual(b.ctx.research.queued, [first.id]);
+    // A classification that ends while the worker lets go of its first hold queues what it has made worth a report.
+    const lock = b.ctx.lock;
+    let holds = 0;
+    b.ctx.lock = async kind => {
+      const taken = await lock(kind);
+      if (!taken.held || holds++ > 0) return taken;
+      return {
+        ...taken,
+        release: async () => {
+          await b.ctx.store.patch(later.id, current => ({ ...current, classification: { category: 'cli-core', relevance: 'high', headline: '', gist: '', rationale: '测试' } }));
+          await enqueueResearch(b.ctx);
+          await taken.release();
+        },
+      };
+    };
+    b.ctx.research.start(b.ctx);
+    await b.ctx.research.idle();
+    assert.deepEqual(ran, ids(first, later));
+    assert.deepEqual(b.ctx.research.queued, []);
+    assert.equal(holds, 2);
+    assert.equal(await exists(join(b.directory, 'lock.json')), false, 'both holds are let go');
+  } finally { await b.close(); }
+});
+
 test('turning automatic research off or clearing the mirror path after the queueing leaves the queued candidates alone', async () => {
   const ran: string[] = [];
   const b = await bench(async (_ctx, id) => { ran.push(id); });
@@ -205,10 +258,69 @@ test('the daily limit stops the run, clears the queue, and says how many wait fo
     assert.deepEqual(ran, ids(done, limited));
     assert.equal(b.ctx.research.notice, '今天的报告额度用完，还有 3 条明天继续', 'the one that met the limit waits too');
     assert.deepEqual(b.ctx.research.queued, []);
-    assert.deepEqual((await b.ctx.store.get(limited.id)).research, { autoAttemptedAt: NOW.toISOString() }, 'the limit is no error of the candidate');
+    assert.equal(Object.hasOwn(await b.ctx.store.get(limited.id), 'research'), false, 'its report never began: no mark, and no error');
     for (const item of waiting) assert.equal((await b.ctx.store.get(item.id)).research, undefined);
     assert.deepEqual(b.ctx.research.results.map(result => [result.id, result.ok]), [[done.id, true], [limited.id, false]]);
     assert.match(b.ctx.research.results[1]!.error!, /达到每日上限 10 份/);
+  } finally { await b.close(); }
+});
+
+test('the candidate that met the daily limit gets back what it had: a later check that day counts it again, and a raised limit takes it', async () => {
+  const ran: string[] = [];
+  let limited = true;
+  const b = await bench(async (_ctx, id) => { ran.push(id); if (limited) throw new DailyLimitError(10, 10); });
+  try {
+    const first = candidate(1, 'high', { research: { autoAttemptedAt: YESTERDAY, lastError: '昨天超时' } });
+    const second = candidate(2, 'high');
+    await write(b.directory, first, second);
+    for (const check of ['the first check', 'a second check the same day']) {
+      await enqueueResearch(b.ctx);
+      assert.deepEqual(b.ctx.research.queued, ids(first, second), check);
+      b.ctx.research.start(b.ctx);
+      await b.ctx.research.idle();
+      assert.equal(b.ctx.research.notice, '今天的报告额度用完，还有 2 条明天继续', `${check}: the same count`);
+      assert.deepEqual((await b.ctx.store.get(first.id)).research, first.research, `${check}: yesterday's try and its error are back`);
+      assert.equal((await b.ctx.store.get(second.id)).research, undefined, check);
+    }
+    assert.deepEqual(ran, ids(first, first));
+    // The limit raised in the settings that day: the next check takes both.
+    limited = false;
+    await enqueueResearch(b.ctx);
+    b.ctx.research.start(b.ctx);
+    await b.ctx.research.idle();
+    assert.deepEqual(ran, ids(first, first, first, second));
+    assert.equal(b.ctx.research.notice, undefined);
+    for (const item of [first, second]) assert.deepEqual((await b.ctx.store.get(item.id)).research, { autoAttemptedAt: NOW.toISOString() });
+  } finally { await b.close(); }
+});
+
+test('a queueing while no run is going clears the notice of the run before, even one that queues nothing', async () => {
+  const b = await bench(async () => { throw new DailyLimitError(10, 10); });
+  try {
+    const limited = candidate(1, 'high');
+    await write(b.directory, limited);
+    await enqueueResearch(b.ctx);
+    b.ctx.research.start(b.ctx);
+    await b.ctx.research.idle();
+    assert.equal(b.ctx.research.notice, '今天的报告额度用完，还有 1 条明天继续');
+    // The next day the candidate has been reported by hand, so the check finds nothing worth a report: yesterday's notice goes all the same.
+    await b.ctx.store.transition(limited.id, 'reported');
+    b.clock.advance(24 * 60 * MINUTE);
+    await enqueueResearch(b.ctx);
+    assert.deepEqual(b.ctx.research.queued, []);
+    assert.equal(b.ctx.research.start(b.ctx), undefined);
+    assert.equal(b.ctx.research.notice, undefined);
+    // The same for another process's lock, once the candidate it kept from the run is ignored.
+    const refused = candidate(2, 'high');
+    await write(b.directory, refused);
+    await writeFile(join(b.directory, 'lock.json'), JSON.stringify(foreignLock({ heartbeatAt: b.clock.now().toISOString() })));
+    await enqueueResearch(b.ctx);
+    b.ctx.research.start(b.ctx);
+    await b.ctx.research.idle();
+    assert.match(b.ctx.research.notice ?? '', /^另一个 DSH 进程正在检查/);
+    await b.ctx.store.transition(refused.id, 'ignored');
+    await enqueueResearch(b.ctx);
+    assert.equal(b.ctx.research.notice, undefined);
   } finally { await b.close(); }
 });
 
@@ -226,6 +338,7 @@ test('a data directory another process holds clears the queue, with the refusal 
     assert.deepEqual(ran, []);
     assert.equal(b.ctx.research.notice, new LockedError({ pid: holder.pid, kind: holder.kind, startedAt: holder.startedAt }).message);
     assert.match(b.ctx.research.notice ?? '', /^另一个 DSH 进程正在检查（pid \d+，开始于 .+）$/);
+    assert.equal(b.ctx.research.refused, true, 'the Host tries a refused run again');
     assert.deepEqual(b.ctx.research.queued, []);
     assert.equal((await b.ctx.store.get(queued.id)).research, undefined);
     assert.deepEqual(JSON.parse(await readFile(join(b.directory, 'lock.json'), 'utf8')), holder, 'the other process keeps its lock');
@@ -236,6 +349,7 @@ test('a data directory another process holds clears the queue, with the refusal 
     await b.ctx.research.idle();
     assert.deepEqual(ran, [queued.id]);
     assert.equal(b.ctx.research.notice, undefined);
+    assert.equal(b.ctx.research.refused, false);
   } finally { await b.close(); }
 });
 

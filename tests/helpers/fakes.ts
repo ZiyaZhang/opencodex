@@ -28,11 +28,15 @@ export function fakeTimers() {
   };
   return {
     timers, armed, log, cleared,
-    /** Runs the one armed timer. */
-    fire() {
-      assert.equal(armed.size, 1, 'exactly one timer is armed');
-      const [[handle, entry]] = [...armed];
-      armed.delete(handle);
+    /** Runs the armed timer `handle`, or, without one, the one armed timer. */
+    fire(handle?: number) {
+      if (handle === undefined) {
+        assert.equal(armed.size, 1, 'exactly one timer is armed');
+        [handle] = [...armed.keys()];
+      }
+      const entry = armed.get(handle!);
+      assert.ok(entry, `timer ${handle} is armed`);
+      armed.delete(handle!);
       entry.run();
     },
   };

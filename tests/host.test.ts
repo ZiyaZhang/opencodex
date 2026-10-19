@@ -1106,8 +1106,8 @@ test('the check the timer runs starts the research too, once it has ended', asyn
   } finally { await f.close(); }
 });
 
-test('automatic research stops at the daily limit, and the snapshot says how many wait for tomorrow', async () => {
-  const f = await fixture({ settings: { dshMirrorPath: MIRROR, dailyReportLimit: 1 } });
+test('automatic research stops at the daily limit, the snapshot says how many wait for tomorrow, and a later check that day says the same', async () => {
+  const f = await fixture({ settings: { dshMirrorPath: MIRROR, dailyReportLimit: 1 }, gh: offlineGh, feed: serve('gone', 404) });
   try {
     const [oldest, middle, newest] = await threeItems(f);
     const at = f.clock.now().toISOString();
@@ -1117,9 +1117,16 @@ test('automatic research stops at the daily limit, and the snapshot says how man
     assert.equal(stopped.researchNotice, '今天的报告额度用完，还有 2 条明天继续');
     assert.equal(stopped.researchQueue, undefined);
     assert.deepEqual([find(stopped, newest.id)!.status, find(stopped, newest.id)!.research], ['reported', { autoAttemptedAt: at }]);
-    assert.deepEqual([find(stopped, middle.id)!.status, find(stopped, middle.id)!.research], ['new', { autoAttemptedAt: at }]);
+    assert.deepEqual([find(stopped, middle.id)!.status, find(stopped, middle.id)!.research], ['new', undefined], 'its report never began, so no try today');
     assert.equal(find(stopped, oldest.id)!.research, undefined);
     assert.equal(await f.store.checkpoint(COUNTER), '1');
+    assert.equal(f.dsh.created.length, 1);
+    // A check later that day queues both again, and the limit stops it the same way: still two waiting, still neither marked.
+    const checked = await f.call({ action: 'check' });
+    assert.deepEqual([checked.researchQueue, checked.researchNotice], [ids([middle, oldest]), undefined], 'the queueing cleared the notice');
+    const again = await snapshotWhen(f, response => response.researchNotice !== undefined, 'the daily limit again');
+    assert.equal(again.researchNotice, '今天的报告额度用完，还有 2 条明天继续');
+    for (const item of [middle, oldest]) assert.equal(find(again, item.id)!.research, undefined);
     assert.equal(f.dsh.created.length, 1);
   } finally { await f.close(); }
 });
@@ -1138,6 +1145,59 @@ test('research refused by another process\'s lock clears the queue, and the snap
     assert.equal(refused.researchQueue, undefined);
     assert.equal(find(refused, candidate.id)!.research, undefined);
     assert.equal(f.dsh.created.length, 0);
+  } finally { await f.close(); }
+});
+
+test('research refused by another process\'s lock is queued and started again 10 minutes later', async () => {
+  const f = await fixture({ settings: { dshMirrorPath: MIRROR } });
+  try {
+    const candidate = await rssItem(f.store);
+    await writeFile(lockFile(f), JSON.stringify(foreignLock()));
+    await f.call({ action: 'classify' });
+    await snapshotWhen(f, response => response.researchNotice !== undefined, 'the refusal');
+    await until(() => f.timers.log.length === 2, 'the retry to be armed');
+    const retry = f.timers.log.at(-1)!;
+    assert.equal(retry.ms, 10 * MINUTE);
+    // The other process has let go by then: the retry queues the candidate again, and its report is written.
+    await rm(lockFile(f));
+    f.timers.fire(retry.handle);
+    const done = await snapshotWhen(f, response => find(response, candidate.id)?.status === 'reported', 'the retried report');
+    assert.equal(done.researchNotice, undefined);
+    assert.equal(f.dsh.created.length, 1);
+  } finally { await f.close(); }
+});
+
+test('a research run that starts before the retry is due takes its place', async () => {
+  const f = await fixture({ settings: { dshMirrorPath: MIRROR } });
+  try {
+    const candidate = await rssItem(f.store);
+    await writeFile(lockFile(f), JSON.stringify(foreignLock()));
+    await f.call({ action: 'classify' });
+    await until(() => f.timers.log.length === 2, 'the retry to be armed');
+    const retry = f.timers.log.at(-1)!.handle;
+    // The other process lets go, and a classification queues the candidate again before the retry is due: that run goes ahead.
+    await rm(lockFile(f));
+    f.dsh.hold();
+    await f.call({ action: 'classify' });
+    await until(() => f.dsh.prompts.length === 1, 'the report');
+    assert.ok(f.timers.cleared.includes(retry) && !f.timers.armed.has(retry), 'the run that started dropped the retry');
+    f.dsh.open();
+    await snapshotWhen(f, response => find(response, candidate.id)?.status === 'reported' && Object.keys(response.busy.candidates).length === 0, 'the report');
+    assert.deepEqual([...f.timers.armed.values()].map(entry => entry.ms), [60_000], 'the first check only');
+  } finally { await f.close(); }
+});
+
+test('an unload drops a research retry still armed', async () => {
+  const f = await fixture({ settings: { dshMirrorPath: MIRROR } });
+  try {
+    await rssItem(f.store);
+    await writeFile(lockFile(f), JSON.stringify(foreignLock()));
+    await f.call({ action: 'classify' });
+    await until(() => f.timers.log.length === 2, 'the retry to be armed');
+    const retry = f.timers.log.at(-1)!.handle;
+    await f.unload();
+    assert.equal(f.timers.armed.size, 0);
+    assert.ok(f.timers.cleared.includes(retry));
   } finally { await f.close(); }
 });
 

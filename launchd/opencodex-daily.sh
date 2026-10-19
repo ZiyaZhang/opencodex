@@ -13,6 +13,9 @@
 #   OPENCODEX_TIMEOUT_MIN    the time limit in minutes, decimals allowed; 120 by default
 #   OPENCODEX_POLL_SEC       how often last-run.json is looked at, in seconds; 20 by default
 #   OPENCODEX_KILL_WAIT_SEC  how long DSH gets to exit after SIGTERM before it gets SIGKILL, in seconds; 60 by default
+#
+# DSH gets OPENCODEX_RUN_ONCE=1 and OPENCODEX_DEADLINE, the time limit's end less 10 minutes in ms since the epoch: OpenCodex takes no
+# candidate whose report could not be written by then.
 set -euo pipefail
 # The data directory holds reports and logs: what this script creates there is the owner's only, as what the plugin creates is.
 umask 077
@@ -85,13 +88,16 @@ TIMEOUT_SEC="$(awk -v minutes="$TIMEOUT_MIN" 'BEGIN { printf "%d", minutes * 60 
 [[ -x "$DSH_BIN" ]] || fail "找不到能运行的 DSH：$DSH_BIN"
 
 BEFORE="$(signature)"
+# Both ends count from here. A report still being written when DSH is ended at DEADLINE is lost, and its analyst session counts toward the
+# day all the same; OpenCodex starts none it could not finish 10 minutes before that, which leaves those minutes for last-run.json.
+DEADLINE=$(( $(date +%s) + TIMEOUT_SEC ))
+RESEARCH_DEADLINE_MS=$(( (DEADLINE - 600) * 1000 ))
 log "开始：$DSH_BIN --profile $DSH_PROFILE，数据目录 $DATA_DIR，时限 $TIMEOUT_MIN 分钟"
-OPENCODEX_RUN_ONCE=1 "$DSH_BIN" --profile "$DSH_PROFILE" --no-open --port 0 < /dev/null >> "$LOG" 2>&1 &
+OPENCODEX_RUN_ONCE=1 OPENCODEX_DEADLINE="$RESEARCH_DEADLINE_MS" "$DSH_BIN" --profile "$DSH_PROFILE" --no-open --port 0 < /dev/null >> "$LOG" 2>&1 &
 DSH_PID=$!
 log "DSH 已启动（pid $DSH_PID）"
 # No idle sleep while DSH runs; caffeinate ends with it. Closing the lid, or Sleep in the menu, still puts the Mac to sleep.
 if command -v caffeinate > /dev/null 2>&1; then caffeinate -i -w "$DSH_PID" & fi
-DEADLINE=$(( $(date +%s) + TIMEOUT_SEC ))
 
 while :; do
   if [[ "$(signature)" != "$BEFORE" ]]; then

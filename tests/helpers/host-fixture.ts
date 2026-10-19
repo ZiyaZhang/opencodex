@@ -196,6 +196,8 @@ export interface FixtureOptions {
   classifyRetryDelaysMs?: number[];
   /** Run-once mode; off unless a test turns it on, whatever OPENCODEX_RUN_ONCE is in the environment the tests run in. */
   runOnce?: boolean;
+  /** Run-once mode's deadline (epoch ms on the Host clock, which stands at NOW until a test moves it), passed instead of OPENCODEX_DEADLINE. */
+  deadline?: number;
   /** Holds report sessions from the start (`dsh.hold()`), for a Host whose check, and the research after it, run as soon as it starts. */
   holdReports?: boolean;
 }
@@ -226,6 +228,7 @@ export async function fixture(options: FixtureOptions = {}) {
   const fiber = ctx.plugin(hostWith({
     github: new GitHubClient({ gh: options.gh ?? codexGh() }), fetcher: options.feed ?? serve(FEED), now: clock.now, timers: timers.timers, lockTimers: lockTimers.timers, reportPollMs: 2,
     classifyRetryDelaysMs: options.classifyRetryDelaysMs ?? [1, 1], runOnce: options.runOnce ?? false, ...(options.timeouts && { timeouts: options.timeouts }),
+    ...(options.deadline !== undefined && { deadline: options.deadline }),
   }) as never, { dataDirectory: directory } as never);
   const remove = () => rm(directory, { recursive: true, force: true });
   try { await fiber.await(); } catch (error) { await fiber.dispose(); throw error; }
