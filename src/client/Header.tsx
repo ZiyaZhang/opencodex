@@ -1,5 +1,5 @@
 /** The top of the page: the title with 检查更新 and the settings button, then what the last check found and what holds up the next one. */
-import type { ClientResponse } from './contract.js';
+import type { OpenCodexResponse } from '../host/remote.js';
 import { Icon } from './icons.js';
 import { time } from './labels.js';
 import { useUi } from './ui-context.js';
@@ -21,7 +21,7 @@ export interface CheckSummary {
  * and for a check another process ran. This process's own last check is used without a log line, and also when it ended after the log's
  * last line, which happens only when its own line could not be written (its `log:` error says why).
  */
-export function lastCheckOf({ lastCheckLog: log, lastCheck, lastCheckAt, hostPid }: Pick<ClientResponse, 'lastCheckLog' | 'lastCheck' | 'lastCheckAt' | 'hostPid'>): CheckSummary | undefined {
+export function lastCheckOf({ lastCheckLog: log, lastCheck, lastCheckAt, hostPid }: Pick<OpenCodexResponse, 'lastCheckLog' | 'lastCheck' | 'lastCheckAt' | 'hostPid'>): CheckSummary | undefined {
   const ownIsLater = lastCheck !== undefined && lastCheckAt !== undefined && log !== undefined && lastCheckAt > log.at;
   if (log && !ownIsLater) {
     const { releases, files, desktop, rss } = log.added;
@@ -58,7 +58,7 @@ function LastCheckLine({ summary }: { summary?: CheckSummary }) {
   </div>;
 }
 
-type IndexSummary = NonNullable<ClientResponse['indexSummary']>;
+type IndexSummary = NonNullable<OpenCodexResponse['indexSummary']>;
 function IndexLine({ summary, mirrorSet, busy, rebuild }: { summary?: IndexSummary; mirrorSet: boolean; busy: boolean; rebuild: () => unknown }) {
   const { Button } = useUi();
   return <div className="oc-line">
@@ -72,7 +72,7 @@ function IndexLine({ summary, mirrorSet, busy, rebuild }: { summary?: IndexSumma
 
 export interface HeaderProps {
   /** The last answer; absent until the first one arrives. */
-  data?: ClientResponse;
+  data?: OpenCodexResponse;
   /** A check is running, asked for by this page or started by the Host's timer. */
   checking: boolean;
   indexBusy: boolean;

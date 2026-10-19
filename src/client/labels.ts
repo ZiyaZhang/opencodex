@@ -2,8 +2,7 @@
  * What the page calls things and how it orders them: the labels of sources, categories, statuses and views; a row's title, second line and
  * reference; the version groups of the list. Plain functions of the snapshot, tested without rendering anything.
  */
-import type { Classification, EvidenceKind, Source, Status } from '../core/candidate.js';
-import type { ClientCandidate } from './contract.js';
+import type { Candidate, Classification, EvidenceKind, Source, Status } from '../core/candidate.js';
 import type { TagTone } from './ui.js';
 
 type Category = Classification['category'];
@@ -12,7 +11,7 @@ type Relevance = Classification['relevance'];
 export const SOURCE_LABELS: Record<Source, string> = { 'codex-release': 'Codex 发布说明', 'codex-files': 'Codex 仓库文件', desktop: 'Codex 桌面端', rss: '官方 RSS' };
 export const CATEGORY_LABELS: Record<Category, string> = { 'cli-core': 'CLI 核心', desktop: '桌面端', cloud: '云端', model: '模型', fix: '修复', other: '其他' };
 export const RELEVANCE_LABELS: Record<Relevance, string> = { high: '高', medium: '中', low: '低' };
-export const EVIDENCE_LABELS: Record<EvidenceKind, string> = { pr: 'PR', file: '文件', chunk: 'chunk', i18n: 'i18n key', rss: 'RSS', 'feature-flag': '功能开关', schema: '协议类型', doc: '文档' };
+export const EVIDENCE_LABELS: Record<EvidenceKind, string> = { pr: 'PR', file: '文件', chunk: 'chunk', i18n: '文案 key', rss: 'RSS', 'feature-flag': '功能开关', schema: '协议类型', doc: '文档' };
 
 /** The label of a value read from disk, or the value itself when this page does not know it. */
 export const labelOf = <K extends string>(labels: Record<K, string>, value: string): string => (Object.hasOwn(labels, value) ? labels[value as K] : value);
@@ -58,11 +57,11 @@ export const VIEWS = ['todo', 'low', 'ignored'] as const;
 export type View = typeof VIEWS[number];
 export const VIEW_LABELS: Record<View, string> = { todo: '待办', low: '相关度低', ignored: '已忽略' };
 /** 待办: new and not low (the unclassified included), and every reported or started one, whatever its relevance. */
-export function viewOf(candidate: ClientCandidate): View {
+export function viewOf(candidate: Candidate): View {
   if (candidate.status === 'ignored') return 'ignored';
   return candidate.status === 'new' && candidate.classification?.relevance === 'low' ? 'low' : 'todo';
 }
-export function countViews(list: readonly ClientCandidate[]): Record<View, number> {
+export function countViews(list: readonly Candidate[]): Record<View, number> {
   const counts: Record<View, number> = { todo: 0, low: 0, ignored: 0 };
   for (const item of list) counts[viewOf(item)]++;
   return counts;
@@ -77,21 +76,21 @@ export function clipLine(text: string, limit: number): string {
   return chars.length <= limit ? chars.join('') : `${chars.slice(0, limit - 1).join('')}…`;
 }
 /** A classification text, unless it is empty: the Host stores an empty one when the model gave none. */
-const given = (text: string | undefined) => (text === undefined || text.trim() === '' ? undefined : text.trim());
+export const given = (text: string | undefined) => (text === undefined || text.trim() === '' ? undefined : text.trim());
 
 /** A row's title: the Codex feature the classification names, else the candidate's own title. */
-export const headlineOf = (candidate: ClientCandidate): string => given(candidate.classification?.headline) ?? candidate.title;
+export const headlineOf = (candidate: Candidate): string => given(candidate.classification?.headline) ?? candidate.title;
 /**
  * A row's second line: what Codex does, in the classification's sentence, else the summary, on one line and cut to 120 code points.
  * Empty when it would only repeat the title, as a release note's summary does.
  */
-export function gistOf(candidate: ClientCandidate): string {
+export function gistOf(candidate: Candidate): string {
   const gist = given(candidate.classification?.gist);
   if (gist) return clipLine(gist, GIST_LIMIT);
   return oneLine(candidate.summary) === oneLine(headlineOf(candidate)) ? '' : clipLine(candidate.summary, GIST_LIMIT);
 }
 /** The automatic research error a row's third line ends with, cut to 60 code points; the whole one goes in its tooltip. */
-export const researchErrorOf = (candidate: ClientCandidate): string | undefined => {
+export const researchErrorOf = (candidate: Candidate): string | undefined => {
   const error = given(candidate.research?.lastError);
   return error && clipLine(error, ERROR_LIMIT);
 };
@@ -105,7 +104,7 @@ function named(names: readonly string[], total: number, unit: string): string {
   return total > shown.length ? `${shown.join('、')} 等 ${total} 个${unit}` : shown.join('、');
 }
 /** Where in its source a candidate comes from: pull request numbers, file names, the desktop chunks and keys counted, or 公告. */
-export function referenceOf(candidate: ClientCandidate): string {
+export function referenceOf(candidate: Candidate): string {
   const { evidence } = candidate;
   if (evidence.length === 0) return '';
   switch (candidate.source) {
@@ -124,7 +123,7 @@ export function referenceOf(candidate: ClientCandidate): string {
 }
 
 /** Where a merged candidate went, one hop only: classifications can point in a circle. The target as its row names it, else its id. */
-export function mergeLabel(mergedInto: string, candidates: readonly ClientCandidate[]): string {
+export function mergeLabel(mergedInto: string, candidates: readonly Candidate[]): string {
   const target = candidates.find(item => item.id === mergedInto);
   return `并入：${target ? headlineOf(target) : mergedInto}`;
 }
@@ -146,7 +145,7 @@ export interface CandidateGroup {
   key: string; title: string;
   /** The latest discovery in the group, which orders the groups. */
   latest: string;
-  items: ClientCandidate[];
+  items: Candidate[];
 }
 const STATUS_ORDER: readonly string[] = ['new', 'reported', 'started', 'ignored'];
 const RELEVANCE_ORDER: readonly string[] = ['high', 'medium', 'low'];
@@ -157,12 +156,12 @@ const rank = (order: readonly string[], value: string | undefined) => {
 };
 const descending = (a: string, b: string) => (a < b ? 1 : a > b ? -1 : 0);
 /** Within a group: new, reported, started; then high, medium, low relevance, the unclassified after them; then the latest change. */
-const rowOrder = (a: ClientCandidate, b: ClientCandidate) => rank(STATUS_ORDER, a.status) - rank(STATUS_ORDER, b.status)
+const rowOrder = (a: Candidate, b: Candidate) => rank(STATUS_ORDER, a.status) - rank(STATUS_ORDER, b.status)
   || rank(RELEVANCE_ORDER, a.classification?.relevance) - rank(RELEVANCE_ORDER, b.classification?.relevance)
   || descending(a.updatedAt, b.updatedAt) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
 /** The group of one candidate: its key, and the title it gives the group (a release group takes the highest one of its members). */
-function groupOf(candidate: ClientCandidate): { key: string; title: string; version?: [number, number, number] } {
+function groupOf(candidate: Candidate): { key: string; title: string; version?: [number, number, number] } {
   switch (candidate.source) {
     case 'codex-release': case 'codex-files': {
       // A release window and a file window of one minor version end at different patch tags (v0.162.0, v0.162.1): one Codex release.
@@ -184,7 +183,7 @@ function groupOf(candidate: ClientCandidate): { key: string; title: string; vers
  * The list in groups: a Codex release by its minor version (titled with the highest full version in it), a desktop app version, the
  * announcements. Groups go latest discovery first, a tie later key first; rows go by `rowOrder`. The input is not reordered.
  */
-export function groupCandidates(list: readonly ClientCandidate[]): CandidateGroup[] {
+export function groupCandidates(list: readonly Candidate[]): CandidateGroup[] {
   const groups = new Map<string, CandidateGroup & { version?: [number, number, number] }>();
   for (const candidate of list) {
     const { key, title, version } = groupOf(candidate);

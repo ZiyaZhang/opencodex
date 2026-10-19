@@ -6,6 +6,7 @@
 import { useMemo, useState, type MouseEvent } from 'react';
 import { Marked } from 'marked';
 import DOMPurify, { type Config } from 'dompurify';
+import { useUi } from './ui-context.js';
 
 /** What `renderMarkdown` needs from DOMPurify. DOMPurify needs a DOM; tests pass an instance made on a jsdom window. */
 export interface Sanitizer {
@@ -125,6 +126,7 @@ function openLink(event: MouseEvent<HTMLElement>): void {
 
 /** A report, formatted, with what the formatting does not show counted above it and the raw text behind 看原文. `sanitizer` is for tests. */
 export function Markdown({ text, sanitizer }: { text: string; sanitizer?: Sanitizer }) {
+  const { Button } = useUi();
   const [raw, setRaw] = useState(false);
   // A report marked cannot parse shows as raw text rather than taking the page down.
   const rendered = useMemo(() => { try { return renderMarkdown(text, sanitizer); } catch { return undefined; } }, [text, sanitizer]);
@@ -145,7 +147,7 @@ export function Markdown({ text, sanitizer }: { text: string; sanitizer?: Saniti
   return <div className="oc-report-body">
     {(notes.length > 0 || formatted) && <div className="oc-report-tools">
       {notes.map(note => <p key={note} className="oc-warning" role="note">{note}</p>)}
-      {formatted && <button type="button" className="oc-small" aria-pressed={raw} onClick={() => setRaw(value => !value)}>{raw ? '看排版' : '看原文'}</button>}
+      {formatted && <Button variant="ghost" size="sm" aria-pressed={raw} onClick={() => setRaw(value => !value)}>{raw ? '看排版' : '看原文'}</Button>}
     </div>}
     {raw || !formatted
       ? <pre className="oc-raw">{revealHidden(text)}</pre>
