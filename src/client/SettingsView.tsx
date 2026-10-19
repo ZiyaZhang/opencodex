@@ -68,9 +68,12 @@ export function modelChoices(catalog: ModelCatalog, values: readonly string[]): 
   return { groups, missing };
 }
 
-/** What the settings know of DSH's models: still asking, the catalog (empty when DSH lists none), or why it could not be read. */
+/** What a page part knows of DSH's models: still asking, the catalog (empty when DSH lists none), or why it could not be read. */
 export type ModelsState = { status: 'loading' } | { status: 'ready'; catalog: ModelCatalog; notice?: string } | { status: 'failed'; error: string };
-/** Asks the Host for DSH's models once, when the component mounts (the settings opening); the Host keeps the list for 5 minutes. */
+/**
+ * Asks the Host for DSH's models once, when the component mounts (the settings, or the detail's 执行, opening); the Host keeps the list
+ * for 5 minutes.
+ */
 export function useModels(call: Call): ModelsState {
   const [state, setState] = useState<ModelsState>({ status: 'loading' });
   useEffect(() => {
@@ -85,7 +88,8 @@ export function useModels(call: Call): ModelsState {
 }
 const listsModels = (models: ModelsState) => models.status === 'ready' && models.catalog.some(entry => entry.models.length > 0);
 
-function ModelsNotice({ models }: { models: ModelsState }) {
+/** What the model fields cannot offer, and why: the list still loading, not read, or empty; a provider whose list failed. */
+export function ModelsNotice({ models }: { models: ModelsState }) {
   if (models.status === 'loading') return <p className="oc-field-note oc-muted" role="status">正在读取 DSH 的模型列表…</p>;
   if (models.status === 'failed') return <p className="oc-warning" role="status">模型列表没取到：{models.error}；先按「提供方/模型」填写。</p>;
   return <>
@@ -94,8 +98,11 @@ function ModelsNotice({ models }: { models: ModelsState }) {
   </>;
 }
 
-/** One model route: a select of DSH's models by provider, or, without a list, a text box of `provider/model`. */
-function ModelField({ name, label, value, saved, models, change }: {
+/**
+ * One model route: a select of DSH's models by provider, or, without a list, a text box of `provider/model`. The settings use it for their
+ * three models, the detail's 执行 for the model of one start.
+ */
+export function ModelField({ name, label, value, saved, models, change }: {
   name: ModelKey; label: string; value: string; saved: string; models: ModelsState; change: (value: string) => void;
 }) {
   const { Input } = useUi();

@@ -9,10 +9,12 @@ import type { CheckLogEntry } from '../src/core/run-log.ts';
 import { DEFAULT_SETTINGS, type Settings } from '../src/core/settings.ts';
 import type { CheckResult } from '../src/host/collector.ts';
 import type { OpenCodexRequest, OpenCodexResponse } from '../src/host/remote.ts';
-import type { ModelCatalog } from '../src/client/contract.ts';
+import type { Brief, ModelCatalog } from '../src/client/contract.ts';
 import type { Ui } from '../src/client/ui.ts';
+import { UiContext } from '../src/client/ui-context.ts';
 import { lastCheckOf } from '../src/client/Header.tsx';
-import { OpenCodexPage, ReportView, checksSummary } from '../src/client/page.tsx';
+import { OpenCodexPage } from '../src/client/page.tsx';
+import { ReportView, checksSummary } from '../src/client/ReportPane.tsx';
 import { draftOf, modelChoices, routeOf, settingsPatch } from '../src/client/SettingsView.tsx';
 import { Markdown, PURIFY_CONFIG, hiddenCharacters, linkDefinitions, renderMarkdown, revealHidden } from '../src/client/markdown.tsx';
 
@@ -38,9 +40,10 @@ const reportRecord = (n: number, dshRefsTotal = 1, dshRefsResolved = 1): ReportR
 function textOf(node: ReactTestInstance | string): string {
   return typeof node === 'string' ? node : node.children.map(textOf).join('');
 }
+/** One part of the page on its own, with the stand-in controls the page would give it. */
 function render(element: ReturnType<typeof createElement>): ReactTestRenderer {
   let renderer!: ReactTestRenderer;
-  TestRenderer.act(() => { renderer = TestRenderer.create(element); });
+  TestRenderer.act(() => { renderer = TestRenderer.create(createElement(UiContext.Provider, { value: ui }, element)); });
   return renderer;
 }
 
@@ -61,21 +64,27 @@ const ui = {
   Switch: ({ checked, onChange, label }: Props) =>
     createElement('button', { type: 'button', role: 'switch', 'aria-checked': checked, 'aria-label': label, onClick: () => (onChange as (next: boolean) => void)(!checked) }),
   SegmentedTabs: ({ items, value, onChange, label }: Props) => createElement('div', { role: 'tablist', 'aria-label': label },
-    ...(items as Array<{ value: string; label: ReactNode }>).map(item =>
-      createElement('button', { key: item.value, role: 'tab', 'aria-selected': item.value === value, onClick: () => (onChange as (next: string) => void)(item.value) }, item.label))),
+    ...(items as Array<{ value: string; label: ReactNode; id: string; panelId: string }>).map(item => createElement('button', {
+      key: item.value, id: item.id, role: 'tab', 'aria-selected': item.value === value, 'aria-controls': item.panelId,
+      onClick: () => (onChange as (next: string) => void)(item.value),
+    }, item.label))),
   Tooltip: ({ children }: Props) => children,
 } as unknown as Ui;
 
 /**
  * A Host stand-in that records the requests: every action answers with the snapshot (`extra` laid over it), `start` with a session id,
- * `candidate` with the record in `whole` (else the listed one), `readReport` with a one-line report, `models` with `host.models`.
- * `failures` makes an action throw.
+ * `candidate` with the record in `whole` (else the listed one), `readReport` with a one-line report, `models` with `host.models`, `brief`
+ * with `host.brief`. `failures` makes an action throw.
  */
 function fakeHost(candidates: Candidate[], extra: Partial<OpenCodexResponse> = {}, whole: Record<string, Candidate> = {}) {
   const host = {
     requests: [] as OpenCodexRequest[],
     settings: { ...DEFAULT_SETTINGS } as Settings,
     models: undefined as ModelCatalog | undefined,
+    brief: {
+      instructions: '任务：按报告的建议实现。\n结束时用一句话说明怎么试用。',
+      attachments: ['报告 reports/x/report.md', '证据目录 reports/x/evidence/', 'DSH 镜像 /Users/x/deepseek-harness（只读）', '工作目录 work/x/'],
+    } as Brief,
     failures: {} as Partial<Record<OpenCodexRequest['action'], string>>,
     call: async (request: OpenCodexRequest): Promise<OpenCodexResponse> => {
       host.requests.push(request);
@@ -90,6 +99,7 @@ function fakeHost(candidates: Candidate[], extra: Partial<OpenCodexResponse> = {
       if (request.action === 'candidate') return { ...snapshot, candidate: whole[request.id] ?? candidates.find(item => item.id === request.id) };
       if (request.action === 'readReport') return { ...snapshot, report: { id: request.id, markdown: `报告正文 ${request.id}` } };
       if (request.action === 'models') return { ...snapshot, ...(host.models && { models: host.models }) };
+      if (request.action === 'brief') return { ...snapshot, brief: host.brief };
       return snapshot;
     },
   };
@@ -117,16 +127,33 @@ const tagsOf = (root: ReactTestInstance) => root.findAll(node => node.type === '
 /** The view switches, as `text:pressed`. */
 const views = (root: ReactTestInstance) => root.findAll(node => node.type === 'button' && node.props['data-active'] !== undefined)
   .map(node => `${textOf(node)}:${node.props['aria-pressed']}`);
+/** The detail's tabs, as `text:selected`, and one of them by its text. */
+const tabs = (root: ReactTestInstance) => root.findAll(node => node.type === 'button' && node.props.role === 'tab')
+  .map(node => `${textOf(node)}:${node.props['aria-selected']}`);
+const tab = (root: ReactTestInstance, label: string) => root.findAll(node => node.type === 'button' && node.props.role === 'tab' && textOf(node) === label)[0];
+/** The open part of the detail. */
+function panel(root: ReactTestInstance): ReactTestInstance {
+  const [found] = root.findAll(node => node.type === 'div' && node.props.role === 'tabpanel');
+  assert.ok(found, 'no part of the detail is open');
+  return found;
+}
+/** The detail's head: the title, its tag, the third line and the buttons. */
+function head(root: ReactTestInstance): ReactTestInstance {
+  const [found] = root.findAll(node => node.type === 'header' && node.props.className === 'oc-detail-head');
+  assert.ok(found, 'no detail is open');
+  return found;
+}
 async function click(button: ReactTestInstance | undefined): Promise<void> {
   assert.ok(button, 'button not found');
   await TestRenderer.act(async () => { await button.props.onClick(); });
 }
+const isField = (node: ReactTestInstance) => node.type === 'input' || node.type === 'select' || node.type === 'textarea';
 async function type(root: ReactTestInstance, name: string, value: string): Promise<void> {
-  const [field] = root.findAll(node => (node.type === 'input' || node.type === 'select') && node.props.name === name);
+  const [field] = root.findAll(node => isField(node) && node.props.name === name);
   assert.ok(field, `field ${name} not found`);
   await TestRenderer.act(async () => { field.props.onChange({ target: { value } }); });
 }
-const valueOf = (root: ReactTestInstance, name: string) => root.findAll(node => (node.type === 'input' || node.type === 'select') && node.props.name === name)[0]?.props.value;
+const valueOf = (root: ReactTestInstance, name: string) => root.findAll(node => isField(node) && node.props.name === name)[0]?.props.value;
 async function submit(root: ReactTestInstance): Promise<void> {
   const [form] = root.findAllByType('form');
   assert.ok(form);
@@ -146,10 +173,10 @@ test('checks summary: warnings for unresolved references and for none at all, ne
 });
 
 test('report area: empty state, check warnings, notice and read error', () => {
-  assert.match(textOf(render(createElement(ReportView, {})).root), /尚未生成报告/);
+  assert.match(textOf(render(createElement(ReportView, {})).root), /还没有报告/);
   const unresolved = textOf(render(createElement(ReportView, { record: reportRecord(1, 5, 3), report: { id: ID(1), markdown: '# 报告' } })).root);
   assert.match(unresolved, /有 2 处引用未在镜像里找到/);
-  assert.match(unresolved, /3\/5/);
+  assert.match(unresolved, /3\/5 处引用在镜像里找到/);
   assert.match(textOf(render(createElement(ReportView, { record: reportRecord(1, 0, 0), report: { id: ID(1), markdown: '# 报告' } })).root), /没有引用/);
   assert.match(textOf(render(createElement(ReportView, { record: reportRecord(1), report: { id: ID(1), markdown: '', notice: '报告文件不存在，请重新生成' } })).root), /报告文件不存在，请重新生成/);
   assert.match(textOf(render(createElement(ReportView, { record: reportRecord(1), error: 'EACCES' })).root), /EACCES/);
@@ -331,7 +358,7 @@ test('开始调研, 忽略 and 恢复 ask the Host; 打开会话 opens the sessi
   } finally { renderer.unmount(); }
 });
 
-test('开始执行 on the list opens the detail and sends nothing; the detail starts the session and switches to it', async () => {
+test('开始执行 on the list opens 执行 and sends nothing; 发送并打开会话 starts the session and switches to it', async () => {
   const host = fakeHost([candidate(1, { status: 'reported', report: reportRecord(1) })]);
   const opened: string[] = [];
   const renderer = await mount({ call: host.call, openSession: id => { opened.push(id); } });
@@ -339,15 +366,18 @@ test('开始执行 on the list opens the detail and sends nothing; the detail st
     await click(buttons(renderer.root, '开始执行')[0]);
     assert.ok(host.requests.every(request => request.action !== 'start'));
     assert.equal(rows(renderer.root).length, 0, 'the detail replaced the list');
-    await click(buttons(renderer.root, '开工')[0]);
-    assert.deepEqual(host.requests.at(-1), { action: 'start', id: ID(1) });
+    assert.deepEqual(tabs(renderer.root), ['概览:false', '报告:false', '执行:true']);
+    await click(buttons(renderer.root, '发送并打开会话')[0]);
+    assert.deepEqual(host.requests.at(-1), {
+      action: 'start', id: ID(1), instructions: host.brief.instructions, model: { ...DEFAULT_SETTINGS.startModel }, preset: DEFAULT_SETTINGS.startPreset,
+    });
     assert.deepEqual(opened, ['session-1']);
   } finally { renderer.unmount(); }
   const failing = await mount({ call: host.call, openSession: () => { throw new Error('no workspace'); } });
   try {
     await click(buttons(failing.root, '开始执行')[0]);
-    await click(buttons(failing.root, '开工')[0]);
-    assert.match(textOf(failing.root), /开工会话已创建（session-1），但没能自动打开/);
+    await click(buttons(failing.root, '发送并打开会话')[0]);
+    assert.match(textOf(panel(failing.root)), /执行会话已创建（session-1），但没能自动打开/);
     assert.equal(failing.root.findAll(node => node.props.role === 'alert').length, 0);
   } finally { failing.unmount(); }
 });
@@ -391,7 +421,7 @@ test('an action error shows on its row as plain text', async () => {
   } finally { renderer.unmount(); }
 });
 
-test('opening a candidate from its title reads its whole record and its report', async () => {
+test('opening a candidate from its title reads its whole record and its report, and 概览 shows the whole record', async () => {
   const listed = candidate(1, { status: 'reported', report: reportRecord(1), summary: '摘要前 300 字', classification: classified('cli-core', 'high', { rationale: '理由前 120 字' }) });
   const whole = { ...listed, summary: '摘要前 300 字，后面还有', classification: { ...listed.classification!, rationale: '理由前 120 字，后面还有' } };
   const host = fakeHost([listed], {}, { [ID(1)]: whole });
@@ -399,10 +429,208 @@ test('opening a candidate from its title reads its whole record and its report',
   try {
     await click(buttons(renderer.root, '候选 1')[0]);
     assert.deepEqual(host.requests.slice(-2), [{ action: 'candidate', id: ID(1) }, { action: 'readReport', id: ID(1) }]);
-    const page = textOf(renderer.root);
-    assert.match(page, /摘要前 300 字，后面还有/);
-    assert.match(page, /理由前 120 字，后面还有/);
-    assert.match(page, new RegExp(`报告正文 ${ID(1)}`));
+    assert.match(textOf(panel(renderer.root)), new RegExp(`报告正文 ${ID(1)}`));
+    await click(tab(renderer.root, '概览'));
+    const overview = textOf(panel(renderer.root));
+    assert.match(overview, /摘要前 300 字，后面还有/);
+    assert.match(overview, /理由前 120 字，后面还有/);
+  } finally { renderer.unmount(); }
+});
+
+test('the detail opens at 报告 when there is a report, else at 概览; 阅读报告 and 开始执行 open their part; each part is labelled by its tab', async () => {
+  const host = fakeHost([candidate(1, { status: 'reported', report: reportRecord(1) }), candidate(2, { classification: classified('cli-core', 'high') })]);
+  const renderer = await mount({ call: host.call });
+  try {
+    const { root } = renderer;
+    await click(buttons(root, '候选 1')[0]);
+    assert.deepEqual(tabs(root), ['概览:false', '报告:true', '执行:false']);
+    const [selected] = root.findAll(node => node.props.role === 'tab' && node.props['aria-selected'] === true);
+    assert.equal(panel(root).props['aria-labelledby'], selected!.props.id);
+    assert.equal(panel(root).props.id, selected!.props['aria-controls']);
+    // The head has the row's tag, third line and buttons; its 开始执行 and 阅读报告 switch parts.
+    assert.deepEqual(tagsOf(head(root)), ['已调研/success']);
+    assert.match(textOf(head(root)), /Codex 发布说明/);
+    assert.deepEqual(looks(head(root)), ['忽略:ghost:sm', '开始执行:outline:sm', '阅读报告:primary:sm']);
+    await click(buttons(head(root), '开始执行')[0]);
+    assert.deepEqual(tabs(root), ['概览:false', '报告:false', '执行:true']);
+    await click(buttons(head(root), '阅读报告')[0]);
+    assert.deepEqual(tabs(root), ['概览:false', '报告:true', '执行:false']);
+    await click(tab(root, '概览'));
+    assert.deepEqual(tabs(root), ['概览:true', '报告:false', '执行:false']);
+    await click(buttons(root, '返回列表')[0]);
+    await click(buttons(root, '候选 2')[0]);
+    assert.deepEqual(tabs(root), ['概览:true', '报告:false', '执行:false']);
+    assert.deepEqual(looks(head(root)), ['忽略:ghost:sm', '开始调研:primary:sm']);
+    await click(buttons(root, '返回列表')[0]);
+    await click(buttons(rowOf(root, '候选 1'), '阅读报告')[0]);
+    assert.deepEqual(tabs(root), ['概览:false', '报告:true', '执行:false']);
+    await click(buttons(root, '返回列表')[0]);
+    await click(buttons(rowOf(root, '候选 1'), '开始执行')[0]);
+    assert.deepEqual(tabs(root), ['概览:false', '报告:false', '执行:true']);
+  } finally { renderer.unmount(); }
+});
+
+test('概览 says what Codex does, why it was classified so, what the source called it, and lists the evidence', async () => {
+  const listed = candidate(1, {
+    summary: '摘要前 300 字', evidence: [{ kind: 'pr', ref: '#12', url: 'https://github.com/openai/codex/pull/12' }],
+    classification: classified('cli-core', 'high', { headline: '重启后台服务', gist: '可以从界面重启托管的后台服务', rationale: '理由' }),
+  });
+  const whole = { ...listed, summary: '摘要前 300 字，后面还有', evidence: [{ ...listed.evidence[0]!, excerpt: '摘录正文' }] };
+  const host = fakeHost([listed, candidate(2, { summary: '只有摘要' })], {}, { [ID(1)]: whole });
+  const renderer = await mount({ call: host.call });
+  try {
+    const { root } = renderer;
+    await click(buttons(root, '重启后台服务')[0]);
+    const overview = panel(root);
+    const sections = overview.findAll(node => node.type === 'section').map(section => textOf(section));
+    assert.equal(sections.length, 4);
+    assert.match(sections[0]!, /^Codex 做了什么可以从界面重启托管的后台服务$/);
+    assert.match(sections[1]!, /^归类理由CLI 核心相关度高理由$/);
+    assert.match(sections[2]!, /^原始标题和摘要候选 1rust-v0\.162\.1 → rust-v0\.163\.0摘要前 300 字，后面还有$/);
+    assert.match(sections[3]!, /^证据 1PR#12打开摘录摘录正文$/);
+    assert.equal(overview.findAll(node => node.type === 'a' && node.props.href === 'https://github.com/openai/codex/pull/12').length, 1);
+    await click(buttons(root, '返回列表')[0]);
+    // Without the classification's sentence the summary says what Codex does, once.
+    await click(buttons(root, '候选 2')[0]);
+    const bare = panel(root).findAll(node => node.type === 'section').map(section => textOf(section));
+    assert.equal(bare[0], 'Codex 做了什么只有摘要');
+    assert.match(bare[1]!, /还没有归类/);
+    assert.equal(bare[2], '原始标题候选 2rust-v0.162.1 → rust-v0.163.0');
+  } finally { renderer.unmount(); }
+});
+
+test('报告 without a report says what research writes and starts it, or how far the queue is; with one it gives the checks and 重新调研', async () => {
+  const host = fakeHost([
+    candidate(1), candidate(2, { status: 'reported', report: reportRecord(2, 4, 3) }), candidate(3), candidate(4), candidate(5, { status: 'ignored' }),
+  ], { researchQueue: [ID(3)], busy: { check: false, candidates: { [ID(4)]: 'report' } } });
+  const renderer = await mount({ call: host.call });
+  /** The 报告 of the candidate titled `title`, opened from the list's view `view`. */
+  const report = async (title: string, view = '待办4') => {
+    const [back] = buttons(renderer.root, '返回列表');
+    if (back) await click(back);
+    await click(buttons(renderer.root, view)[0]);
+    await click(buttons(renderer.root, title)[0]);
+    await click(tab(renderer.root, '报告'));
+    return panel(renderer.root);
+  };
+  try {
+    const empty = await report('候选 1');
+    assert.match(textOf(empty), /还没有报告。开始调研后，分析会话会对照证据和 DSH 镜像写一份报告，大约 3 分钟。/);
+    assert.deepEqual(looks(empty), ['开始调研:outline:sm']);
+    await click(buttons(empty, '开始调研')[0]);
+    assert.deepEqual(host.requests.at(-1), { action: 'report', id: ID(1) });
+    const queued = await report('候选 3');
+    assert.match(textOf(queued), /排在自动调研的第 1 个，轮到时自动开始。/);
+    assert.deepEqual(looks(queued), []);
+    assert.match(textOf(await report('候选 4')), /分析会话正在写报告。/);
+    const ignored = await report('候选 5', '已忽略1');
+    assert.match(textOf(ignored), /已忽略的动态要先恢复，才能开始调研。/);
+    assert.deepEqual(looks(ignored), []);
+    const written = await report('候选 2');
+    assert.match(textOf(written), /3\/4 处引用在镜像里找到/);
+    assert.match(textOf(written), new RegExp(`报告正文 ${ID(2)}`));
+    assert.deepEqual(looks(written).filter(look => look.startsWith('重新调研')), ['重新调研:outline:sm']);
+    await click(buttons(written, '重新调研')[0]);
+    assert.deepEqual(host.requests.at(-1), { action: 'report', id: ID(2) });
+  } finally { renderer.unmount(); }
+});
+
+test('执行 reads the brief: the instructions can be edited, what goes with them is listed, and the model and preset are for this start only', async () => {
+  const host = fakeHost([candidate(1, { status: 'reported', report: reportRecord(1) })]);
+  host.models = catalog;
+  const opened: string[] = [];
+  const renderer = await mount({ call: host.call, openSession: id => { opened.push(id); } });
+  try {
+    const { root } = renderer;
+    await click(buttons(root, '开始执行')[0]);
+    assert.deepEqual(host.requests.filter(request => request.action === 'brief'), [{ action: 'brief', id: ID(1) }]);
+    assert.ok(host.requests.some(request => request.action === 'models'), 'the model list as the settings read it');
+    const text = textOf(panel(root));
+    for (const line of host.brief.attachments) assert.ok(text.includes(line), line);
+    assert.match(text, /会话在 workspace-write 沙箱里运行，能写自己的工作目录；安装 bundle 时 DSH 会弹一次审批。/);
+    assert.equal(valueOf(root, 'instructions'), host.brief.instructions);
+    assert.equal(valueOf(root, 'startModel'), 'deepseek-official/deepseek-v4-pro');
+    assert.deepEqual(root.findAll(node => node.type === 'select' && node.props.name === 'startModel')[0]!.findAllByType('optgroup').map(group => group.props.label),
+      ['DeepSeek', 'OpenRouter']);
+    assert.equal(valueOf(root, 'startPreset'), 'cordis');
+    const send = () => buttons(root, '发送并打开会话')[0]!;
+    assert.deepEqual([send().props['data-variant'], send().props['data-size'], send().props.disabled], ['primary', 'sm', false]);
+    await type(root, 'instructions', '   ');
+    assert.equal(send().props.disabled, true, 'blank instructions are not sent');
+    await type(root, 'instructions', '任务：只做第一级。');
+    await type(root, 'startModel', 'openrouter/anthropic/claude-x');
+    await type(root, 'startPreset', ' agent-x ');
+    await click(send());
+    assert.deepEqual(host.requests.at(-1), {
+      action: 'start', id: ID(1), instructions: '任务：只做第一级。', model: { provider: 'openrouter', model: 'anthropic/claude-x' }, preset: 'agent-x',
+    });
+    assert.deepEqual(opened, ['session-1']);
+    assert.ok(host.requests.every(request => request.action !== 'settings'), 'nothing is saved');
+    assert.deepEqual(host.settings.startModel, DEFAULT_SETTINGS.startModel);
+    assert.equal(host.requests.filter(request => request.action === 'brief').length, 1, 'the brief is read once');
+    assert.equal(valueOf(root, 'instructions'), '任务：只做第一级。', 'the edit stays');
+  } finally { renderer.unmount(); }
+});
+
+test('执行 shows why the Host refuses a brief, and no form; it asks again once the candidate has moved on', async () => {
+  const list = [candidate(1)];
+  const host = fakeHost(list);
+  host.failures.brief = '先在设置里填 DSH 镜像路径';
+  const renderer = await mount({ call: host.call });
+  try {
+    const { root } = renderer;
+    await click(buttons(root, '候选 1')[0]);
+    await click(tab(root, '执行'));
+    assert.match(textOf(panel(root)), /先在设置里填 DSH 镜像路径/);
+    assert.equal(root.findAllByType('textarea').length, 0);
+    assert.equal(buttons(root, '发送并打开会话').length, 0);
+    delete host.failures.brief;
+    list[0] = { ...list[0]!, status: 'reported', report: reportRecord(1), updatedAt: AT(9) };
+    await click(buttons(root, '重建索引')[0]);
+    assert.equal(host.requests.filter(request => request.action === 'brief').length, 2);
+    assert.equal(valueOf(root, 'instructions'), host.brief.instructions);
+  } finally { renderer.unmount(); }
+});
+
+test('执行 of a candidate already sent shows its session and when it went, and 再开一个会话 sends the form again', async () => {
+  const host = fakeHost([candidate(1, { status: 'started', report: reportRecord(1), started: { sessionId: 'session-3', at: AT(4) } })]);
+  const opened: string[] = [];
+  const renderer = await mount({ call: host.call, openSession: id => { opened.push(id); } });
+  try {
+    const { root } = renderer;
+    await click(buttons(root, '候选 1')[0]);
+    assert.deepEqual(looks(head(root)), ['打开会话:primary:sm']);
+    await click(tab(root, '执行'));
+    const pane = panel(root);
+    assert.match(textOf(pane), /会话 session-3发送于 /);
+    await click(buttons(pane, 'session-3')[0]);
+    assert.deepEqual(opened, ['session-3']);
+    assert.equal(buttons(root, '发送并打开会话').length, 0);
+    assert.deepEqual(looks(pane).filter(look => look.startsWith('再开一个会话')), ['再开一个会话:outline:sm']);
+    await type(root, 'instructions', '任务：再做一遍。');
+    await click(buttons(pane, '再开一个会话')[0]);
+    assert.deepEqual(host.requests.at(-1), {
+      action: 'start', id: ID(1), instructions: '任务：再做一遍。', model: { ...DEFAULT_SETTINGS.startModel }, preset: DEFAULT_SETTINGS.startPreset,
+    });
+    assert.deepEqual(opened, ['session-3', 'session-1']);
+    assert.equal(valueOf(root, 'instructions'), '任务：再做一遍。');
+  } finally { renderer.unmount(); }
+});
+
+test('a start the Host refuses shows its reason in 执行 beside the button, not under the head', async () => {
+  const host = fakeHost([candidate(1, { status: 'reported', report: reportRecord(1) })]);
+  host.failures.start = '上一个会话还在运行（会话 session-0）';
+  const renderer = await mount({ call: host.call });
+  try {
+    const { root } = renderer;
+    await click(buttons(root, '开始执行')[0]);
+    await click(buttons(root, '发送并打开会话')[0]);
+    assert.match(textOf(panel(root)), /上一个会话还在运行（会话 session-0）/);
+    assert.doesNotMatch(textOf(head(root)), /上一个会话还在运行/);
+    // Any other action's error is under the head, where its buttons are.
+    host.failures.ignore = '记录写不进去';
+    await click(buttons(head(root), '忽略')[0]);
+    assert.match(textOf(head(root)), /记录写不进去/);
   } finally { renderer.unmount(); }
 });
 

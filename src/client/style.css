@@ -1,5 +1,6 @@
-/* DSH-native surfaces, compact typography and a single restrained accent. The controls are DSH's own (Button, Pill, Tag, Input); the rules
- * here lay them out and never style a control by its element, which would override the look their own classes give them. */
+/* DSH-native surfaces, compact typography and a single restrained accent. The controls are DSH's own (Button, Pill, Tag, Input,
+ * SegmentedTabs); the rules here lay them out and never style a control by its element, which would override the look their own classes
+ * give them. */
 .oc-page {
   --oc-text: var(--dsw-alias-label-primary, #25272b);
   --oc-muted: var(--dsw-alias-label-secondary, #686d75);
@@ -97,40 +98,52 @@
 .oc-empty { text-align: center; padding: 40px 16px 48px; }
 .oc-empty h2 { display: block; font-size: 16px; }
 
-/* Detail view. It still draws its own buttons, so the plain-button look below is scoped to it. */
-.oc-detail button, .oc-page select { font: inherit; }
-.oc-detail button {
-  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-  border: 1px solid var(--oc-line); border-radius: var(--oc-radius);
-  background: var(--oc-bg); color: inherit; padding: 6px 10px;
-  min-height: 32px; line-height: 1.35; font-weight: 500; cursor: pointer;
-  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
-}
-.oc-detail button:not(:disabled):hover { background: var(--oc-layer); border-color: color-mix(in srgb, var(--oc-text) 24%, transparent); }
-.oc-detail button:not(:disabled):active { background: color-mix(in srgb, var(--oc-text) 9%, var(--oc-bg)); }
-.oc-detail button:disabled { opacity: .45; cursor: default; }
-.oc-detail button:focus-visible { outline: 2px solid var(--oc-accent); outline-offset: 3px; }
-.oc-page .oc-small { min-height: 26px; padding: 3px 8px; font-size: 12px; }
-.oc-page .oc-back { border: 0; padding: 0; min-height: 26px; color: var(--oc-muted); background: none; font-size: 13px; }
-.oc-detail-head { display: flex; align-items: baseline; gap: 10px; margin: 10px 0 4px; }
-.oc-detail-head h2 { display: block; flex: 0 1 auto; min-width: 0; font-size: 17px; overflow-wrap: anywhere; }
-.oc-detail-head > .oc-status { flex-shrink: 0; }
-.oc-row-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; margin: 4px 0; color: var(--oc-muted); font-size: 12px; line-height: 1.4; }
-.oc-candidate-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-.oc-page .oc-candidate-actions button { min-height: 28px; padding: 4px 9px; font-size: 12px; }
-.oc-detail > .oc-candidate-actions { margin: 12px 0; }
-.oc-detail > .oc-error, .oc-detail > .oc-row-note { margin: 0 0 10px; }
-.oc-status { display: inline-flex; align-items: center; flex-shrink: 0; font-size: 12px; line-height: 1.5; white-space: nowrap; padding: 1px 6px; background: var(--oc-layer); border-radius: 4px; font-weight: 500; color: var(--oc-muted); }
-.oc-status-reported, .oc-status-started { color: var(--oc-accent); background: var(--oc-accent-soft); }
-.oc-status-ignored { opacity: .7; }
-.oc-busy { color: var(--oc-warn); background: color-mix(in srgb, var(--oc-warn) 10%, var(--oc-bg)); }
+/* Detail. Its controls are DSH's own; these rules lay out the detail's own classes only. The head is the list row at page scale: the
+ * text, and at its top right the buttons its phase allows. Its title line is 28px, the height of a small DSH button, so the title, its tag
+ * and the buttons share one first line with no padding; below it the row's third line, 4px down as in the list. */
+.oc-page select { font: inherit; }
+.oc-detail-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 6px 16px; margin: 12px 0 0; }
+.oc-detail-main { min-width: 0; }
+.oc-detail-title { display: flex; align-items: flex-start; gap: 8px; }
+.oc-page .oc-detail-title > h2 { display: block; flex: 0 1 auto; min-width: 0; margin: 0; font-size: 18px; line-height: 28px; font-weight: 600; overflow-wrap: anywhere; }
+.oc-detail-title > .oc-row-status { height: 28px; }
+.oc-page .oc-detail-head .oc-error { margin: 6px 0 0; font-size: 12px; }
+/* The tabs: 112px each (three in 336px), 16px below the head and 20px above the part they show. */
+.oc-page .oc-detail-tabs { max-width: 336px; margin: 16px 0 20px; }
+/* A part of the detail: sections 20px apart, each a 20px heading 6px above its text. */
+.oc-detail .oc-pane-section + .oc-pane-section { margin-top: 20px; }
+.oc-page .oc-pane-section > h3 { margin: 0 0 6px; font-size: 13px; line-height: 20px; }
+.oc-page .oc-pane-section > p { margin: 0; }
+.oc-page .oc-pane-section > p + p { margin-top: 6px; }
+.oc-page .oc-pane-facts { display: flex; flex-wrap: wrap; column-gap: 12px; row-gap: 2px; font-size: 12px; line-height: 18px; color: var(--oc-faint); }
+.oc-detail .oc-pane-title { font-weight: 500; }
 .oc-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.6; max-width: 85ch; }
-.oc-section { border-top: 1px solid var(--oc-line); padding-top: 14px; margin-top: 18px; }
-.oc-report-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; font-size: 12px; margin-bottom: 8px; }
+/* Report: the checks on a 20px line with 4px above, which centres it on the 28px 重新调研 at their right. */
+.oc-detail .oc-report-bar { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 6px 16px; margin: 0 0 8px; }
+.oc-page .oc-report-head { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 14px; row-gap: 2px; margin: 0; padding-top: 4px; font-size: 12px; line-height: 20px; }
 .oc-report-head > strong { font-size: 13px; font-weight: 600; }
 .oc-report > .oc-warning { margin: 6px 0; }
+.oc-detail .oc-report-empty { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; }
+.oc-page .oc-report-empty > p { margin: 0; font-size: 13px; line-height: 20px; color: var(--oc-muted); }
 .oc-report-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin: 10px 0 8px; }
 .oc-report-tools > .oc-warning { margin: 0; }
+/* 执行: as wide as the settings form. The session sent to sits in a box of 8px by 12px, its 20px line 4px down to centre it on the 28px
+ * 再开一个会话; the instructions are a 12-line box (20px lines, 8px by 10px inside) drawn like a DSH Input. */
+.oc-detail .oc-execute { max-width: 720px; }
+.oc-detail .oc-execute-session { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 6px 16px; margin: 0 0 16px; padding: 8px 12px; border: .5px solid var(--oc-field-line); border-radius: var(--dsw-radius-md, 8px); background: var(--oc-layer); }
+.oc-page .oc-execute-sent { display: flex; flex-wrap: wrap; column-gap: 12px; row-gap: 2px; margin: 0; padding-top: 4px; font-size: 13px; line-height: 20px; color: var(--oc-muted); }
+.oc-detail .oc-instructions {
+  display: block; width: 100%; min-height: 120px; margin: 6px 0 14px; padding: 8px 10px; resize: vertical;
+  border: .5px solid var(--oc-field-line); border-radius: var(--dsw-radius-md, 8px); background: var(--oc-bg); color: var(--oc-text);
+  font: inherit; font-size: 13px; line-height: 20px; font-weight: 400;
+}
+.oc-detail .oc-instructions:focus-visible { outline: none; border-color: var(--dsw-alias-state-business-primary, var(--oc-accent)); }
+.oc-page .oc-execute-form > h3 { margin: 18px 0 6px; font-size: 13px; line-height: 20px; }
+.oc-page .oc-attachments { margin: 0 0 16px; padding-left: 18px; font-size: 13px; line-height: 20px; color: var(--oc-muted); }
+.oc-page .oc-attachments li { margin: 2px 0; overflow-wrap: anywhere; }
+.oc-detail .oc-execute-form :is(.oc-warning, .oc-notice) { margin: 0 0 12px; }
+.oc-page .oc-execute-note { margin: 4px 0 12px; font-size: 12px; line-height: 18px; color: var(--oc-muted); }
+.oc-page .oc-execute :is(.oc-error, .oc-row-note) { margin: 8px 0 0; font-size: 12px; }
 .oc-raw { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 560px; overflow: auto; padding: 10px 12px; border: 1px solid var(--oc-line); border-radius: var(--oc-radius); background: var(--oc-layer); font: 12.5px/1.55 var(--oc-mono); }
 .oc-markdown { font-size: 14px; line-height: 1.65; overflow-wrap: anywhere; }
 .oc-markdown :is(h1, h2, h3, h4, h5, h6) { display: block; font-weight: 600; line-height: 1.4; margin: 18px 0 8px; }
@@ -157,7 +170,6 @@
 .oc-evidence-head a { font-size: 12px; white-space: nowrap; }
 .oc-evidence summary { margin-top: 4px; font-size: 12px; color: var(--oc-muted); cursor: pointer; }
 .oc-evidence .oc-raw { max-height: 320px; margin-top: 6px; }
-.oc-tag { font-size: 12px; padding: 1px 6px; border-radius: 4px; background: var(--oc-layer); color: var(--oc-muted); white-space: nowrap; }
 
 /* Settings. Text fields are DSH Inputs; the selects are drawn to match them: 32px tall, the same hairline border, corners and text size. */
 .oc-page .oc-back-button { margin-left: -10px; }
@@ -189,12 +201,9 @@
   .oc-page { padding: 18px 16px; }
   .oc-page .oc-title { font-size: 18px; }
   .oc-two-columns { grid-template-columns: minmax(0, 1fr); }
-  .oc-row { grid-template-columns: minmax(0, 1fr); }
+  .oc-row, .oc-detail-head, .oc-detail .oc-report-bar, .oc-detail .oc-execute-session { grid-template-columns: minmax(0, 1fr); }
   .oc-row-actions { justify-content: flex-start; }
 }
 @media (max-width: 420px) {
   .oc-header, .oc-footer { flex-wrap: wrap; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .oc-detail button { transition: none; }
 }

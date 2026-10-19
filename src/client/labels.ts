@@ -76,7 +76,7 @@ export function clipLine(text: string, limit: number): string {
   return chars.length <= limit ? chars.join('') : `${chars.slice(0, limit - 1).join('')}…`;
 }
 /** A classification text, unless it is empty: the Host stores an empty one when the model gave none. */
-const given = (text: string | undefined) => (text === undefined || text.trim() === '' ? undefined : text.trim());
+export const given = (text: string | undefined) => (text === undefined || text.trim() === '' ? undefined : text.trim());
 
 /** A row's title: the Codex feature the classification names, else the candidate's own title. */
 export const headlineOf = (candidate: Candidate): string => given(candidate.classification?.headline) ?? candidate.title;
