@@ -189,6 +189,10 @@ export interface FixtureOptions {
   timeouts?: Dependencies['timeouts'];
   /** 1 ms twice by default, so a retried classification does not wait 25 seconds. */
   classifyRetryDelaysMs?: number[];
+  /** Run-once mode; off unless a test turns it on, whatever OPENCODEX_RUN_ONCE is in the environment the tests run in. */
+  runOnce?: boolean;
+  /** Holds report sessions from the start (`dsh.hold()`), for a Host whose check, and the research after it, run as soon as it starts. */
+  holdReports?: boolean;
 }
 /**
  * An OpenCodex Host loaded as a Cordis plugin (`ctx.plugin`, so `inject` is enforced as in DSH) on a fresh context that provides every
@@ -203,6 +207,7 @@ export async function fixture(options: FixtureOptions = {}) {
   const ctx = new Context();
   const descriptors: InvocationDescriptor[] = [];
   const dsh = fakeDsh();
+  if (options.holdReports) dsh.hold();
   const llm = options.llm ?? fakeLlm();
   ctx.provide('typert', { register(contribution: { invocations: InvocationDescriptor[] }) { descriptors.push(...contribution.invocations); return async () => {}; } } as never);
   ctx.provide('sessionController', dsh.sessionController as never);
@@ -215,7 +220,7 @@ export async function fixture(options: FixtureOptions = {}) {
   const clock = fakeClock();
   const fiber = ctx.plugin(hostWith({
     github: new GitHubClient({ gh: options.gh ?? codexGh() }), fetcher: options.feed ?? serve(FEED), now: clock.now, timers: timers.timers, lockTimers: lockTimers.timers, reportPollMs: 2,
-    classifyRetryDelaysMs: options.classifyRetryDelaysMs ?? [1, 1], ...(options.timeouts && { timeouts: options.timeouts }),
+    classifyRetryDelaysMs: options.classifyRetryDelaysMs ?? [1, 1], runOnce: options.runOnce ?? false, ...(options.timeouts && { timeouts: options.timeouts }),
   }) as never, { dataDirectory: directory } as never);
   const remove = () => rm(directory, { recursive: true, force: true });
   try { await fiber.await(); } catch (error) { await fiber.dispose(); throw error; }
