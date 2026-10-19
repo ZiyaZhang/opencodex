@@ -5,8 +5,8 @@ import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client';
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client';
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client';
 import type { SessionId } from '@deepseek-ai/dsh-session';
-import { OPEN_CODEX_REMOTE, type OpenCodexRequest } from '../host/remote.js';
-import type { ClientRequest, ClientResponse } from './contract.js';
+import { OPEN_CODEX_REMOTE } from '../host/remote.js';
+import type { Call } from './contract.js';
 import { OpenCodexPage } from './page.js';
 import { Icon } from './icons.js';
 import styles from './style.css';
@@ -27,12 +27,9 @@ export async function apply(ctx: Context): Promise<void> {
   /** Shows a session in the workspace: the creator-mode session `start` opened. */
   const openSession = (sessionId: string) => { ctx.uiWorkspace.openSession(sessionId as SessionId); };
   ctx.inject(['remote.opencodex'], ctx => {
-  /**
-   * The page's requests include what only a newer Host knows (the `models` action, the `autoResearch` setting), so its request type is
-   * wider than the Remote's. The Host checks every request (`parseRequest`) and refuses what it does not know with a message the page shows.
-   */
-  const call = async (request: ClientRequest, signal?: AbortSignal): Promise<ClientResponse> => {
-    const result = await ctx.remote.opencodex.call(request as OpenCodexRequest, signal);
+  /** The Host checks every request (`parseRequest`) and refuses one it does not take with a message the page shows. */
+  const call: Call = async (request, signal) => {
+    const result = await ctx.remote.opencodex.call(request, signal);
     if (!result.ok) throw new Error(result.error.message);
     return result.value;
   };

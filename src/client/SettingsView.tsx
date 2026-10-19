@@ -3,8 +3,8 @@
  * and saved as `{ provider, model }` routes; where DSH lists none, or the Host cannot list them, they are typed as `provider/model`.
  */
 import { useEffect, useRef, useState, type InputHTMLAttributes } from 'react';
-import type { ModelRoute } from '../core/settings.js';
-import { DEFAULT_AUTO_RESEARCH, type AutoResearch, type Call, type ClientSettings, type ModelCatalog } from './contract.js';
+import { DEFAULT_SETTINGS, type AutoResearch, type ModelRoute, type Settings } from '../core/settings.js';
+import type { Call, ModelCatalog } from './contract.js';
 import { Icon } from './icons.js';
 import { useUi } from './ui-context.js';
 
@@ -26,28 +26,30 @@ export interface SettingsDraft {
   reportPreset: string; startPreset: string; dailyReportLimit: string; checkIntervalHours: string;
   autoResearch: AutoResearch;
 }
-export const draftOf = (settings: ClientSettings): SettingsDraft => ({
+/**
+ * Right after the plugin is reinstalled the page can still be talking to the previous Host, whose settings have no `autoResearch`; it is
+ * shown with the Host's default, and goes out only when the user changes it (that Host refuses the field).
+ */
+const autoResearchOf = (settings: Settings): AutoResearch => settings.autoResearch ?? DEFAULT_SETTINGS.autoResearch;
+export const draftOf = (settings: Settings): SettingsDraft => ({
   dshMirrorPath: settings.dshMirrorPath, desktopPlistPath: settings.desktopPlistPath, desktopLocale: settings.desktopLocale,
   classifyModel: routeText(settings.classifyModel), reportModel: routeText(settings.reportModel), startModel: routeText(settings.startModel),
   reportPreset: settings.reportPreset, startPreset: settings.startPreset,
   dailyReportLimit: String(settings.dailyReportLimit), checkIntervalHours: String(settings.checkIntervalHours),
-  autoResearch: settings.autoResearch ?? DEFAULT_AUTO_RESEARCH,
+  autoResearch: autoResearchOf(settings),
 });
-/**
- * The settings the draft changes: trimmed, numbers as numbers, a changed route whole. A Host without `autoResearch` is taken to have its
- * default, so the field goes out only when the user changes it (a Host that does not know it refuses it). The Host checks the values.
- */
-export function settingsPatch(current: ClientSettings, draft: SettingsDraft): Partial<ClientSettings> {
-  const before: ClientSettings = { ...current, autoResearch: current.autoResearch ?? DEFAULT_AUTO_RESEARCH };
-  const next: ClientSettings = {
+/** The settings the draft changes: trimmed, numbers as numbers, a changed route whole. The Host checks the values. */
+export function settingsPatch(current: Settings, draft: SettingsDraft): Partial<Settings> {
+  const before: Settings = { ...current, autoResearch: autoResearchOf(current) };
+  const next: Settings = {
     ...before,
     dshMirrorPath: draft.dshMirrorPath.trim(), desktopPlistPath: draft.desktopPlistPath.trim(), desktopLocale: draft.desktopLocale.trim(),
     classifyModel: routeOf(draft.classifyModel), reportModel: routeOf(draft.reportModel), startModel: routeOf(draft.startModel),
     reportPreset: draft.reportPreset.trim(), startPreset: draft.startPreset.trim(),
     dailyReportLimit: Number(draft.dailyReportLimit), checkIntervalHours: Number(draft.checkIntervalHours), autoResearch: draft.autoResearch,
   };
-  const changed = (Object.keys(next) as (keyof ClientSettings)[]).filter(key => JSON.stringify(next[key]) !== JSON.stringify(before[key]));
-  return Object.fromEntries(changed.map(key => [key, next[key]])) as Partial<ClientSettings>;
+  const changed = (Object.keys(next) as (keyof Settings)[]).filter(key => JSON.stringify(next[key]) !== JSON.stringify(before[key]));
+  return Object.fromEntries(changed.map(key => [key, next[key]])) as Partial<Settings>;
 }
 
 export interface ModelChoices {
@@ -113,14 +115,14 @@ function ModelField({ name, label, value, saved, models, change }: {
 }
 
 export interface SettingsViewProps {
-  settings: ClientSettings;
+  settings: Settings;
   /** For the model list. */
   call: Call;
   saving: boolean;
   /** Why the last save failed. */
   error?: string;
   /** Sends the patch; true when it went through. */
-  save: (patch: Partial<ClientSettings>) => Promise<boolean>;
+  save: (patch: Partial<Settings>) => Promise<boolean>;
   back: () => void;
 }
 
@@ -137,7 +139,7 @@ export function SettingsView({ settings, call, saving, error, save, back }: Sett
   // New settings from the Host (after a save, or a refresh that brings a change made elsewhere) go into the fields the user has not
   // changed and the ones the user changed to just that value; what the user is still typing stays.
   useEffect(() => {
-    const next = draftOf(JSON.parse(stored) as ClientSettings), previous = base.current;
+    const next = draftOf(JSON.parse(stored) as Settings), previous = base.current;
     base.current = next;
     setDraft(current => {
       const merged = { ...current };

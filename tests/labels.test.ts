@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { Candidate, Classification, Evidence } from '../src/core/candidate.ts';
-import type { ClientCandidate } from '../src/client/contract.ts';
 import {
   PHASE_TAGS, clipLine, countViews, gistOf, groupCandidates, headlineOf, mergeLabel, phaseOf, referenceOf, tagOf, versionOf, viewOf,
 } from '../src/client/labels.ts';
@@ -10,11 +9,11 @@ const ID = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')
 const AT = (hour: number) => `2026-10-15T${String(hour).padStart(2, '0')}:00:00.000Z`;
 const classified = (relevance: Classification['relevance'], extra: Partial<Classification> = {}): Classification =>
   ({ category: 'cli-core', relevance, rationale: 'r', ...extra });
-const candidate = (n: number, fields: Partial<ClientCandidate> = {}): ClientCandidate => ({
+const candidate = (n: number, fields: Partial<Candidate> = {}): Candidate => ({
   id: ID(n), fingerprint: `codex-release:pr:${n}`, source: 'codex-release', title: `候选 ${n}`, summary: '',
   status: 'new', createdAt: AT(n), updatedAt: AT(n), evidence: [], ...fields,
 });
-const release = (n: number, toTag: string, fields: Partial<ClientCandidate> = {}) => candidate(n, { window: { fromTag: 'rust-v0.160.0', toTag }, ...fields });
+const release = (n: number, toTag: string, fields: Partial<Candidate> = {}) => candidate(n, { window: { fromTag: 'rust-v0.160.0', toTag }, ...fields });
 const ids = (list: readonly Candidate[]) => list.map(item => item.id);
 const pr = (ref: string): Evidence => ({ kind: 'pr', ref });
 

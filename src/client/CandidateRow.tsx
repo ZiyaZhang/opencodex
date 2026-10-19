@@ -2,8 +2,7 @@
  * One row of the list: the Codex feature and its tag, what Codex does, where it comes from, and at the top right the buttons its phase
  * allows, the one primary button last. A row whose research is queued or running shows how far it is instead of buttons.
  */
-import { canTransition } from '../core/candidate.js';
-import type { ClientCandidate } from './contract.js';
+import { canTransition, type Candidate } from '../core/candidate.js';
 import {
   CATEGORY_LABELS, RELEVANCE_LABELS, SOURCE_LABELS, gistOf, headlineOf, labelOf, mergeLabel, phaseOf, referenceOf, researchErrorOf, tagOf, time,
   type Phase,
@@ -21,9 +20,9 @@ export type OpenTarget = 'report' | 'execute';
 const RUNNING: Record<CandidateAction, string> = { report: '调研中…', start: '发送中…', ignore: '忽略中…', restore: '恢复中…' };
 
 export interface CandidateRowProps {
-  candidate: ClientCandidate;
+  candidate: Candidate;
   /** Every listed candidate, to name the one a merged candidate went into. */
-  candidates: readonly ClientCandidate[];
+  candidates: readonly Candidate[];
   /** The action running on it: the one this page asked for, else the one the Host reports. */
   busy?: CandidateAction;
   /** Its place in the automatic research queue, from 1; absent when it is not queued. */
@@ -36,7 +35,7 @@ export interface CandidateRowProps {
 }
 
 /** The third line: source and reference, category, relevance, the latest of discovery / report / send, a merge, an automatic research error. */
-function RowInfo({ candidate, candidates }: { candidate: ClientCandidate; candidates: readonly ClientCandidate[] }) {
+function RowInfo({ candidate, candidates }: { candidate: Candidate; candidates: readonly Candidate[] }) {
   const { classification, started, report } = candidate;
   const reference = referenceOf(candidate);
   const [event, at] = started ? ['发送', started.at] : report ? ['报告', report.generatedAt] : ['发现', candidate.createdAt];

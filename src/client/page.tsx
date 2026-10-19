@@ -3,10 +3,11 @@
  * and the list, the settings, the detail of one candidate). The detail view below is the one from before the list's redesign.
  */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { canTransition, type Evidence, type ReportChecks, type ReportRecord, type Status } from '../core/candidate.js';
+import { canTransition, type Candidate, type Evidence, type ReportChecks, type ReportRecord, type Status } from '../core/candidate.js';
+import type { OpenCodexRequest, OpenCodexResponse } from '../host/remote.js';
 import { CandidateList } from './CandidateList.js';
 import type { CandidateAction, RowState } from './CandidateRow.js';
-import type { Call, ClientCandidate, ClientRequest, ClientResponse, OpenSession } from './contract.js';
+import type { Call, OpenSession, ReportText } from './contract.js';
 import { Filters } from './Filters.js';
 import { Header } from './Header.js';
 import { Icon } from './icons.js';
@@ -18,7 +19,6 @@ import { SettingsView } from './SettingsView.js';
 import type { Ui } from './ui.js';
 import { UiContext, useUi } from './ui-context.js';
 
-type ReportText = NonNullable<ClientResponse['report']>;
 /** The controls outside the list, each with its own busy flag and error line. */
 type Control = 'check' | 'index' | 'settings';
 
@@ -80,7 +80,7 @@ export function ReportView({ record, report, error, loading }: { record?: Report
 }
 
 /** The buttons of one candidate in the detail view, each enabled by the status move it makes. */
-function CandidateActions({ candidate, busy, run }: { candidate: ClientCandidate; busy: boolean; run: (action: CandidateAction) => Promise<void> }) {
+function CandidateActions({ candidate, busy, run }: { candidate: Candidate; busy: boolean; run: (action: CandidateAction) => Promise<void> }) {
   const { status, report } = candidate;
   const startHint = status === 'ignored' ? '先恢复这条候选' : status !== 'new' ? undefined : report ? '恢复的候选要先重新生成报告' : '先生成报告再开工';
   return <div className="oc-candidate-actions">
@@ -114,10 +114,10 @@ function EvidenceList({ evidence }: { evidence: readonly Evidence[] }) {
 }
 
 /** What the detail view reads for one candidate: the whole record (evidence excerpts) and the report text. */
-interface Detail { id: string; loading: boolean; candidate?: ClientCandidate; candidateError?: string; report?: ReportText; reportError?: string }
+interface Detail { id: string; loading: boolean; candidate?: Candidate; candidateError?: string; report?: ReportText; reportError?: string }
 
 function CandidateDetail({ candidate, candidates, detail, busy, state, run, back, openSession }: {
-  candidate: ClientCandidate; candidates: readonly ClientCandidate[]; detail?: Detail; busy?: CandidateAction; state: RowState;
+  candidate: Candidate; candidates: readonly Candidate[]; detail?: Detail; busy?: CandidateAction; state: RowState;
   run: (action: CandidateAction) => Promise<void>; back: () => void; openSession?: OpenSession;
 }) {
   const { classification, started, window: range } = candidate;
@@ -173,7 +173,7 @@ export function OpenCodexPage({ ui, ...props }: { call: Call; openSession?: Open
 
 function Page({ call, openSession }: { call: Call; openSession?: OpenSession }) {
   const { Button } = useUi();
-  const [data, setData] = useState<ClientResponse>();
+  const [data, setData] = useState<OpenCodexResponse>();
   const [loadError, setLoadError] = useState('');
   const [view, setView] = useState<View>('todo');
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -189,7 +189,7 @@ function Page({ call, openSession }: { call: Call; openSession?: OpenSession }) 
   /** Counts the responses shown, so a snapshot asked for before another response arrived does not replace it. */
   const shownCount = useRef(0);
 
-  const show = useCallback((response: ClientResponse) => { shownCount.current++; setData(response); }, []);
+  const show = useCallback((response: OpenCodexResponse) => { shownCount.current++; setData(response); }, []);
   const refresh = useCallback(async () => {
     const signal = lifetime.current?.signal, before = shownCount.current;
     try {
@@ -244,7 +244,7 @@ function Page({ call, openSession }: { call: Call; openSession?: OpenSession }) 
     try { openSession?.(sessionId); } catch { setRow(id, () => ({ note: `会话 ${sessionId} 没能自动打开` })); }
   };
   /** A request from one of the controls outside the list; true when it went through. */
-  const control = async (name: Control, request: ClientRequest): Promise<boolean> => {
+  const control = async (name: Control, request: OpenCodexRequest): Promise<boolean> => {
     const signal = lifetime.current?.signal;
     setBusy(current => ({ ...current, [name]: true }));
     setControlErrors(current => ({ ...current, [name]: undefined }));

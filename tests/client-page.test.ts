@@ -4,11 +4,12 @@ import { createRequire } from 'node:module';
 import { createElement, type ReactNode } from 'react';
 import TestRenderer, { type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
 import createDOMPurify, { type WindowLike } from 'dompurify';
-import type { Classification, ReportRecord } from '../src/core/candidate.ts';
+import type { Candidate, Classification, ReportRecord } from '../src/core/candidate.ts';
 import type { CheckLogEntry } from '../src/core/run-log.ts';
-import { DEFAULT_SETTINGS } from '../src/core/settings.ts';
+import { DEFAULT_SETTINGS, type Settings } from '../src/core/settings.ts';
 import type { CheckResult } from '../src/host/collector.ts';
-import type { ClientCandidate, ClientRequest, ClientResponse, ClientSettings, ModelCatalog } from '../src/client/contract.ts';
+import type { OpenCodexRequest, OpenCodexResponse } from '../src/host/remote.ts';
+import type { ModelCatalog } from '../src/client/contract.ts';
 import type { Ui } from '../src/client/ui.ts';
 import { lastCheckOf } from '../src/client/Header.tsx';
 import { OpenCodexPage, ReportView, checksSummary } from '../src/client/page.tsx';
@@ -26,7 +27,7 @@ const ID = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')
 const AT = (hour: number) => `2026-10-15T${String(hour).padStart(2, '0')}:00:00.000Z`;
 const classified = (category: Classification['category'], relevance: Classification['relevance'], extra: Partial<Classification> = {}): Classification =>
   ({ category, relevance, rationale: 'r', ...extra });
-const candidate = (n: number, fields: Partial<ClientCandidate> = {}): ClientCandidate => ({
+const candidate = (n: number, fields: Partial<Candidate> = {}): Candidate => ({
   id: ID(n), fingerprint: `codex-release:pr:${n}`, source: 'codex-release', title: `候选 ${n}`, summary: '',
   status: 'new', createdAt: AT(n), updatedAt: AT(n), evidence: [], window: { fromTag: 'rust-v0.162.1', toTag: 'rust-v0.163.0' }, ...fields,
 });
@@ -70,18 +71,18 @@ const ui = {
  * `candidate` with the record in `whole` (else the listed one), `readReport` with a one-line report, `models` with `host.models`.
  * `failures` makes an action throw.
  */
-function fakeHost(candidates: ClientCandidate[], extra: Partial<ClientResponse> = {}, whole: Record<string, ClientCandidate> = {}) {
+function fakeHost(candidates: Candidate[], extra: Partial<OpenCodexResponse> = {}, whole: Record<string, Candidate> = {}) {
   const host = {
-    requests: [] as ClientRequest[],
-    settings: { ...DEFAULT_SETTINGS } as ClientSettings,
+    requests: [] as OpenCodexRequest[],
+    settings: { ...DEFAULT_SETTINGS } as Settings,
     models: undefined as ModelCatalog | undefined,
-    failures: {} as Partial<Record<ClientRequest['action'], string>>,
-    call: async (request: ClientRequest): Promise<ClientResponse> => {
+    failures: {} as Partial<Record<OpenCodexRequest['action'], string>>,
+    call: async (request: OpenCodexRequest): Promise<OpenCodexResponse> => {
       host.requests.push(request);
       const failure = host.failures[request.action];
       if (failure) throw new Error(failure);
       if (request.action === 'settings') host.settings = { ...host.settings, ...request.patch };
-      const snapshot: ClientResponse = {
+      const snapshot: OpenCodexResponse = {
         settings: host.settings, candidates, totalCandidates: candidates.length, omittedCandidates: 0, checkpoints: {},
         busy: { check: false, candidates: {} }, hostPid: 4242, ...extra,
       };
@@ -365,7 +366,7 @@ test('打开会话 that cannot switch says which session it was; without a works
 test('while a row\'s request is out its buttons wait, the one pressed saying so', async () => {
   const host = fakeHost([candidate(1)]);
   let finish!: () => void;
-  const call = async (request: ClientRequest) => {
+  const call = async (request: OpenCodexRequest) => {
     if (request.action === 'ignore') await new Promise<void>(resolve => { finish = resolve; });
     return host.call(request);
   };
@@ -492,7 +493,7 @@ test('上次检查 reads the check log first, this process\'s last check without
 });
 
 test('the header shows the last check, another process that ran it, a lock that holds 检查更新, and the research notice', async () => {
-  const header = async (extra: Partial<ClientResponse>) => {
+  const header = async (extra: Partial<OpenCodexResponse>) => {
     const renderer = await mount({ call: fakeHost([], extra).call });
     try { return { text: textOf(renderer.root), check: buttons(renderer.root, '检查更新')[0]?.props.disabled }; } finally { renderer.unmount(); }
   };
@@ -565,7 +566,7 @@ test('model choices: a group per provider that lists models, values provider/mod
 });
 
 test('the settings patch holds only the changed keys, a model route whole, numbers as numbers, 自动调研 only when it changed', () => {
-  const current: ClientSettings = {
+  const current: Settings = {
     ...DEFAULT_SETTINGS, classifyModel: { ...DEFAULT_SETTINGS.classifyModel }, reportModel: { ...DEFAULT_SETTINGS.reportModel },
     startModel: { ...DEFAULT_SETTINGS.startModel },
   };
@@ -577,10 +578,13 @@ test('the settings patch holds only the changed keys, a model route whole, numbe
   });
   assert.deepEqual(settingsPatch(current, { ...draftOf(current), startModel: 'openrouter/anthropic/claude-x' }),
     { startModel: { provider: 'openrouter', model: 'anthropic/claude-x' } });
-  assert.equal(draftOf(current).autoResearch, 'high', 'a Host without the setting shows its default');
   assert.deepEqual(settingsPatch(current, { ...draftOf(current), autoResearch: 'off' }), { autoResearch: 'off' });
   const medium = { ...current, autoResearch: 'medium' as const };
   assert.deepEqual(settingsPatch(medium, draftOf(medium)), {});
+  // The previous Host, which the page can still be talking to right after a reinstall, has no such setting.
+  const { autoResearch: _none, ...older } = current;
+  assert.equal(draftOf(older as Settings).autoResearch, DEFAULT_SETTINGS.autoResearch, 'a Host without the setting shows its default');
+  assert.deepEqual(settingsPatch(older as Settings, draftOf(older as Settings)), {}, 'and is not sent the field it does not know');
 });
 
 test('the settings open from the header icon and read the model list; a model is picked by provider and saved as a route; 返回 goes back', async () => {

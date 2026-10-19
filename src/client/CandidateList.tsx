@@ -1,14 +1,14 @@
 /** The candidates of one view, in version groups: latest discovery first, each group titled with its version, discovery date and size. */
 import { useId } from 'react';
-import type { ClientCandidate } from './contract.js';
+import type { Candidate } from '../core/candidate.js';
 import { CandidateRow, type CandidateAction, type OpenTarget, type RowState } from './CandidateRow.js';
 import { groupCandidates, monthDay } from './labels.js';
 
 export interface CandidateListProps {
   /** The candidates of the view. */
-  shown: readonly ClientCandidate[];
+  shown: readonly Candidate[];
   /** Every listed candidate, to name the one a merged candidate went into. */
-  candidates: readonly ClientCandidate[];
+  candidates: readonly Candidate[];
   /** The automatic research queue, in order. */
   queue: readonly string[];
   busyOf: (id: string) => CandidateAction | undefined;
