@@ -1,6 +1,6 @@
 {
   "name": "dsh-opencodex",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Watch Codex releases and the desktop app, write Codex-to-DSH gap reports, hand picked ones to DSH Creator mode",
   "type": "module",
   "license": "MIT",
