@@ -261,7 +261,7 @@ test('diffsFor takes a renamed file from its rename line and reads git-quoted pa
   assert.deepEqual(files.map(f => f.path), ['docs/new.md', 'docs/中.md', 'docs/plain.md', 'docs/文 "2".md', 'docs/a b/c.md']);
 });
 
-const LIB = 'codex-rs/features/src/lib.rs', LEGACY = 'codex-rs/features/src/legacy.rs';
+const LIB = 'codex-rs/features/src/lib.rs', LEGACY = 'codex-rs/features/src/legacy.rs', CONFIGS = 'codex-rs/features/src/feature_configs.rs';
 async function writeSnapshot(dir: string, from: string, to: string, files: object[]): Promise<void> {
   await mkdir(join(dir, 'codex-files'), { recursive: true });
   await writeFile(join(dir, 'codex-files', `${from}__${to}.json`), JSON.stringify({ window: { from, to, releases: [to] }, files }));
@@ -335,6 +335,34 @@ test('diffsFor reports a damaged snapshot, a candidate it cannot place and a ran
   });
 });
 
+test('diffsFor gives a feature-flag candidate of each file only the lines of its evidence excerpt, not every line the file gained', async () => {
+  await withTempDir(async dir => {
+    // The window added two flags to each file, and the snapshot keeps the lines of both.
+    await writeSnapshot(dir, 'rust-v0.162.1', 'rust-v0.163.0', [
+      { path: CONFIGS, status: 'modified', added: ['    /// Mask credentials.', '    pub credential_masking: Option<bool>,', '    /// Hide native tools.', '    pub disable_native_tools: Option<bool>,'] },
+      { path: LIB, status: 'modified', added: ['        key: "credential_masking",', '        key: "code_mode_host_grpc",', '        stage: Stage::UnderDevelopment,', '        default_enabled: false,', '        stage: Stage::Stable,'] },
+    ]);
+    // A patch release that gave this flag no line: it does not go into the tag.
+    await writeSnapshot(dir, 'rust-v0.163.0', 'rust-v0.163.1', [{ path: LIB, status: 'modified', added: ['        key: "output_token_replay",'] }]);
+    const candidate = filesCandidate({
+      fingerprint: 'codex-files:feature-flag:credential_masking:0.163', window: { fromTag: 'rust-v0.162.1', toTag: 'rust-v0.163.1' },
+      evidence: [
+        { kind: 'feature-flag', ref: CONFIGS, excerpt: '    /// Mask credentials.\n    pub credential_masking: Option<bool>,' },
+        { kind: 'feature-flag', ref: LIB, excerpt: '        key: "credential_masking",\n        stage: Stage::UnderDevelopment,\n        default_enabled: false,' },
+      ],
+    });
+    const deps = { github: offline, snapshotDir: dir };
+    assert.deepEqual(await diffsFor(candidate, deps), [
+      { path: CONFIGS, diff: '+    /// Mask credentials.\n+    pub credential_masking: Option<bool>,', source: 'rust-v0.162.1__rust-v0.163.0' },
+      { path: LIB, diff: '+        key: "credential_masking",\n+        stage: Stage::UnderDevelopment,\n+        default_enabled: false,', source: 'rust-v0.162.1__rust-v0.163.0' },
+    ]);
+    // The registry candidate keeps every line its files gained.
+    assert.deepEqual((await diffsFor({ ...candidate, fingerprint: 'codex-files:feature-flags:0.163' }, deps)).map(f => [f.path, f.diff.split('\n').length, f.source]), [
+      [CONFIGS, 4, 'rust-v0.162.1__rust-v0.163.0'], [LIB, 6, 'rust-v0.162.1__rust-v0.163.1'],
+    ]);
+  });
+});
+
 test('diffsFor gives desktop and RSS candidates no diff', async () => {
   for (const source of ['desktop', 'rss'] as const) {
     assert.deepEqual(await diffsFor(candidateOf({ source, evidence: [{ kind: 'i18n', ref: 'codex.quickChat.open' }] }), { github: offline, snapshotDir: '/nonexistent' }), []);
@@ -398,6 +426,27 @@ test('buildEvidencePack writes codex-files line lists as added-*.txt under 新�
     const index = await readFile(join(root, 'INDEX.md'), 'utf8');
     assert.deepEqual(listOf(index, '## 新增行（sources/，不是 diff）'), [`- sources/${added} ← ${LIB}（rust-v0.161.9 → rust-v0.161.11，只放了前 2 行，共 3 行）`]);
     assert.deepEqual(listOf(index, '## 未读文件'), []);
+  });
+});
+
+test('buildEvidencePack says that the lines of a feature-flag candidate are that flag\'s alone', async () => {
+  await withTempDir(async dir => {
+    const excerpt = '    /// Mask credentials before they reach the model.\n        key: "credential_masking",';
+    const evidence: Evidence[] = [{ kind: 'feature-flag', ref: LIB, excerpt }, { kind: 'feature-flag', ref: CONFIGS, excerpt: '    pub credential_masking: Option<bool>,' }];
+    const candidate = filesCandidate({ fingerprint: 'codex-files:feature-flag:credential_masking:0.163', title: 'credential_masking', evidence });
+    const lib: DiffFile = { path: LIB, diff: excerpt.split('\n').map(line => `+${line}`).join('\n'), source: 'rust-v0.162.1__rust-v0.163.0' };
+    const added = 'added-0.162.1__0.163.0-codex-rs-features-src-lib.rs.txt';
+    const page = (root: string, ref: string) => readFile(join(root, 'sources', `feature-flag-${ref.replace(/\//g, '-')}.md`), 'utf8');
+    const root = await buildEvidencePack({ directory: join(dir, 'flag'), candidate, diffs: [lib], dshHits: [] });
+    assert.ok((await page(root, LIB)).includes(`新增行在 sources/${added}，只含这个开关的行，这里不重复。`));
+    assert.ok((await readFile(join(root, 'sources', added), 'utf8')).includes('\n不是 diff：没有上下文，也没有删掉的行。只含这个开关的行，文件别的新增行不在这里。\n'));
+    // A file without a list of its own shows the excerpt, as the flag's lines.
+    assert.ok((await page(root, CONFIGS)).includes('这个开关的行：\n\n    pub credential_masking: Option<bool>,'));
+    // The registry candidate's lines are the file's, as before.
+    const registry = await buildEvidencePack({ directory: join(dir, 'registry'), candidate: { ...candidate, fingerprint: 'codex-files:feature-flags:0.163' }, diffs: [lib], dshHits: [] });
+    assert.ok((await page(registry, LIB)).includes(`新增行在 sources/${added}，这里不重复。`));
+    assert.doesNotMatch(await readFile(join(registry, 'sources', added), 'utf8'), /开关/);
+    assert.ok((await page(registry, CONFIGS)).includes('新增行：\n\n    pub credential_masking: Option<bool>,'));
   });
 });
 
