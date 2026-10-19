@@ -1,6 +1,7 @@
 /**
- * OpenCodex Host: the `opencodex/call` Remote and the timer that runs a check every `checkIntervalHours`. This file wires; each action lives
- * in `./actions/`, and every external operation goes through the injected DSH services, so tests replace them with plain objects.
+ * OpenCodex Host: the `opencodex/call` Remote and the timer that runs a check every `checkIntervalHours`, or, in run-once mode, one check
+ * at start and no timer (`./run-once.ts`). This file wires; each action lives in `./actions/`, and every external operation goes through
+ * the injected DSH services, so tests replace them with plain objects.
  */
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -32,6 +33,7 @@ import { loadSettings, updateSettings } from './actions/settings.js';
 import { candidate, respond, type ActionResult } from './actions/snapshot.js';
 import { start } from './actions/start.js';
 import { OPEN_CODEX_DESCRIPTOR, parseRequest, type OpenCodexRequest, type OpenCodexResponse } from './remote.js';
+import { LAST_RUN, runOnce } from './run-once.js';
 
 export interface Config { dataDirectory?: string }
 export type { Timers } from '../core/timers.js';
@@ -52,6 +54,8 @@ export interface Dependencies {
   timeouts?: Partial<HostContext['timeouts']>;
   /** The waits before each further try of a classification batch that broke off on the connection; 5 and 20 seconds by default. */
   classifyRetryDelaysMs?: number[];
+  /** Run-once mode (see run-once.ts), for the launchd job; on when the environment has OPENCODEX_RUN_ONCE=1, which tests never rely on. */
+  runOnce?: boolean;
 }
 declare module '@deepseek-ai/cordis' { interface Context { opencodex: OpenCodex } }
 
@@ -89,7 +93,9 @@ export default class OpenCodex extends TypertRemoteService {
   /** Aborted on unload: every report, start, check, classification and the research worker run under it. */
   private readonly lifetime = new AbortController();
   private readonly timers: Timers;
-  /** Calls, timer runs and the research worker in progress, waited for on unload. */
+  /** Run-once mode: one check as soon as the Host has started, then its research and last-run.json; no timer, ever. */
+  private readonly once: boolean;
+  /** Calls, timer runs, the research worker and the run-once start in progress, waited for on unload. */
   private readonly work = new Set<Promise<unknown>>();
   /** Holds of the data-directory lock taken through the HostContext and not released yet. */
   private readonly locks = new Set<Extract<LockResult, { held: true }>>();
@@ -100,9 +106,12 @@ export default class OpenCodex extends TypertRemoteService {
     super(ctx, 'opencodex', { namespace: 'opencodex' });
     this.directory = resolve(config.dataDirectory ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'opencodex'));
     this.timers = deps.timers ?? NODE_TIMERS;
+    this.once = deps.runOnce ?? process.env.OPENCODEX_RUN_ONCE === '1';
     ctx.typert.register({ package: 'dsh-opencodex', face: 'host', schemas: [], model: { services: [], events: [], objects: [] }, invocations: [OPEN_CODEX_DESCRIPTOR] });
     this.ready = this.open(deps);
     void this.ready.catch(() => undefined); // reported by [Service.init] and by every call
+    // Tracked from the start, so that an unload, even the one after a failed start, waits for last-run.json.
+    if (this.once) void this.track(this.runOnceAtStart(deps.now ?? (() => new Date())));
     ctx.effect(() => () => this.close(), 'opencodex: unload');
   }
 
@@ -169,8 +178,21 @@ export default class OpenCodex extends TypertRemoteService {
       busy: new Map(), running: new Map(), reportsRunning: 0, research: new ResearchQueue(),
       lanes: { settings: new Lane(), reports: new Lane(), classify: new Lane(), index: new Lane() },
     };
-    this.arm(FIRST_CHECK_DELAY_MS, 'startup');
+    this.arm(FIRST_CHECK_DELAY_MS, 'startup'); // arms nothing in run-once mode, whose one check starts at once (runOnceAtStart)
     return host;
+  }
+
+  /**
+   * Run-once mode: the one run (`runOnce`) as soon as the Host has started, or has failed to, and its end in the DSH log. A last-run.json
+   * that cannot be written is a warning, since the launchd job then waits out its time limit.
+   */
+  private async runOnceAtStart(now: () => Date): Promise<void> {
+    try {
+      const run = await runOnce(this.ready, { directory: this.directory, now, startResearch: host => this.startResearch(host) });
+      if (run) this.ctx.logger.info(`opencodex: run-once finished：结果写在 ${join(this.directory, LAST_RUN)}`);
+    } catch (error) {
+      this.ctx.logger.warn(`opencodex: run-once 没能写出 ${LAST_RUN}，launchd 任务会等到时限才结束 DSH：${messageOf(error)}`);
+    }
   }
 
   /** The data-directory lock under the Host clock and lifetime. A hold is kept here until released, so that one still held at unload is released then. */
@@ -206,10 +228,13 @@ export default class OpenCodex extends TypertRemoteService {
     if (this.timer !== undefined) this.timers.clear(this.timer);
     this.timer = undefined;
   }
-  /** Arms the timer to run a check in `ms`, replacing the armed one; nothing once the plugin is unloading. */
+  /**
+   * Arms the timer to run a check in `ms`, replacing the armed one; nothing once the plugin is unloading, and nothing ever in run-once
+   * mode, whose DSH the launchd job ends after the one run: a check asked for by hand or a settings change re-arms nothing there either.
+   */
   private arm(ms: number, trigger: TimerTrigger = 'timer'): void {
     this.disarm();
-    if (!this.closed) this.timer = this.timers.set(() => { this.timer = undefined; void this.scheduled(trigger); }, Math.max(0, ms));
+    if (!this.closed && !this.once) this.timer = this.timers.set(() => { this.timer = undefined; void this.scheduled(trigger); }, Math.max(0, ms));
   }
 
   /** After a settings change: the next check is due one (new) interval after the last one ended. The startup timer, and a check in progress, re-arm by themselves. */
